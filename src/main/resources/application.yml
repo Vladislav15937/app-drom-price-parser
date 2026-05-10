@@ -1,0 +1,56 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: price-aggregator
+  main:
+    allow-bean-definition-overriding: false
+
+# Swagger/OpenAPI (должен быть на корневом уровне, НЕ внутри spring!)
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operationsSorter: method
+    tagsSorter: alpha
+    tryItOutEnabled: true
+    filter: true
+  api-docs:
+    path: /v3/api-docs
+  packages-to-scan: ru.retail.service.controller
+  show-actuator: false
+
+apify:
+  api:
+    token: apify_api_yUzydG8Qrpt5gkdTGO6WdHLVRtDR5a4j9qoD
+    base-url: https://api.apify.com
+  actor:
+    drom-scraper-id: Lz2PWiyvRnFjoINKV
+
+drom:
+  headless: true  # false для отладки, true для продакшена
+  proxy:
+    url:  # Оставьте пустым или укажите http://login:pass@ip:port
+
+deepseek:
+  api:
+    token: sk-v0VUKD3dAXgYlikrioAGwQ
+
+#    sk-70c0e9c831ec41568ade1fa9124aeeb8
+
+feign:
+  client:
+    config:
+      apify-actor-client:
+        connectTimeout: 30000
+        readTimeout: 300000
+        loggerLevel: FULL
+      apify-dataset-client:
+        connectTimeout: 10000
+        readTimeout: 60000
+        loggerLevel: FULL
+
+logging:
+  level:
+    ru.retail.service.client: DEBUG
+    feign: DEBUG
