@@ -27,10 +27,10 @@ import java.util.Set;
 public class DromParser {
 
     private static final String[] USER_AGENTS = {
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
     };
 
@@ -50,7 +50,8 @@ public class DromParser {
                                 "--disable-blink-features=AutomationControlled",
                                 "--no-sandbox",
                                 "--disable-dev-shm-usage",
-                                "--disable-gpu"
+                                "--disable-gpu",
+                                "--incognito"
                         ))
         );
     }
@@ -75,9 +76,9 @@ public class DromParser {
 
         Page page = ctx.newPage();
         page.addInitScript("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        delete navigator.__proto__.webdriver;
-    """);
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            delete navigator.__proto__.webdriver;
+        """);
 
         try {
             page.navigate(url);
@@ -88,8 +89,9 @@ public class DromParser {
                 log.warn("Обнаружена капча!");
                 if (!headless) {
                     log.info("Решите капчу в браузере. Ожидаю 60 секунд...");
-                    page.waitForSelector(".bull-item, [data-ftid='component_bull'], [class*='css-']",
-                            new Page.WaitForSelectorOptions().setTimeout(60000));
+                    page.waitForURL(url, new Page.WaitForURLOptions().setTimeout(120000));
+                    page.waitForLoadState(LoadState.NETWORKIDLE);
+                    log.info("Капча решена, продолжаю...");
                 } else {
                     log.error("Капча в headless-режиме.");
                     return results;
@@ -99,58 +101,46 @@ public class DromParser {
             page.waitForLoadState(LoadState.NETWORKIDLE);
             Thread.sleep(2000);
 
-            // Поиск объявлений
-            List<ElementHandle> bulls = page.querySelectorAll(".bull-item");
-            if (bulls.isEmpty()) {
-                bulls = page.querySelectorAll("[data-ftid='component_bull']");
+            // Собираем ссылки на детальные страницы
+            List<String> detailUrls = new ArrayList<>();
+            List<ElementHandle> allLinks = page.querySelectorAll("a[href*='/sell_spare_parts/']");
+            for (ElementHandle link : allLinks) {
+                String href = link.getAttribute("href");
+                if (href != null && href.contains("sell_spare_parts") && href.length() > 30
+                        && (href.contains("-g") || href.contains(".html"))) {
+                    String fullUrl = href.startsWith("http") ? href : "https://baza.drom.ru" + href;
+                    if (!detailUrls.contains(fullUrl)) {
+                        detailUrls.add(fullUrl);
+                    }
+                }
             }
+            log.info("Найдено ссылок на объявления: {}", detailUrls.size());
 
-            log.info("Найдено объявлений: {}", bulls.size());
-
-            if (bulls.isEmpty()) {
-                log.error("Объявления не найдены");
-                page.screenshot(new Page.ScreenshotOptions().setPath(Paths.get("error.png")));
-                return results;
-            }
-
-            // Парсим с дедубликацией
-            Set<String> seen = new HashSet<>();
+            // Дедубликация по полному URL
+            Set<String> seenUrls = new HashSet<>();
             int count = 0;
 
-            for (ElementHandle bull : bulls) {
+            for (String detailUrl : detailUrls) {
                 if (count >= 10) break;
 
-                try {
-                    String text = bull.innerText().trim();
-                    if (text.length() < 30) continue;
+                // Дедубликация по полному URL
+                if (!seenUrls.add(detailUrl)) {
+                    log.debug("Пропущен дубликат URL: {}", detailUrl);
+                    continue;
+                }
 
-                    PartPrice.PartPriceBuilder builder = PartPrice.builder();
-                    extractBasicInfo(text, builder);
+                // Задержка между запросами
+                if (count > 0) {
+                    Thread.sleep(1500 + (long)(Math.random() * 2000));
+                }
 
-                    // Извлекаем ссылку
-                    String detailUrl = extractDetailUrl(bull);
+                log.info("[{}/10] Загружаю: {}", count + 1, detailUrl);
 
-                    // Дедубликация по названию + цене + продавцу
-                    PartPrice temp = builder.build();
-                    String key = temp.getTitle() + "|" + temp.getPrice() + "|" + temp.getDealer();
-                    if (seen.contains(key)) continue;
-                    seen.add(key);
+                PartPrice partPrice = parseDetailPage(ctx, detailUrl);
 
-                    // Загружаем детальную страницу
-                    if (detailUrl != null) {
-                        log.debug("Загружаю: {}", detailUrl);
-                        String description = fetchDetailPage(ctx, detailUrl);
-                        builder.description(description);
-                    }
-
-                    PartPrice partPrice = builder.build();
-                    if (partPrice.getPrice() != null) {
-                        results.add(partPrice);
-                        count++;
-                    }
-
-                } catch (Exception e) {
-                    log.debug("Ошибка элемента: {}", e.getMessage());
+                if (partPrice != null) {
+                    results.add(partPrice);
+                    count++;
                 }
             }
 
@@ -168,185 +158,113 @@ public class DromParser {
     }
 
     /**
-     * Извлекает ссылку на детальную страницу из карточки
+     * Загружает детальную страницу и извлекает из неё все данные
      */
-    private String extractDetailUrl(ElementHandle bull) {
-        String[] linkSelectors = {
-                "a[href*='/sell_spare_parts/']",
-                "a[href*='baza.drom.ru']",
-                "[data-ftid='bull_title']",
-                "a"
-        };
-
-        for (String selector : linkSelectors) {
-            try {
-                ElementHandle el = bull.querySelector(selector);
-                if (el != null) {
-                    String href = el.getAttribute("href");
-                    if (href != null && href.contains("sell_spare_parts") && href.length() > 20) {
-                        return href.startsWith("http") ? href : "https://baza.drom.ru" + href;
-                    }
-                }
-            } catch (Exception e) {}
-        }
-        return null;
-    }
-
-    /**
-     * Извлекает базовую информацию из карточки поиска
-     */
-    private void extractBasicInfo(String text, PartPrice.PartPriceBuilder builder) {
-        String[] lines = text.split("\n");
-
-        BigDecimal price = null;
-        String title = "";
-        String location = "";
-        String dealer = "";
-
-        for (int i = 0; i < lines.length; i++) {
-            String line = lines[i].trim();
-            if (line.matches("^(передний|задний|[ЛП])$")) continue;
-
-            if (price == null && line.matches(".*\\d+.*₽.*")) {
-                String priceText = line.replaceAll("[^\\d.]", "");
-                if (!priceText.isEmpty()) {
-                    try { price = new BigDecimal(priceText); } catch (Exception e) {}
-                }
-                continue;
-            }
-
-            if (title.isEmpty() && !line.contains("₽") && !line.startsWith("в ")
-                    && !line.equals("Защищённая сделка") && !line.startsWith("доставка")
-                    && !line.equals("Доставка почтой") && line.length() > 15) {
-                title = line;
-            }
-
-            if (location.isEmpty() && line.startsWith("в ") && line.length() < 30) {
-                location = line;
-            }
-
-            if (i == lines.length - 1 || (i > 0 && (lines[i-1].contains("вчера")
-                    || lines[i-1].contains("сегодня") || lines[i-1].contains("мая")
-                    || lines[i-1].contains("апреля")))) {
-                String candidate = line.trim();
-                if (!candidate.contains("₽") && candidate.length() > 3 && !candidate.startsWith("в ")) {
-                    dealer = candidate;
-                }
-            }
-        }
-
-        builder.title(title.isEmpty() ? "Деталь" : title)
-                .price(price)
-                .location(location)
-                .dealer(dealer);
-    }
-
-    /**
-     * Заходит на детальную страницу и собирает полное описание
-     */
-    private String fetchDetailPage(BrowserContext ctx, String url) {
+    private PartPrice parseDetailPage(BrowserContext ctx, String url) {
         Page detailPage = null;
         try {
             detailPage = ctx.newPage();
             detailPage.navigate(url);
             detailPage.waitForLoadState(LoadState.NETWORKIDLE);
-            Thread.sleep(2000 + (int)(Math.random() * 2000));
+            Thread.sleep(1500);
 
-            StringBuilder sb = new StringBuilder();
+            String actualUrl = detailPage.url();
+
+            // Цена
+            String priceText = getTextByAttribute(detailPage, "data-field", "price");
+            if (priceText == null) return null;
+            priceText = priceText.replaceAll("[^\\d.]", "");
+            if (priceText.isEmpty()) return null;
+            BigDecimal price = new BigDecimal(priceText);
+
+            // Название
+            String title = "";
+            ElementHandle titleEl = detailPage.querySelector("h1.subject span");
+            if (titleEl != null) {
+                title = titleEl.innerText().trim();
+            }
 
             // Состояние
-            String condition = extractField(detailPage, "Состояние");
-            if (condition != null) sb.append("Состояние: ").append(condition).append("\n");
+            String condition = getTextByAttribute(detailPage, "data-field", "condition");
+
+            // Оригинальность
+            String authenticity = getTextByAttribute(detailPage, "data-field", "autoPartsAuthenticity");
 
             // Производитель
-            String manufacturer = extractField(detailPage, "Производитель");
-            if (manufacturer != null) sb.append("Производитель: ").append(manufacturer).append("\n");
+            String manufacturer = getTextByAttribute(detailPage, "data-field", "manufacturer");
 
             // Номер запчасти
-            String partNumber = extractField(detailPage, "Номер запчасти");
-            if (partNumber != null) sb.append("Номер запчасти: ").append(partNumber).append("\n");
+            String oem = getTextByAttribute(detailPage, "data-field", "autoPartsOemNumber");
 
-            // Подходит (автомобили)
-            String cars = extractCars(detailPage);
-            if (cars != null) sb.append("Подходит: ").append(cars).append("\n");
+            // Продавец
+            String seller = "";
+            ElementHandle sellerEl = detailPage.querySelector(".userNick a");
+            if (sellerEl != null) seller = sellerEl.innerText().trim();
 
-            // Примечание
-            String note = extractField(detailPage, "Примечание");
-            if (note != null) sb.append("Примечание: ").append(note).append("\n");
+            // Рейтинг
+            String rating = "";
+            ElementHandle ratingEl = detailPage.querySelector(".ratingPositive");
+            if (ratingEl != null) rating = ratingEl.innerText().trim();
 
-            // Рейтинг и отзывы
-            String rating = extractRating(detailPage);
-            if (rating != null) sb.append("Продавец: ").append(rating).append("\n");
+            // Город
+            String city = "";
+            List<ElementHandle> sellerDivs = detailPage.querySelectorAll(".seller-summary > div");
+            for (ElementHandle div : sellerDivs) {
+                String text = div.innerText().trim();
+                if (text.length() > 1 && text.length() < 30
+                        && !text.contains("Рейтинг")
+                        && !text.contains("отзыв")
+                        && !text.contains("Продавец")
+                        && !text.contains("на сайте")
+                        && !text.contains("предложений")
+                        && !text.matches(".*\\d{2,}.*")) {
+                    city = text;
+                }
+            }
 
-            // Наличие
-            String availability = extractAvailability(detailPage);
-            if (availability != null) sb.append("Наличие: ").append(availability).append("\n");
+            // Описание
+            String desc = getTextByAttribute(detailPage, "data-field", "text");
 
-            // Полный текст для контекста
-            String bodyText = detailPage.innerText("body");
-            if (bodyText.length() > 1500) bodyText = bodyText.substring(0, 1500) + "...";
-            sb.append("\nПолное описание:\n").append(bodyText);
+            // Собираем описание
+            StringBuilder sb = new StringBuilder();
+            if (condition != null) sb.append("Состояние: ").append(condition).append("\n");
+            if (authenticity != null) sb.append("Оригинальность: ").append(authenticity).append("\n");
+            if (manufacturer != null) sb.append("Производитель: ").append(manufacturer).append("\n");
+            if (oem != null) sb.append("Номер запчасти: ").append(oem.replaceAll("\\s+", "")).append("\n");
+            if (!seller.isEmpty()) sb.append("Продавец: ").append(seller).append("\n");
+            if (!rating.isEmpty()) sb.append("Рейтинг: ").append(rating).append("\n");
+            if (!city.isEmpty()) sb.append("Город: ").append(city).append("\n");
+            if (desc != null && desc.length() > 10)
+                sb.append("Описание: ").append(desc.substring(0, Math.min(300, desc.length()))).append("\n");
 
-            return sb.toString();
+            log.info("[{}] ✅ {} — {}₽",
+                    actualUrl.substring(Math.max(0, actualUrl.length() - 40)),
+                    title.length() > 50 ? title.substring(0, 50) : title, price);
+
+            return PartPrice.builder()
+                    .title(title)
+                    .price(price)
+                    .url(actualUrl)
+                    .location(city)
+                    .dealer(seller)
+                    .description(sb.toString())
+                    .build();
 
         } catch (Exception e) {
-            log.warn("Ошибка при загрузке детальной страницы {}: {}", url, e.getMessage());
+            log.warn("Ошибка {}: {}", url, e.getMessage());
             return null;
         } finally {
             if (detailPage != null) detailPage.close();
         }
     }
 
-    private String extractField(Page page, String fieldName) {
+    private String getTextByAttribute(Page page, String attr, String value) {
         try {
-            String text = page.innerText("body");
-            String[] lines = text.split("\n");
-            for (int i = 0; i < lines.length; i++) {
-                if (lines[i].trim().equals(fieldName) && i + 1 < lines.length) {
-                    return lines[i + 1].trim();
-                }
-            }
-        } catch (Exception e) {}
-        return null;
-    }
-
-    private String extractCars(Page page) {
-        try {
-            StringBuilder cars = new StringBuilder();
-            ElementHandle container = page.querySelector("[class*='css-'][class*='list']");
-            if (container != null) {
-                String text = container.innerText();
-                return text.replace("\n", ", ").trim();
-            }
-        } catch (Exception e) {}
-        return null;
-    }
-
-    private String extractRating(Page page) {
-        try {
-            String text = page.innerText("body");
-            if (text.contains("Рейтинг")) {
-                int idx = text.indexOf("Рейтинг");
-                return text.substring(idx, Math.min(idx + 80, text.length()))
-                        .replace("\n", " ").trim();
-            }
-        } catch (Exception e) {}
-        return null;
-    }
-
-    private String extractAvailability(Page page) {
-        try {
-            String text = page.innerText("body");
-            if (text.contains("В наличии") || text.contains("Под заказ")) {
-                int idx = text.indexOf("Наличие товара");
-                if (idx == -1) idx = text.indexOf("В наличии");
-                if (idx >= 0) {
-                    return text.substring(idx, Math.min(idx + 50, text.length()))
-                            .replace("\n", " ").trim();
-                }
-            }
-        } catch (Exception e) {}
-        return null;
+            ElementHandle el = page.querySelector("[" + attr + "='" + value + "']");
+            return el != null ? el.innerText().trim() : null;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private String randomUserAgent() {

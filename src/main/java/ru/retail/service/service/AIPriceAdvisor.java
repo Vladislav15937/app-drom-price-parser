@@ -71,7 +71,7 @@ public class AIPriceAdvisor {
                             Map.of("role", "user", "content", prompt)
                     ),
                     "temperature", 0.1,
-                    "max_tokens", 300
+                    "max_tokens", 1000
             );
 
             String json = objectMapper.writeValueAsString(requestBody);
