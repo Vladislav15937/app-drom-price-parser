@@ -15,7 +15,7 @@ import java.math.BigDecimal;
 @Schema(description = "Цена на запчасть")
 public class PartPrice {
 
-    @Schema(description = "Название", example = "Фара Toyota Aurion, Camry Powertec")
+    @Schema(description = "Название", example = "Фара Toyota Aurion, Camry Powertec 81130-06730")
     private String title;
 
     @Schema(description = "Цена в рублях", example = "4180")
@@ -32,5 +32,8 @@ public class PartPrice {
 
     @Schema(description = "Дата публикации")
     private String date;
+
+    @Schema(description = "Полное описание с детальной страницы")
+    private String description;
 }
 

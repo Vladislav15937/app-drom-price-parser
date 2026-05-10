@@ -28,7 +28,7 @@ apify:
     drom-scraper-id: Lz2PWiyvRnFjoINKV
 
 drom:
-  headless: true  # false для отладки, true для продакшена
+  headless: false  # false для отладки, true для продакшена
   proxy:
     url:  # Оставьте пустым или укажите http://login:pass@ip:port
 
