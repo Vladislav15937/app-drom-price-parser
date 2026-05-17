@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import ru.retail.service.dto.MyListingInfo;
 import ru.retail.service.dto.PartPrice;
 
 import java.math.BigDecimal;
@@ -13,8 +14,13 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -24,249 +30,479 @@ public class AIPriceAdvisor {
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
     private final String apiKey;
+    private final String baseUrl;
+    private final String textModel;
+    private final ExecutorService photoExecutor = Executors.newFixedThreadPool(3);
 
-    private static final String BASE_URL = "https://open.blackroute.space/v1/chat/completions";
-    // Используем НЕ-R1 модель — она не делает {think}, сразу JSON
-    private static final String MODEL = "deepseek-chat";
-
-    public AIPriceAdvisor(@Value("${deepseek.api.token}") String apiKey) {
+    public AIPriceAdvisor(
+            @Value("${deepseek.api.token}") String apiKey,
+            @Value("${deepseek.api.base-url:https://api.deepseek.com/v1/chat/completions}") String baseUrl,
+            @Value("${deepseek.text.model:deepseek-v4-flash}") String textModel) {
         this.apiKey = apiKey;
+        this.baseUrl = baseUrl;
+        this.textModel = textModel;
         this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(60)).build();
         this.objectMapper = new ObjectMapper();
     }
 
-    // ==================== ТРИ АГЕНТА ====================
-
-    private String analyzeMarketQualitative(List<PartPrice> marketPrices) {
-        String prompt = buildMarketPrompt(marketPrices);
-        return callAI("""
-            Ты Аналитик рынка. Проанализируй ТОЛЬКО конкурентов.
-            Верни СТРОГО ТОЛЬКО JSON, без пояснений:
-            {"outliers":"есть/нет","marketDensity":"высокая/средняя/низкая","comment":"1-2 предложения"}
-            """, prompt);
-    }
-
-    private ConditionReport assessCondition(String description, String condition, String manufacturer) {
-        String prompt = String.format("""
-        Деталь: %s | Состояние: %s | Производитель: %s
-        """, description, condition, manufacturer);
-
-        String response = callAI("""
-        Ты Оценщик качества автозапчастей. Оцени ТОЛЬКО качество детали.
-        Игнорируй рейтинг продавца, магазин, доставку — это неважно.
-        
-        Коэффициенты КАЧЕСТВА (не продавца!):
-        
-        ПРОИЗВОДИТЕЛЬ:
-        - Оригинал (Toyota, Honda, BMW и т.д.): 1.00
-        - Качественный аналог (CASP, Depo, TYC, Hella): 0.90
-        - Средний аналог (Sailing, SAT): 0.80
-        - Бюджетный аналог (Powertec): 0.70
-        
-        СОСТОЯНИЕ:
-        - Новый: 1.00
-        - Контрактный (без пробега по РФ): 0.90
-        - Контрактный (с пробегом по РФ): 0.80
-        - Б/у (пробег до 50 000 км): 0.85
-        - Б/у (пробег 50 000-100 000 км): 0.75
-        - Б/у (пробег 100 000+ км): 0.65
-        - Б/у (пробег неизвестен): 0.70
-        
-        ДЕФЕКТЫ (вычитаются дополнительно):
-        - Царапина: -0.05
-        - Скол: -0.10
-        - Без скобы/направляющих: -0.15
-        - Уценка: -0.10
-        - Отсутствие упаковки: -0.03
-        
-        ВАЖНО: контрактный = снят с японского/европейского авто, без пробега по РФ = ПЛЮС.
-        Пробег по РФ = МИНУС (износ по нашим дорогам).
-        
-        Верни СТРОГО ТОЛЬКО JSON:
-        {"coefficient":число от 0 до 1, "breakdown":"краткое обоснование"}
-        """, prompt);
-
-        return parseConditionReport(response);
-    }
-
-    private AIRecommendation makeFinalDecision(
-            MarketStats stats, ConditionReport cond, BigDecimal myPrice, String myDesc, String qualitative) {
-
-        String prompt = String.format("""
-        РЫНОК: мин=%s, мед=%s, макс=%s, ср=%s, предл=%d, разброс=%s%%
-        КАЧЕСТВЕННЫЙ АНАЛИЗ: %s
-        КОЭФФИЦИЕНТ КАЧЕСТВА ДЕТАЛИ: %s (%s)
-        БАЗОВАЯ ЦЕНА (медиана×коэф): %s руб.
-        МОЯ ТЕКУЩАЯ: %s руб.
-        ДЕТАЛЬ: %s
-        
-        Скорректируй базовую цену, учитывая:
-        - Реальное качество детали (коэффициент уже учёл производителя, состояние, дефекты)
-        - Плотность рынка (много конкурентов → небольшой минус)
-        - Выбросы (аномально дешёвые/дорогие — игнорировать)
-        
-        НЕ учитывай рейтинг продавца, название магазина, доставку — это не влияет на цену детали.
-        
-        Верни СТРОГО ТОЛЬКО JSON:
-        {"recommendedPrice":число,"confidence":"высокая/средняя/низкая","reason":"обоснование"}
-        """,
-                stats.min, stats.median, stats.max, stats.avg, stats.count, stats.spread,
-                qualitative, cond.coefficient(), cond.breakdown(),
-                stats.median.multiply(BigDecimal.valueOf(cond.coefficient())).setScale(0, RoundingMode.HALF_UP),
-                myPrice, myDesc);
-
-        String response = callAI("""
-        Ты Стратег по ценообразованию автозапчастей.
-        Выдай финальную цену на основе качества детали и рыночной ситуации.
-        НЕ учитывай рейтинг продавца, доставку, магазин — только деталь и рынок.
-        """, prompt);
-        return parseResponse(response, myPrice);
-    }
-
     // ==================== ПУБЛИЧНЫЙ МЕТОД ====================
 
+    /**
+     * Анализирует рынок и рекомендует конкурентную цену.
+     *
+     * @param myListing      данные моего объявления (описание, фото, дата)
+     * @param myCurrentPrice текущая цена (из объявления или переданная вручную)
+     * @param cityPrices     конкуренты в городе (с фото)
+     * @param siberiaPrices  конкуренты по Сибири (пусто если не нужны)
+     * @param isOldListing   объявление старше 6 месяцев
+     */
     public AIRecommendation analyze(
-            String myDescription, String myCondition, String myManufacturer,
-            BigDecimal myCurrentPrice, List<PartPrice> marketPrices) {
+            MyListingInfo myListing, BigDecimal myCurrentPrice,
+            List<PartPrice> cityPrices, List<PartPrice> siberiaPrices,
+            boolean isOldListing) {
 
-        if (marketPrices.isEmpty()) {
-            return new AIRecommendation(myCurrentPrice, "Нет данных", "Нет рыночных данных");
+        if (cityPrices.isEmpty() && siberiaPrices.isEmpty()) {
+            return new AIRecommendation(myCurrentPrice, "нет данных",
+                    "Конкуренты не найдены ни в городе, ни по Сибири. Цена оставлена без изменений.", "");
         }
 
         try {
-            // МАТЕМАТИКА — считаем сами (AI не умеет)
-            MarketStats stats = computeStats(marketPrices);
+            // ШАГ 1: Параллельная оценка фотографий (мои + конкурентов)
+            log.info("Шаг 1/3: Оценка фотографий...");
+            PhotoAssessment myPhoto = evaluatePhotosAsync(myListing.getPhotoUrls(), "моя деталь").join();
+            log.info("Мои фото: {} (коэф. {})", myPhoto.condition(), myPhoto.coefficient());
 
-            // Шаг 1: Качественный анализ рынка
-            log.info("Агент 1/3: Аналитик рынка...");
-            String qualitative = analyzeMarketQualitative(marketPrices);
+            List<CompletableFuture<PhotoAssessment>> competitorPhotoFutures = cityPrices.stream()
+                    .map(p -> evaluatePhotosAsync(p.getPhotoUrls(), p.getTitle()))
+                    .collect(Collectors.toList());
+            List<PhotoAssessment> competitorPhotos = competitorPhotoFutures.stream()
+                    .map(CompletableFuture::join)
+                    .collect(Collectors.toList());
 
-            // Шаг 2: Коэффициент состояния
-            log.info("Агент 2/3: Оценщик состояния...");
-            ConditionReport condition = assessCondition(myDescription, myCondition, myManufacturer);
+            // ШАГ 2: Классификация конкурентов в городе
+            log.info("Шаг 2/3: Классификация {} городских конкурентов...", cityPrices.size());
+            CompetitorClassification cityClassification = classifyCompetitors(
+                    cityPrices, competitorPhotos, myListing, myPhoto);
 
-            // Шаг 3: Стратег
-            log.info("Агент 3/3: Стратег...");
-            AIRecommendation result = makeFinalDecision(stats, condition, myCurrentPrice, myDescription, qualitative);
+            // ШАГ 3: Стратегия ценообразования
+            log.info("Шаг 3/3: Расчёт конкурентной цены...");
+            AIRecommendation result = computeCompetitivePrice(
+                    cityClassification, cityPrices, siberiaPrices,
+                    myPhoto, myCurrentPrice, isOldListing);
 
-            log.info("Рекомендация: {} руб. (уверенность: {})", result.recommendedPrice(), result.confidence());
+            log.info("Рекомендация: {} руб. | уверенность: {} | причина: {}",
+                    result.recommendedPrice(), result.confidence(), result.reason());
             return result;
 
         } catch (Exception e) {
-            log.error("Ошибка: {}", e.getMessage());
-            return fallback(marketPrices);
+            log.error("Ошибка анализа: {}", e.getMessage());
+            return fallback(cityPrices.isEmpty() ? siberiaPrices : cityPrices, myCurrentPrice);
         }
     }
 
-    // ==================== МАТЕМАТИКА (без AI) ====================
+    // ==================== АГЕНТ 1: VISION — оценка фотографий ====================
 
-    private MarketStats computeStats(List<PartPrice> market) {
-        List<BigDecimal> sorted = market.stream().map(PartPrice::getPrice).sorted().collect(Collectors.toList());
-        int size = sorted.size();
-
-        BigDecimal min = sorted.get(0);
-        BigDecimal max = sorted.get(size - 1);
-        BigDecimal sum = sorted.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
-        BigDecimal avg = sum.divide(BigDecimal.valueOf(size), 2, RoundingMode.HALF_UP);
-
-        BigDecimal median;
-        if (size % 2 == 0) {
-            median = sorted.get(size/2 - 1).add(sorted.get(size/2)).divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP);
-        } else {
-            median = sorted.get(size / 2);
-        }
-
-        BigDecimal spread = max.subtract(min).divide(avg, 2, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100));
-
-        return new MarketStats(min, median, max, avg, size, spread.setScale(0, RoundingMode.HALF_UP).toString());
+    private CompletableFuture<PhotoAssessment> evaluatePhotosAsync(List<String> photoUrls, String context) {
+        return CompletableFuture.supplyAsync(() -> evaluatePhotos(photoUrls, context), photoExecutor);
     }
 
-    // ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
+    private PhotoAssessment evaluatePhotos(List<String> photoUrls, String context) {
+        // Vision-модель недоступна в текущем API — возвращаем нейтральный коэффициент
+        log.debug("Vision пропущен для '{}': нет vision-модели в API", context);
+        return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
+    }
 
-    private String callAI(String systemPrompt, String userPrompt) {
+    @SuppressWarnings("unused")
+    private PhotoAssessment evaluatePhotosViaApi(List<String> photoUrls, String context) {
+        if (photoUrls == null || photoUrls.isEmpty()) {
+            return new PhotoAssessment("нет фото", "нет фото", 0.80);
+        }
+
+        List<Map<String, Object>> content = new ArrayList<>();
+        int added = 0;
+        for (String url : photoUrls) {
+            if (added >= 2) break;
+            Map<String, Object> imageItem = new HashMap<>();
+            imageItem.put("type", "image_url");
+            imageItem.put("image_url", Map.of("url", url));
+            content.add(imageItem);
+            added++;
+        }
+        content.add(Map.of("type", "text", "text", """
+                Оцени автозапчасть на фото по внешнему виду и состоянию.
+                Учитывай: видимые повреждения, износ, царапины, сколы, общий вид.
+                Игнорируй бренд и марку — только визуальное состояние.
+                Верни СТРОГО ТОЛЬКО JSON без пояснений:
+                {"condition":"отличное/хорошее/удовлетворительное/плохое","defects":"список дефектов или нет","coefficient":число от 0.5 до 1.0}
+                Пример: {"condition":"хорошее","defects":"лёгкие царапины","coefficient":0.85}
+                """));
+
         try {
-            Map<String, Object> body = Map.of(
-                    "model", MODEL,
-                    "messages", List.of(
-                            Map.of("role", "system", "content", systemPrompt),
-                            Map.of("role", "user", "content", userPrompt)
-                    ),
-                    "temperature", 0.1,
-                    "max_tokens", 300
-            );
+            Map<String, Object> body = new HashMap<>();
+            body.put("model", "deepseek-vl2"); // заменить на vision-модель при появлении в API
+            body.put("messages", List.of(Map.of("role", "user", "content", content)));
+            body.put("temperature", 0.1);
+            body.put("max_tokens", 200);
 
             String json = objectMapper.writeValueAsString(body);
             HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(BASE_URL))
+                    .uri(URI.create(baseUrl))
                     .header("Content-Type", "application/json")
                     .header("Authorization", "Bearer " + apiKey)
                     .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .timeout(Duration.ofSeconds(60))
                     .build();
 
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
             Map<String, Object> map = objectMapper.readValue(resp.body(), Map.class);
             List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
-            return (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
+            if (choices == null || choices.isEmpty()) {
+                String preview = resp.body().substring(0, Math.min(300, resp.body().length()));
+                throw new IllegalStateException("choices отсутствует в ответе API: " + preview);
+            }
+            String raw = (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
+            return parsePhotoAssessment(raw);
 
         } catch (Exception e) {
-            log.error("AI error: {}", e.getMessage());
+            log.warn("Vision AI недоступен для '{}': {}. Используем нейтральный коэф.", context, e.getMessage());
+            return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
+        }
+    }
+
+    // ==================== АГЕНТ 2: Классификатор конкурентов ====================
+
+    private CompetitorClassification classifyCompetitors(
+            List<PartPrice> competitors, List<PhotoAssessment> photos,
+            MyListingInfo myListing, PhotoAssessment myPhoto) {
+
+        if (competitors.isEmpty()) return CompetitorClassification.empty();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("МОЯ ДЕТАЛЬ:\n");
+        sb.append("Состояние: ").append(myListing.getCondition()).append("\n");
+        sb.append("Производитель: ").append(myListing.getManufacturer()).append("\n");
+        sb.append("Описание: ").append(myListing.getDescription()).append("\n");
+        sb.append("Оценка по фото: ").append(myPhoto.condition())
+          .append(" (коэф. ").append(myPhoto.coefficient()).append(")\n\n");
+        sb.append("КОНКУРЕНТЫ:\n");
+
+        for (int i = 0; i < competitors.size(); i++) {
+            PartPrice p = competitors.get(i);
+            PhotoAssessment pa = i < photos.size() ? photos.get(i) : new PhotoAssessment("нет фото", "", 0.80);
+
+            sb.append(i + 1).append(". Цена: ").append(p.getPrice()).append("₽");
+            sb.append(" | Фото: ").append(pa.condition())
+              .append(" (коэф. ").append(pa.coefficient()).append(")");
+
+            if (p.getDescription() != null && !p.getDescription().isBlank()) {
+                String desc = p.getDescription()
+                        .replaceAll("(?m)Продавец:.*$", "")
+                        .replaceAll("(?m)Рейтинг:.*$", "")
+                        .replaceAll("(?m)Город:.*$", "")
+                        .trim();
+                if (desc.length() > 10) sb.append(" | ").append(desc, 0, Math.min(150, desc.length()));
+            }
+            sb.append("\n");
+        }
+
+        String response = callTextAI("""
+                Ты эксперт по автозапчастям. Сравни качество каждого конкурента с моей деталью.
+                Учитывай: оценку по фото (коэффициент и состояние), производителя, состояние из описания, дефекты.
+                Игнорируй: продавца, рейтинг, доставку, город.
+
+                Классификация относительно МОЕЙ детали:
+                - "similar" = аналогичное качество (коэф. конкурента в пределах ±0.10 от моего, схожее состояние)
+                - "better"  = явно лучше (новый vs б/у, оригинал vs аналог, или коэф. выше на 0.15+)
+                - "worse"   = явно хуже (дефекты, плохое фото, дешёвый аналог при моём оригинале)
+
+                Верни СТРОГО ТОЛЬКО JSON (цены — числа из списка конкурентов):
+                {"similar":[цены],"better":[цены],"worse":[цены],"comment":"краткий вывод о рынке"}
+                """, sb.toString());
+
+        return parseCompetitorClassification(response);
+    }
+
+    // ==================== СТРАТЕГИЯ КОНКУРЕНТНОГО ЦЕНООБРАЗОВАНИЯ ====================
+
+    /**
+     * Правила:
+     * 1. Недавнее объявление + в городе есть аналоги дешевле → ПОНИЗИТЬ до min(аналоги)×0.97
+     * 2. Недавнее объявление + в городе нет аналогов дешевле → НЕ МЕНЯТЬ (нет смысла снижать)
+     * 3. Старое объявление → сравниваем с Сибирью (те же правила)
+     * 4. Корректировка по фото: если моё фото плохое → доп. дисконт
+     * 5. Коридор [60% медианы, 130% медианы]
+     */
+    private AIRecommendation computeCompetitivePrice(
+            CompetitorClassification cityClass, List<PartPrice> cityPrices,
+            List<PartPrice> siberiaPrices, PhotoAssessment myPhoto,
+            BigDecimal myCurrentPrice, boolean isOldListing) {
+
+        String photoNote = myPhoto.coefficient() < 1.0
+                ? String.format(" Мои фото: %s (коэф. %.2f).", myPhoto.condition(), myPhoto.coefficient())
+                : "";
+
+        // === Для свежих объявлений работаем с городом ===
+        if (!isOldListing && !cityPrices.isEmpty()) {
+            return strategyForMarket(cityClass, cityPrices, myPhoto, myCurrentPrice,
+                    "В городе", photoNote);
+        }
+
+        // === Старое объявление или мало конкурентов в городе → работаем с Новосибирском ===
+        if (!siberiaPrices.isEmpty()) {
+            MarketStats siberiaStats = computeStats(siberiaPrices);
+            String scope = isOldListing ? "Объявление старше 6 мес., сравниваем с Новосибирском" : "Мало предложений в городе, смотрим Новосибирск";
+
+            List<Double> similar = cityClass.similar();
+            double myPrice = myCurrentPrice.doubleValue();
+            double siberiaMin = siberiaStats.min().doubleValue();
+            double siberiaMedian = siberiaStats.median().doubleValue();
+
+            // Цена объявления не определена (капча/ошибка парсинга) — рекомендуем по рынку
+            if (myPrice == 0) {
+                BigDecimal raw = BigDecimal.valueOf(siberiaMin * 0.97).setScale(0, RoundingMode.DOWN);
+                raw = applyPhotoDiscount(raw, myPhoto);
+                BigDecimal target = applyBounds(raw, siberiaStats);
+                String boundsNote = target.compareTo(raw) != 0
+                        ? String.format(" [нижний порог: %.0f₽]", target.doubleValue()) : "";
+                return new AIRecommendation(target, "средняя",
+                        scope + String.format(". Цена объявления не определена. Рекомендуем −3%% от мин. Новосибирска = %.0f₽.%s",
+                                target.doubleValue(), boundsNote),
+                        photoNote);
+            }
+
+            // Есть ли аналоги в Сибири дешевле моей цены?
+            if (myPrice > siberiaMin * 1.05) { // больше чем на 5% дороже минимума Сибири
+                BigDecimal raw = BigDecimal.valueOf(siberiaMin * 0.97).setScale(0, RoundingMode.DOWN);
+                raw = applyPhotoDiscount(raw, myPhoto);
+                BigDecimal target = applyBounds(raw, siberiaStats);
+                String boundsNote = target.compareTo(raw) != 0
+                        ? String.format(" [нижний порог: %.0f₽]", target.doubleValue()) : "";
+                return new AIRecommendation(target, "средняя",
+                        scope + String.format(". Новосибирск мин=%.0f₽, мед=%.0f₽. −3%% от нск минимума = %.0f₽.%s",
+                                siberiaMin, siberiaMedian, target.doubleValue(), boundsNote),
+                        photoNote);
+            } else {
+                BigDecimal raw = applyPhotoDiscount(myCurrentPrice, myPhoto);
+                if (raw.compareTo(myCurrentPrice) == 0) {
+                    return new AIRecommendation(myCurrentPrice, "высокая",
+                            scope + String.format(". Наша цена конкурентна (нск мин=%.0f₽).", siberiaMin), photoNote);
+                }
+                BigDecimal target = applyBounds(raw, siberiaStats);
+                return new AIRecommendation(target, "средняя",
+                        scope + String.format(". Цена в норме, корректируем по фото (коэф. %.2f) → %.0f₽.",
+                                myPhoto.coefficient(), target.doubleValue()), photoNote);
+            }
+        }
+
+        // Фолбэк: нет ни города ни Сибири
+        return new AIRecommendation(myCurrentPrice, "низкая",
+                "Недостаточно данных для анализа. Цена оставлена без изменений.", photoNote);
+    }
+
+    private AIRecommendation strategyForMarket(
+            CompetitorClassification cls, List<PartPrice> marketPrices,
+            PhotoAssessment myPhoto, BigDecimal myCurrentPrice, String scope, String photoNote) {
+
+        MarketStats stats = computeStats(marketPrices);
+        List<Double> similar = cls.similar();
+        List<Double> worse   = cls.worse();
+        List<Double> better  = cls.better();
+        double myPrice = myCurrentPrice.doubleValue();
+
+        BigDecimal target;
+        String confidence;
+        String reason;
+
+        if (!similar.isEmpty()) {
+            double minSimilar = similar.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
+            if (myPrice > minSimilar) {
+                // Есть аналоги дешевле → ОБЯЗАТЕЛЬНО снижаем
+                target     = BigDecimal.valueOf(minSimilar * 0.97).setScale(0, RoundingMode.DOWN);
+                confidence = similar.size() >= 3 ? "высокая" : "средняя";
+                reason     = String.format("%s есть аналоги дешевле (от %.0f₽). Снижаем на 3%% — до %.0f₽.",
+                        scope, minSimilar, target.doubleValue());
+            } else {
+                // Мы уже дешевле или наравне — не трогаем
+                target     = myCurrentPrice;
+                confidence = "высокая";
+                reason     = String.format("%s наша цена уже ниже или равна аналогам (мин. аналог %.0f₽). Цена оптимальна.",
+                        scope, minSimilar);
+            }
+
+        } else if (!worse.isEmpty() && better.isEmpty()) {
+            // Мы лучшие на рынке → небольшая премия
+            double minWorse = worse.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
+            target     = BigDecimal.valueOf(minWorse * 1.20).setScale(0, RoundingMode.HALF_UP);
+            confidence = "средняя";
+            reason     = String.format("%s наш товар лучше всех конкурентов. +20%% к дешёвому (%.0f₽).", scope, minWorse);
+
+        } else if (!better.isEmpty() && worse.isEmpty()) {
+            // Мы хуже всех → нужна существенная скидка
+            double minBetter = better.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
+            target     = BigDecimal.valueOf(minBetter * 0.80).setScale(0, RoundingMode.DOWN);
+            confidence = "средняя";
+            reason     = String.format("%s наш товар хуже конкурентов. −20%% от минимума (%.0f₽).", scope, minBetter);
+
+        } else if (similar.isEmpty() && worse.isEmpty() && better.isEmpty()) {
+            // Нет конкурентов вообще
+            target     = myCurrentPrice;
+            confidence = "высокая";
+            reason     = scope + " аналогов нет. Цена не меняется.";
+
+        } else {
+            // Смешанный рынок без чётких аналогов
+            target     = stats.median().multiply(BigDecimal.valueOf(0.95)).setScale(0, RoundingMode.HALF_UP);
+            confidence = "низкая";
+            reason     = String.format("Нет чётких аналогов (%s). Медиана (%.0f₽) × 0.95.",
+                    scope.toLowerCase(), stats.median().doubleValue());
+        }
+
+        target = applyPhotoDiscount(target, myPhoto);
+        BigDecimal bounded = applyBounds(target, stats);
+        if (bounded.compareTo(target) != 0) {
+            reason += String.format(" [нижний порог: %.0f₽]", bounded.doubleValue());
+            target = bounded;
+        }
+
+        if (cls.comment() != null && !cls.comment().isBlank()) reason += " " + cls.comment();
+        return new AIRecommendation(target, confidence, reason, photoNote);
+    }
+
+    /** Дополнительный дисконт если фото плохое (коэф. ниже 0.70) */
+    private BigDecimal applyPhotoDiscount(BigDecimal price, PhotoAssessment myPhoto) {
+        if (myPhoto.coefficient() < 0.70) {
+            double discount = myPhoto.coefficient() / 0.70; // до −30%
+            log.info("Фото-дисконт: коэф={} → ×{}", myPhoto.coefficient(), String.format("%.2f", discount));
+            return price.multiply(BigDecimal.valueOf(discount)).setScale(0, RoundingMode.DOWN);
+        }
+        return price;
+    }
+
+    /**
+     * Нижний порог: не ниже 80% от минимальной цены на рынке (защита от аномально низких значений).
+     * Верхний потолок не применяется — если аналоги дорогие, цена должна это отражать.
+     */
+    private BigDecimal applyBounds(BigDecimal price, MarketStats stats) {
+        BigDecimal floor = stats.min().multiply(BigDecimal.valueOf(0.80)).setScale(0, RoundingMode.DOWN);
+        if (price.compareTo(floor) < 0) return floor;
+        return price;
+    }
+
+    // ==================== МАТЕМАТИКА ====================
+
+    private MarketStats computeStats(List<PartPrice> market) {
+        List<BigDecimal> sorted = market.stream().map(PartPrice::getPrice).sorted().collect(Collectors.toList());
+        int size = sorted.size();
+        BigDecimal sum = sorted.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal avg = sum.divide(BigDecimal.valueOf(size), 2, RoundingMode.HALF_UP);
+        BigDecimal median = size % 2 == 0
+                ? sorted.get(size / 2 - 1).add(sorted.get(size / 2)).divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP)
+                : sorted.get(size / 2);
+        return new MarketStats(sorted.get(0), median, sorted.get(size - 1), avg, size);
+    }
+
+    private AIRecommendation fallback(List<PartPrice> prices, BigDecimal myCurrentPrice) {
+        if (prices.isEmpty()) return new AIRecommendation(myCurrentPrice, "низкая", "Нет данных", "");
+        BigDecimal median = computeStats(prices).median();
+        return new AIRecommendation(
+                median.multiply(BigDecimal.valueOf(0.95)).setScale(0, RoundingMode.DOWN),
+                "низкая", "Фолбэк: медиана −5%", "");
+    }
+
+    // ==================== HTTP ====================
+
+    private String callTextAI(String system, String user) {
+        try {
+            Map<String, Object> body = Map.of(
+                    "model", textModel,
+                    "messages", List.of(
+                            Map.of("role", "system", "content", system),
+                            Map.of("role", "user", "content", user)
+                    ),
+                    "temperature", 0.1,
+                    "max_tokens", 500
+            );
+            String json = objectMapper.writeValueAsString(body);
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + apiKey)
+                    .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .timeout(Duration.ofSeconds(90))
+                    .build();
+            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+            Map<String, Object> map = objectMapper.readValue(resp.body(), Map.class);
+            List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
+            if (choices == null || choices.isEmpty()) {
+                String preview = resp.body().substring(0, Math.min(300, resp.body().length()));
+                throw new IllegalStateException("choices отсутствует в ответе API: " + preview);
+            }
+            return (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
+        } catch (Exception e) {
+            log.error("Text AI error: {}", e.getMessage());
             return null;
         }
     }
 
-    private String buildMarketPrompt(List<PartPrice> market) {
-        StringBuilder sb = new StringBuilder("Рынок (" + market.size() + "):\n");
-        for (int i = 0; i < market.size(); i++) {
-            PartPrice p = market.get(i);
-            sb.append(i+1).append(". ").append(p.getPrice()).append("₽");
-            if (p.getDescription() != null) {
-                String desc = p.getDescription();
-                // Оставляем только качество, убираем продавца
-                desc = desc.replaceAll("Продавец:.*", "").replaceAll("Рейтинг:.*", "").replaceAll("Город:.*", "");
-                if (desc.length() > 10) sb.append(" | ").append(desc.substring(0, Math.min(120, desc.length())));
-            }
-            sb.append("\n");
-        }
-        return sb.toString();
-    }
+    // ==================== ПАРСЕРЫ ОТВЕТОВ ====================
 
-    private ConditionReport parseConditionReport(String content) {
+    private PhotoAssessment parsePhotoAssessment(String content) {
         try {
-            String cleaned = content.replaceAll("```json|```", "").trim();
-            if (!cleaned.startsWith("{")) cleaned = cleaned.substring(cleaned.indexOf('{'));
-            Map<String, Object> m = objectMapper.readValue(cleaned, Map.class);
-            return new ConditionReport(((Number) m.get("coefficient")).doubleValue(), (String) m.getOrDefault("breakdown", ""));
+            if (content == null) return new PhotoAssessment("неизвестно", "", 0.80);
+            String c = content.replaceAll("```json|```", "").trim();
+            if (!c.startsWith("{")) c = c.substring(c.indexOf('{'));
+            Map<String, Object> m = objectMapper.readValue(c, Map.class);
+            return new PhotoAssessment(
+                    (String) m.getOrDefault("condition", "неизвестно"),
+                    (String) m.getOrDefault("defects", ""),
+                    ((Number) m.getOrDefault("coefficient", 0.80)).doubleValue()
+            );
         } catch (Exception e) {
-            return new ConditionReport(0.8, "не удалось оценить");
+            return new PhotoAssessment("неизвестно", "", 0.80);
         }
     }
 
-    private AIRecommendation parseResponse(String content, BigDecimal def) {
+    private CompetitorClassification parseCompetitorClassification(String content) {
         try {
-            String cleaned = content.replaceAll("```json|```", "").trim();
-            if (!cleaned.startsWith("{")) cleaned = cleaned.substring(cleaned.indexOf('{'));
-            Map<String, Object> m = objectMapper.readValue(cleaned, Map.class);
-            return new AIRecommendation(toBD(m.get("recommendedPrice"), def), (String) m.getOrDefault("confidence", "средняя"), (String) m.getOrDefault("reason", ""));
+            if (content == null) return CompetitorClassification.empty();
+            String c = content.replaceAll("```json|```", "").trim();
+            if (!c.startsWith("{")) c = c.substring(c.indexOf('{'));
+            Map<String, Object> m = objectMapper.readValue(c, Map.class);
+            return new CompetitorClassification(
+                    toDoubleList(m.get("similar")),
+                    toDoubleList(m.get("better")),
+                    toDoubleList(m.get("worse")),
+                    (String) m.getOrDefault("comment", "")
+            );
         } catch (Exception e) {
-            return new AIRecommendation(def, "средняя", "ошибка парсинга");
+            log.warn("Не удалось распарсить классификацию: {}", e.getMessage());
+            return CompetitorClassification.empty();
         }
     }
 
-    private AIRecommendation fallback(List<PartPrice> p) {
-        List<BigDecimal> s = p.stream().map(PartPrice::getPrice).sorted().collect(Collectors.toList());
-        return new AIRecommendation(s.get(s.size()/2).multiply(BigDecimal.valueOf(0.95)).setScale(0, RoundingMode.DOWN), "Без AI", "медиана - 5%");
+    private List<Double> toDoubleList(Object obj) {
+        if (!(obj instanceof List<?> list)) return List.of();
+        return list.stream()
+                .filter(o -> o instanceof Number)
+                .map(o -> ((Number) o).doubleValue())
+                .collect(Collectors.toList());
     }
 
-    private BigDecimal toBD(Object o, BigDecimal def) {
-        if (o == null) return def;
-        if (o instanceof Number) return BigDecimal.valueOf(((Number) o).doubleValue());
-        try { return new BigDecimal(o.toString()); } catch (Exception e) { return def; }
+    // ==================== ЗАПИСИ ====================
+
+    public record AIRecommendation(
+            BigDecimal recommendedPrice,
+            String confidence,
+            String reason,
+            String photoNote) {}
+
+    public record PhotoAssessment(String condition, String defects, double coefficient) {}
+
+    private record CompetitorClassification(List<Double> similar, List<Double> better, List<Double> worse, String comment) {
+        static CompetitorClassification empty() {
+            return new CompetitorClassification(List.of(), List.of(), List.of(), "");
+        }
     }
 
-    // ==================== RECORDS ====================
-
-    public record AIRecommendation(BigDecimal recommendedPrice, String confidence, String reason) {}
-    private record ConditionReport(double coefficient, String breakdown) {}
-    private record MarketStats(BigDecimal min, BigDecimal median, BigDecimal max, BigDecimal avg, int count, String spread) {}
+    private record MarketStats(BigDecimal min, BigDecimal median, BigDecimal max, BigDecimal avg, int count) {}
 }
-

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Владислав\\\\IdeaProjects\\\\app-drom-price-parser\" -Force)",
+      "Bash(Select-Object -Property Name, PSIsContainer)",
+      "Bash(mvn compile *)"
+    ]
+  }
+}

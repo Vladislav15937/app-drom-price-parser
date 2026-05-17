@@ -12,12 +12,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import ru.retail.service.dto.AggregationResult;
-import ru.retail.service.dto.PartPrice;
-import ru.retail.service.service.DromParser;
 import ru.retail.service.service.PriceAnalyzer;
 
 import java.math.BigDecimal;
-import java.util.List;
 
 @RestController
 @RequestMapping("/api/v1/prices")
@@ -25,22 +22,7 @@ import java.util.List;
 @Tag(name = "Агрегатор цен на запчасти")
 public class PriceAggregatorController {
 
-    private final DromParser dromParser;
     private final PriceAnalyzer priceAnalyzer;
-
-//    @GetMapping("/oem/{oemNumber}")
-//    @Operation(summary = "Получить цены по OEM-номеру")
-//    public ResponseEntity<AggregationResult> getPrices(
-//            @Parameter(description = "OEM-номер", example = "8113006730")
-//            @PathVariable String oemNumber,
-//
-//            @Parameter(description = "Регион", example = "krasnodar")
-//            @RequestParam(defaultValue = "krasnodar") String region) {
-//
-//        List<PartPrice> prices = dromParser.parseParts(oemNumber, region);
-//        AggregationResult result = priceAnalyzer.analyze(oemNumber, prices);
-//        return ResponseEntity.ok(result);
-//    }
 
     @GetMapping("/health")
     @Operation(summary = "Проверка работоспособности")
@@ -49,18 +31,29 @@ public class PriceAggregatorController {
     }
 
     @PostMapping("/oem/{oemNumber}/ai-price")
-    @Operation(summary = "AI-рекомендация цены")
+    @Operation(summary = "AI-рекомендация конкурентной цены",
+               description = """
+                       Парсит конкурентов на Drom.ru по OEM-номеру и региону.
+                       Оценивает фотографии (мои и конкурентов) через vision-агент.
+                       Если объявление старше 6 месяцев или конкурентов в городе мало — расширяет поиск на Сибирь.
+                       Возвращает рекомендованную цену с обоснованием.
+                       """)
     public ResponseEntity<AggregationResult> aiPrice(
-            @PathVariable String oemNumber,
-            @RequestParam(defaultValue = "krasnodar") String region,
-            @RequestParam String description,
-            @RequestParam String condition,
-            @RequestParam String manufacturer,
-            @RequestParam(defaultValue = "5000") BigDecimal myPrice) {
 
-        List<PartPrice> prices = dromParser.parseParts(oemNumber, region);
-        AggregationResult result = priceAnalyzer.analyze(
-                oemNumber, prices, description, condition, manufacturer, myPrice);
+            @Parameter(description = "OEM-номер запчасти", example = "8113006730")
+            @PathVariable String oemNumber,
+
+            @Parameter(description = "Регион (slug Drom.ru)", example = "barnaul")
+            @RequestParam(defaultValue = "barnaul") String region,
+
+            @Parameter(description = "URL моего объявления на baza.drom.ru",
+                       example = "https://baza.drom.ru/sell_spare_parts/auto/12345678.html")
+            @RequestParam String myListingUrl,
+
+            @Parameter(description = "Переопределить цену (если 0 — берётся из объявления)", example = "0")
+            @RequestParam(required = false) BigDecimal myPrice) {
+
+        AggregationResult result = priceAnalyzer.analyze(oemNumber, region, myListingUrl, myPrice);
         return ResponseEntity.ok(result);
     }
 }

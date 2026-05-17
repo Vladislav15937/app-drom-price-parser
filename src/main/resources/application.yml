@@ -35,6 +35,9 @@ drom:
 deepseek:
   api:
     token: sk-v0VUKD3dAXgYlikrioAGwQ
+    base-url: https://open.blackroute.space/v1/chat/completions
+  text:
+    model: deepseek-chat
 
 #    sk-70c0e9c831ec41568ade1fa9124aeeb8
 

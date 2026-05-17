@@ -41,9 +41,31 @@ public class AggregationResult {
     @Schema(description = "Обоснование AI")
     private String aiReason;
 
-    @Schema(description = "Найденные предложения")
+    @Schema(description = "Количество конкурентов найдено в городе")
+    private int cityCompetitorCount;
+
+    @Schema(description = "Количество конкурентов найдено по Сибири (0 если не искали)")
+    private int siberiaCompetitorCount;
+
+    @Schema(description = "Искали ли рынок Сибири (актуально для старых объявлений)")
+    private boolean searchedSiberia;
+
+    @Schema(description = "Оценка моей детали по фото")
+    private String myPhotoAssessment;
+
+    @Schema(description = "Дата публикации моего объявления")
+    private String myListingDate;
+
+    @Schema(description = "Краткий вывод по рыночной ситуации")
+    private String marketNote;
+
+    @Schema(description = "Найденные предложения в городе")
     @Builder.Default
     private List<PartPrice> items = Collections.emptyList();
+
+    @Schema(description = "Найденные предложения по Сибири")
+    @Builder.Default
+    private List<PartPrice> siberiaItems = Collections.emptyList();
 
     @Schema(description = "Время сбора")
     private Instant collectedAt;

@@ -7,6 +7,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 @Data
 @Builder
@@ -30,8 +31,11 @@ public class PartPrice {
     @Schema(description = "Название магазина")
     private String dealer;
 
-    @Schema(description = "Дата публикации")
-    private String date;
+    @Schema(description = "Дата публикации объявления", example = "15 ноября 2024")
+    private String publishedDate;
+
+    @Schema(description = "URL фотографий детали (до 3 штук)")
+    private List<String> photoUrls;
 
     @Schema(description = "Полное описание с детальной страницы")
     private String description;
