@@ -37,6 +37,9 @@ public class PartPrice {
     @Schema(description = "URL фотографий детали (до 3 штук)")
     private List<String> photoUrls;
 
+    @Schema(description = "OEM-номер из объявления (нормализованный, без пробелов)")
+    private String oem;
+
     @Schema(description = "Полное описание с детальной страницы")
     private String description;
 }

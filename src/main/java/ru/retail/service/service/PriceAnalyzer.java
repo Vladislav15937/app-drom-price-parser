@@ -46,8 +46,11 @@ public class PriceAnalyzer {
                 myPrice, myListing.getPublishedDate(), myListing.getPhotoUrls().size());
 
         // 2. Парсим конкурентов в городе (только полные узлы, без ремкомплектов/поршней)
-        List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region);
-        List<PartPrice> cityPrices = filterAssemblies(cityRaw);
+        String normalizedMyUrl = myListingUrl.toLowerCase().replaceAll("/+$", "");
+        List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region).stream()
+                .filter(p -> !p.getUrl().toLowerCase().replaceAll("/+$", "").equals(normalizedMyUrl))
+                .collect(java.util.stream.Collectors.toList());
+        List<PartPrice> cityPrices = filterAssemblies(cityRaw, oemNumber);
         log.info("Конкуренты в городе: {} (до фильтра: {})", cityPrices.size(), cityRaw.size());
 
         // 3. Если конкурентов в городе меньше 10 → доищем в Новосибирске
@@ -60,7 +63,7 @@ public class PriceAnalyzer {
         List<PartPrice> siberiaPrices = Collections.emptyList();
         if (needFallback && !region.equals(FALLBACK_REGION)) {
             List<PartPrice> fallbackRaw = dromParser.parseParts(oemNumber, FALLBACK_REGION);
-            siberiaPrices = filterAssemblies(fallbackRaw);
+            siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
             log.info("{} после фильтра: {} (до фильтра: {})", FALLBACK_REGION, siberiaPrices.size(), fallbackRaw.size());
         }
 
@@ -126,11 +129,18 @@ public class PriceAnalyzer {
             "комплект направляющ", "болт", "пружин", "шплинт"
     );
 
-    private List<PartPrice> filterAssemblies(List<PartPrice> parts) {
+    private List<PartPrice> filterAssemblies(List<PartPrice> parts, String targetOem) {
+        String normalizedTarget = targetOem.replaceAll("\\s+", "").toUpperCase();
         return parts.stream()
                 .filter(p -> {
                     String title = p.getTitle() == null ? "" : p.getTitle().toLowerCase();
-                    return NON_ASSEMBLY_KEYWORDS.stream().noneMatch(title::contains);
+                    if (NON_ASSEMBLY_KEYWORDS.stream().anyMatch(title::contains)) return false;
+                    if (p.getOem() != null && !p.getOem().isBlank()) {
+                        boolean match = p.getOem().equalsIgnoreCase(normalizedTarget);
+                        if (!match) log.debug("Исключён по OEM: {} (ожидался {})", p.getOem(), normalizedTarget);
+                        return match;
+                    }
+                    return true;
                 })
                 .collect(java.util.stream.Collectors.toList());
     }

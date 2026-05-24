@@ -40,14 +40,14 @@ public class PriceAggregatorController {
                        """)
     public ResponseEntity<AggregationResult> aiPrice(
 
-            @Parameter(description = "OEM-номер запчасти", example = "8113006730")
+            @Parameter(description = "OEM-номер запчасти", example = "26692AE020")
             @PathVariable String oemNumber,
 
             @Parameter(description = "Регион (slug Drom.ru)", example = "barnaul")
             @RequestParam(defaultValue = "barnaul") String region,
 
             @Parameter(description = "URL моего объявления на baza.drom.ru",
-                       example = "https://baza.drom.ru/sell_spare_parts/auto/12345678.html")
+                       example = "https://baza.drom.ru/barnaul/sell_spare_parts/support-zadnij-pravyj-subaru-legacy-26692ae020-g13066380597.html")
             @RequestParam String myListingUrl,
 
             @Parameter(description = "Переопределить цену (если 0 — берётся из объявления)", example = "0")

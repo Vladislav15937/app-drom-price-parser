@@ -15,6 +15,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -32,15 +33,24 @@ public class AIPriceAdvisor {
     private final String apiKey;
     private final String baseUrl;
     private final String textModel;
+    private final String geminiApiKey;
+    private final String geminiBaseUrl;
+    private final String geminiVisionModel;
     private final ExecutorService photoExecutor = Executors.newFixedThreadPool(3);
 
     public AIPriceAdvisor(
             @Value("${deepseek.api.token}") String apiKey,
             @Value("${deepseek.api.base-url:https://api.deepseek.com/v1/chat/completions}") String baseUrl,
-            @Value("${deepseek.text.model:deepseek-v4-flash}") String textModel) {
+            @Value("${deepseek.text.model:deepseek-v4-flash}") String textModel,
+            @Value("${gemini.api.key:}") String geminiApiKey,
+            @Value("${gemini.api.base-url:https://generativelanguage.googleapis.com/v1beta/openai/chat/completions}") String geminiBaseUrl,
+            @Value("${gemini.vision.model:gemini-2.0-flash}") String geminiVisionModel) {
         this.apiKey = apiKey;
         this.baseUrl = baseUrl;
         this.textModel = textModel;
+        this.geminiApiKey = geminiApiKey;
+        this.geminiBaseUrl = geminiBaseUrl;
+        this.geminiVisionModel = geminiVisionModel;
         this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(60)).build();
         this.objectMapper = new ObjectMapper();
     }
@@ -79,15 +89,24 @@ public class AIPriceAdvisor {
                     .map(CompletableFuture::join)
                     .collect(Collectors.toList());
 
-            // ШАГ 2: Классификация конкурентов в городе
+            // ШАГ 2: Классификация конкурентов
             log.info("Шаг 2/3: Классификация {} городских конкурентов...", cityPrices.size());
             CompetitorClassification cityClassification = classifyCompetitors(
                     cityPrices, competitorPhotos, myListing, myPhoto);
 
+            CompetitorClassification siberiaClassification = CompetitorClassification.empty();
+            if (!siberiaPrices.isEmpty()) {
+                log.info("Шаг 2b/3: Классификация {} новосибирских конкурентов...", siberiaPrices.size());
+                List<PhotoAssessment> siberiaPhotos = siberiaPrices.stream()
+                        .map(p -> new PhotoAssessment("нет оценки", "", 0.80))
+                        .collect(Collectors.toList());
+                siberiaClassification = classifyCompetitors(siberiaPrices, siberiaPhotos, myListing, myPhoto);
+            }
+
             // ШАГ 3: Стратегия ценообразования
             log.info("Шаг 3/3: Расчёт конкурентной цены...");
             AIRecommendation result = computeCompetitivePrice(
-                    cityClassification, cityPrices, siberiaPrices,
+                    cityClassification, cityPrices, siberiaClassification, siberiaPrices,
                     myPhoto, myCurrentPrice, isOldListing);
 
             log.info("Рекомендация: {} руб. | уверенность: {} | причина: {}",
@@ -107,64 +126,91 @@ public class AIPriceAdvisor {
     }
 
     private PhotoAssessment evaluatePhotos(List<String> photoUrls, String context) {
-        // Vision-модель недоступна в текущем API — возвращаем нейтральный коэффициент
-        log.debug("Vision пропущен для '{}': нет vision-модели в API", context);
-        return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
+        if (geminiApiKey == null || geminiApiKey.isBlank()) {
+            log.debug("Gemini API key не задан, vision пропущен для '{}'", context);
+            return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
+        }
+        return evaluatePhotosViaApi(photoUrls, context);
     }
 
-    @SuppressWarnings("unused")
     private PhotoAssessment evaluatePhotosViaApi(List<String> photoUrls, String context) {
         if (photoUrls == null || photoUrls.isEmpty()) {
-            return new PhotoAssessment("нет фото", "нет фото", 0.80);
+            return new PhotoAssessment("нет фото", "нет фото", 0.65);
         }
 
         List<Map<String, Object>> content = new ArrayList<>();
         int added = 0;
         for (String url : photoUrls) {
             if (added >= 2) break;
+            String dataUrl = downloadImageAsBase64(url);
+            if (dataUrl == null) continue;
             Map<String, Object> imageItem = new HashMap<>();
             imageItem.put("type", "image_url");
-            imageItem.put("image_url", Map.of("url", url));
+            imageItem.put("image_url", Map.of("url", dataUrl));
             content.add(imageItem);
             added++;
         }
         content.add(Map.of("type", "text", "text", """
                 Оцени автозапчасть на фото по внешнему виду и состоянию.
-                Учитывай: видимые повреждения, износ, царапины, сколы, общий вид.
-                Игнорируй бренд и марку — только визуальное состояние.
+                Учитывай: видимые повреждения, износ, царапины, сколы, ржавчину, общий вид и качество самого фото.
+                Игнорируй бренд и марку — только визуальное состояние детали.
                 Верни СТРОГО ТОЛЬКО JSON без пояснений:
                 {"condition":"отличное/хорошее/удовлетворительное/плохое","defects":"список дефектов или нет","coefficient":число от 0.5 до 1.0}
                 Пример: {"condition":"хорошее","defects":"лёгкие царапины","coefficient":0.85}
+                coefficient: 0.95-1.0=отличное, 0.80-0.94=хорошее, 0.65-0.79=удовлетворительное, ниже 0.65=плохое
                 """));
 
+        String responseBody = null;
         try {
             Map<String, Object> body = new HashMap<>();
-            body.put("model", "deepseek-vl2"); // заменить на vision-модель при появлении в API
+            body.put("model", geminiVisionModel);
             body.put("messages", List.of(Map.of("role", "user", "content", content)));
             body.put("temperature", 0.1);
-            body.put("max_tokens", 200);
+            body.put("max_tokens", 1000);
 
             String json = objectMapper.writeValueAsString(body);
             HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(baseUrl))
+                    .uri(URI.create(geminiBaseUrl))
                     .header("Content-Type", "application/json")
-                    .header("Authorization", "Bearer " + apiKey)
+                    .header("Authorization", "Bearer " + geminiApiKey)
                     .POST(HttpRequest.BodyPublishers.ofString(json))
-                    .timeout(Duration.ofSeconds(60))
+                    .timeout(Duration.ofSeconds(90))
                     .build();
 
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            Map<String, Object> map = objectMapper.readValue(resp.body(), Map.class);
+            responseBody = resp.body();
+            log.debug("Gemini raw response [{}] HTTP {}: {}", context, resp.statusCode(),
+                    responseBody.substring(0, Math.min(500, responseBody.length())));
+
+            if (resp.statusCode() == 429) {
+                log.info("Gemini vision: квота исчерпана (429), используем нейтральный коэф. для '{}'", context);
+                return new PhotoAssessment("неизвестно", "квота Gemini исчерпана", 0.80);
+            }
+            if (resp.statusCode() != 200) {
+                log.warn("Gemini vision HTTP {} для '{}': {}", resp.statusCode(), context,
+                        responseBody.substring(0, Math.min(300, responseBody.length())));
+                return new PhotoAssessment("неизвестно", "ошибка Gemini", 0.80);
+            }
+
+            // Gemini иногда оборачивает ответ в массив — нормализуем
+            String normalized = responseBody.trim();
+            if (normalized.startsWith("[")) {
+                normalized = normalized.substring(1, normalized.lastIndexOf(']')).trim();
+            }
+
+            Map<String, Object> map = objectMapper.readValue(normalized, Map.class);
             List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
             if (choices == null || choices.isEmpty()) {
-                String preview = resp.body().substring(0, Math.min(300, resp.body().length()));
-                throw new IllegalStateException("choices отсутствует в ответе API: " + preview);
+                throw new IllegalStateException("choices отсутствует в ответе Gemini: "
+                        + normalized.substring(0, Math.min(300, normalized.length())));
             }
             String raw = (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
-            return parsePhotoAssessment(raw);
+            PhotoAssessment result = parsePhotoAssessment(raw);
+            log.info("Gemini vision [{}]: {} (коэф. {})", context, result.condition(), result.coefficient());
+            return result;
 
         } catch (Exception e) {
-            log.warn("Vision AI недоступен для '{}': {}. Используем нейтральный коэф.", context, e.getMessage());
+            log.warn("Gemini vision недоступен для '{}': {}. Используем нейтральный коэф.", context, e.getMessage());
             return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
         }
     }
@@ -191,6 +237,8 @@ public class AIPriceAdvisor {
             PhotoAssessment pa = i < photos.size() ? photos.get(i) : new PhotoAssessment("нет фото", "", 0.80);
 
             sb.append(i + 1).append(". Цена: ").append(p.getPrice()).append("₽");
+            if (p.getTitle() != null && !p.getTitle().isBlank())
+                sb.append(" | Название: ").append(p.getTitle(), 0, Math.min(80, p.getTitle().length()));
             sb.append(" | Фото: ").append(pa.condition())
               .append(" (коэф. ").append(pa.coefficient()).append(")");
 
@@ -224,79 +272,74 @@ public class AIPriceAdvisor {
 
     // ==================== СТРАТЕГИЯ КОНКУРЕНТНОГО ЦЕНООБРАЗОВАНИЯ ====================
 
+    private static final int MIN_CITY_COMPETITORS = 3;
+    /** Надбавка к ценам НСК: барнаульский покупатель экономит на доставке (~300–500₽ ≈ +15%). */
+    private static final double NSK_BARNAUL_PREMIUM = 1.15;
+
     /**
      * Правила:
-     * 1. Недавнее объявление + в городе есть аналоги дешевле → ПОНИЗИТЬ до min(аналоги)×0.97
-     * 2. Недавнее объявление + в городе нет аналогов дешевле → НЕ МЕНЯТЬ (нет смысла снижать)
-     * 3. Старое объявление → сравниваем с Сибирью (те же правила)
-     * 4. Корректировка по фото: если моё фото плохое → доп. дисконт
-     * 5. Коридор [60% медианы, 130% медианы]
+     * 1. Свежее объявление + в городе ≥3 конкурентов → используем только город
+     * 2. Свежее объявление + в городе <3 конкурентов → Новосибирск с местной надбавкой ×1.15
+     * 3. Старое объявление → Новосибирск с местной надбавкой ×1.15
+     * 4. Фото-дисконт при коэф. < 0.70
      */
     private AIRecommendation computeCompetitivePrice(
             CompetitorClassification cityClass, List<PartPrice> cityPrices,
-            List<PartPrice> siberiaPrices, PhotoAssessment myPhoto,
-            BigDecimal myCurrentPrice, boolean isOldListing) {
+            CompetitorClassification siberiaClass, List<PartPrice> siberiaPrices,
+            PhotoAssessment myPhoto, BigDecimal myCurrentPrice, boolean isOldListing) {
 
         String photoNote = myPhoto.coefficient() < 1.0
                 ? String.format(" Мои фото: %s (коэф. %.2f).", myPhoto.condition(), myPhoto.coefficient())
                 : "";
 
-        // === Для свежих объявлений работаем с городом ===
-        if (!isOldListing && !cityPrices.isEmpty()) {
+        // === Достаточно городских конкурентов — используем только город ===
+        if (!isOldListing && cityPrices.size() >= MIN_CITY_COMPETITORS) {
             return strategyForMarket(cityClass, cityPrices, myPhoto, myCurrentPrice,
                     "В городе", photoNote);
         }
 
-        // === Старое объявление или мало конкурентов в городе → работаем с Новосибирском ===
+        // === Мало конкурентов в городе или старое объявление → Новосибирск с местной надбавкой ===
         if (!siberiaPrices.isEmpty()) {
-            MarketStats siberiaStats = computeStats(siberiaPrices);
-            String scope = isOldListing ? "Объявление старше 6 мес., сравниваем с Новосибирском" : "Мало предложений в городе, смотрим Новосибирск";
+            // Масштабируем цены НСК: покупатель из Барнаула платит NSK_цена + доставка,
+            // поэтому барнаульский продавец конкурентоспособен при цене ≤ NSK × (1 + доставка).
+            List<PartPrice> scaledNsk = scaleMarketPrices(siberiaPrices, NSK_BARNAUL_PREMIUM);
+            CompetitorClassification scaledNskClass = scaleClassification(siberiaClass, NSK_BARNAUL_PREMIUM);
 
-            List<Double> similar = cityClass.similar();
-            double myPrice = myCurrentPrice.doubleValue();
-            double siberiaMin = siberiaStats.min().doubleValue();
-            double siberiaMedian = siberiaStats.median().doubleValue();
-
-            // Цена объявления не определена (капча/ошибка парсинга) — рекомендуем по рынку
-            if (myPrice == 0) {
-                BigDecimal raw = BigDecimal.valueOf(siberiaMin * 0.97).setScale(0, RoundingMode.DOWN);
-                raw = applyPhotoDiscount(raw, myPhoto);
-                BigDecimal target = applyBounds(raw, siberiaStats);
-                String boundsNote = target.compareTo(raw) != 0
-                        ? String.format(" [нижний порог: %.0f₽]", target.doubleValue()) : "";
-                return new AIRecommendation(target, "средняя",
-                        scope + String.format(". Цена объявления не определена. Рекомендуем −3%% от мин. Новосибирска = %.0f₽.%s",
-                                target.doubleValue(), boundsNote),
-                        photoNote);
-            }
-
-            // Есть ли аналоги в Сибири дешевле моей цены?
-            if (myPrice > siberiaMin * 1.05) { // больше чем на 5% дороже минимума Сибири
-                BigDecimal raw = BigDecimal.valueOf(siberiaMin * 0.97).setScale(0, RoundingMode.DOWN);
-                raw = applyPhotoDiscount(raw, myPhoto);
-                BigDecimal target = applyBounds(raw, siberiaStats);
-                String boundsNote = target.compareTo(raw) != 0
-                        ? String.format(" [нижний порог: %.0f₽]", target.doubleValue()) : "";
-                return new AIRecommendation(target, "средняя",
-                        scope + String.format(". Новосибирск мин=%.0f₽, мед=%.0f₽. −3%% от нск минимума = %.0f₽.%s",
-                                siberiaMin, siberiaMedian, target.doubleValue(), boundsNote),
-                        photoNote);
-            } else {
-                BigDecimal raw = applyPhotoDiscount(myCurrentPrice, myPhoto);
-                if (raw.compareTo(myCurrentPrice) == 0) {
-                    return new AIRecommendation(myCurrentPrice, "высокая",
-                            scope + String.format(". Наша цена конкурентна (нск мин=%.0f₽).", siberiaMin), photoNote);
-                }
-                BigDecimal target = applyBounds(raw, siberiaStats);
-                return new AIRecommendation(target, "средняя",
-                        scope + String.format(". Цена в норме, корректируем по фото (коэф. %.2f) → %.0f₽.",
-                                myPhoto.coefficient(), target.doubleValue()), photoNote);
-            }
+            String premiumNote = String.format("+%.0f%% местная надбавка (нет доставки)", (NSK_BARNAUL_PREMIUM - 1) * 100);
+            String scope = isOldListing
+                    ? "Объявление старше 6 мес. Ориентир — Новосибирск (" + premiumNote + ")"
+                    : "Мало предложений в городе. Ориентир — Новосибирск (" + premiumNote + ")";
+            return strategyForMarket(scaledNskClass, scaledNsk, myPhoto, myCurrentPrice, scope, photoNote);
         }
 
-        // Фолбэк: нет ни города ни Сибири
+        // === Есть только городские (мало, но Новосибирск пуст) ===
+        if (!cityPrices.isEmpty()) {
+            return strategyForMarket(cityClass, cityPrices, myPhoto, myCurrentPrice,
+                    "В городе (мало данных)", photoNote);
+        }
+
         return new AIRecommendation(myCurrentPrice, "низкая",
                 "Недостаточно данных для анализа. Цена оставлена без изменений.", photoNote);
+    }
+
+    /** Создаёт копию списка с ценами, умноженными на factor. */
+    private List<PartPrice> scaleMarketPrices(List<PartPrice> prices, double factor) {
+        return prices.stream().map(p -> PartPrice.builder()
+                .title(p.getTitle()).url(p.getUrl()).location(p.getLocation())
+                .dealer(p.getDealer()).publishedDate(p.getPublishedDate())
+                .photoUrls(p.getPhotoUrls()).oem(p.getOem()).description(p.getDescription())
+                .price(p.getPrice().multiply(BigDecimal.valueOf(factor)).setScale(0, RoundingMode.HALF_UP))
+                .build()).collect(Collectors.toList());
+    }
+
+    /** Масштабирует числовые цены в классификации на factor. */
+    private CompetitorClassification scaleClassification(CompetitorClassification cls, double factor) {
+        return new CompetitorClassification(
+                cls.similar().stream().map(p -> p * factor).collect(Collectors.toList()),
+                cls.better().stream().map(p -> p * factor).collect(Collectors.toList()),
+                cls.worse().stream().map(p -> p * factor).collect(Collectors.toList()),
+                cls.comment()
+        );
     }
 
     private AIRecommendation strategyForMarket(
@@ -407,6 +450,30 @@ public class AIPriceAdvisor {
         return new AIRecommendation(
                 median.multiply(BigDecimal.valueOf(0.95)).setScale(0, RoundingMode.DOWN),
                 "низкая", "Фолбэк: медиана −5%", "");
+    }
+
+    // ==================== ЗАГРУЗКА ИЗОБРАЖЕНИЙ ====================
+
+    private String downloadImageAsBase64(String url) {
+        try {
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(15))
+                    .build();
+            HttpResponse<byte[]> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofByteArray());
+            if (resp.statusCode() != 200) {
+                log.debug("Не удалось загрузить фото (HTTP {}): {}", resp.statusCode(), url);
+                return null;
+            }
+            String mimeType = resp.headers().firstValue("content-type")
+                    .map(ct -> ct.split(";")[0].trim())
+                    .orElse("image/jpeg");
+            String base64 = Base64.getEncoder().encodeToString(resp.body());
+            return "data:" + mimeType + ";base64," + base64;
+        } catch (Exception e) {
+            log.debug("Ошибка загрузки фото {}: {}", url, e.getMessage());
+            return null;
+        }
     }
 
     // ==================== HTTP ====================

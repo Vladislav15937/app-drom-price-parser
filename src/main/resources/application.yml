@@ -30,7 +30,18 @@ apify:
 drom:
   headless: false  # false для отладки, true для продакшена
   proxy:
-    url:  # Оставьте пустым или укажите http://login:pass@ip:port
+    url:  # http://login:pass@ip:port
+
+twocaptcha:
+  enabled: true   # true для автоматического решения капчи
+  api-key: 682948916e47240f5ce9a73ec7c1f4a4 # Ключ с 2captcha.com
+
+gemini:
+  api:
+    key: sk-jx8ewiNBTyp_0ca8xoI7zA
+    base-url: https://open.blackroute.space/v1/chat/completions
+  vision:
+    model: gemini-3.5-flash
 
 deepseek:
   api:
@@ -57,3 +68,4 @@ logging:
   level:
     ru.retail.service.client: DEBUG
     feign: DEBUG
+    ru.retail.service.service.AIPriceAdvisor: DEBUG

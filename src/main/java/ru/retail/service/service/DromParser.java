@@ -7,6 +7,7 @@ import com.microsoft.playwright.ElementHandle;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.Playwright;
 import com.microsoft.playwright.options.LoadState;
+import com.microsoft.playwright.options.Proxy;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
@@ -16,6 +17,9 @@ import ru.retail.service.dto.MyListingInfo;
 import ru.retail.service.dto.PartPrice;
 
 import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -34,6 +38,8 @@ public class DromParser {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
     };
 
+    private static final Path SESSION_FILE = Paths.get("drom-session.json");
+
     // Регионы Сибири для широкого поиска
     static final List<String> SIBERIA_REGIONS = List.of(
             "barnaul", "novosibirsk", "omsk", "tomsk", "kemerovo", "krasnoyarsk"
@@ -45,20 +51,33 @@ public class DromParser {
     @Value("${drom.headless:true}")
     private boolean headless;
 
+    @Value("${drom.proxy.url:}")
+    private String proxyUrl;
+
+    private final CaptchaSolverService captchaSolver;
+
+    public DromParser(CaptchaSolverService captchaSolver) {
+        this.captchaSolver = captchaSolver;
+    }
+
     @PostConstruct
     public void init() {
         playwright = Playwright.create();
-        browser = playwright.chromium().launch(
-                new BrowserType.LaunchOptions()
-                        .setHeadless(headless)
-                        .setArgs(List.of(
-                                "--disable-blink-features=AutomationControlled",
-                                "--no-sandbox",
-                                "--disable-dev-shm-usage",
-                                "--disable-gpu",
-                                "--incognito"
-                        ))
-        );
+        BrowserType.LaunchOptions launchOptions = new BrowserType.LaunchOptions()
+                .setHeadless(headless)
+                .setArgs(List.of(
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                        "--lang=ru-RU",
+                        "--window-size=1366,768"
+                ));
+        if (proxyUrl != null && !proxyUrl.isBlank()) {
+            // Playwright требует глобальный прокси при запуске, если контексты используют per-context прокси
+            launchOptions.setProxy(new Proxy(proxyUrl));
+        }
+        browser = playwright.chromium().launch(launchOptions);
     }
 
     @PreDestroy
@@ -78,35 +97,33 @@ public class DromParser {
         BrowserContext ctx = newContext();
         Page page = newPage(ctx);
         try {
-            page.navigate(url);
-            page.waitForLoadState(LoadState.NETWORKIDLE);
+            page.navigate(url, new Page.NavigateOptions().setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
+            page.waitForLoadState(LoadState.DOMCONTENTLOADED);
             Thread.sleep(1500);
 
             if (hasCaptcha(page)) {
-                if (!headless) {
-                    log.info("Капча на странице объявления — жду ручного решения 120 сек...");
-                    page.waitForFunction("() => !document.body.innerText.includes('Вы не робот')",
-                            new Page.WaitForFunctionOptions().setTimeout(120_000));
-                    page.waitForLoadState(LoadState.NETWORKIDLE);
-                    Thread.sleep(1000);
-                } else {
-                    log.warn("Капча на моём объявлении в headless-режиме. Данные недоступны.");
-                    return MyListingInfo.builder()
-                            .description("").condition("не указано").manufacturer("не указано")
-                            .photoUrls(List.of()).price(BigDecimal.ZERO).build();
+                boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
+                if (!solved) {
+                    if (!headless) {
+                        log.info("Капча на объявлении — жду ручного решения 120 сек...");
+                        page.waitForFunction("() => { try { return !document.body.innerText.includes('Вы не робот'); } catch(e) { return false; } }",
+                                null, new Page.WaitForFunctionOptions().setTimeout(120_000));
+                    } else {
+                        log.warn("Капча на моём объявлении, автоматическое решение не помогло. Данные недоступны.");
+                        return MyListingInfo.builder()
+                                .description("").condition("не указано").manufacturer("не указано")
+                                .photoUrls(List.of()).price(BigDecimal.ZERO).build();
+                    }
                 }
+                page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+                Thread.sleep(1000);
             }
 
             String title = "";
             ElementHandle titleEl = page.querySelector("h1.subject span, h1 span");
             if (titleEl != null) title = titleEl.innerText().trim();
 
-            String priceText = getTextByAttr(page, "data-field", "price");
-            BigDecimal price = BigDecimal.ZERO;
-            if (priceText != null) {
-                String digits = priceText.replaceAll("[^\\d.]", "");
-                if (!digits.isEmpty()) price = new BigDecimal(digits);
-            }
+            BigDecimal price = extractPriceFromPage(page);
 
             String condition     = getTextByAttr(page, "data-field", "condition");
             String manufacturer  = getTextByAttr(page, "data-field", "manufacturer");
@@ -151,61 +168,110 @@ public class DromParser {
     }
 
     public List<PartPrice> parseParts(String oemNumber, String region, int limit) {
-        String url = buildSearchUrl(oemNumber, region);
-        log.info("Парсинг конкурентов [{}]: {}", region, url);
+        String searchUrl = buildSearchUrl(oemNumber, region);
+        log.info("Парсинг конкурентов [{}]: {}", region, searchUrl);
 
-        List<PartPrice> results = new ArrayList<>();
         BrowserContext ctx = newContext();
         Page page = newPage(ctx);
 
         try {
-            page.navigate(url);
+            // ── Шаг 1: загружаем страницу поиска ──
+            page.navigate(searchUrl, new Page.NavigateOptions().setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
             Thread.sleep(3000);
 
             if (hasCaptcha(page)) {
-                if (!headless) {
-                    log.info("Капча — ожидаю ручного решения 120 сек...");
-                    page.waitForURL(url, new Page.WaitForURLOptions().setTimeout(120_000));
-                    page.waitForLoadState(LoadState.NETWORKIDLE);
-                } else {
-                    log.error("Капча в headless-режиме.");
-                    return results;
+                boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
+                if (solved) saveSession(ctx);
+                if (!solved) {
+                    if (!headless) {
+                        log.info("Капча на поиске [{}] — жду ручного решения 120 сек...", region);
+                        page.waitForURL(searchUrl, new Page.WaitForURLOptions().setTimeout(120_000));
+                        saveSession(ctx);
+                    } else {
+                        log.error("Капча не решена автоматически, возвращаем пустой результат для [{}].", region);
+                        return List.of();
+                    }
+                }
+                page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+            }
+
+            page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+            Thread.sleep(2000);
+
+            // ── Шаг 2: собираем ссылки ──
+            List<String> allUrls = collectListingLinks(page);
+            String regionSlug = "/" + region + "/";
+            String oemLower = oemNumber.toLowerCase().replaceAll("\\s+", "");
+            Set<String> withOemSet = allUrls.stream()
+                    .filter(u -> u.contains(regionSlug))
+                    .filter(u -> u.toLowerCase().contains(oemLower))
+                    .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
+            List<String> regional = allUrls.stream()
+                    .filter(u -> u.contains(regionSlug))
+                    .distinct()
+                    .collect(Collectors.toList());
+            List<String> prioritized = new ArrayList<>(withOemSet);
+            regional.stream().filter(u -> !withOemSet.contains(u)).forEach(prioritized::add);
+            log.info("Ссылок всего: {} | в регионе: {} | с OEM в URL: {} (идут первыми)",
+                    allUrls.size(), regional.size(), withOemSet.size());
+
+            // ── Шаг 3: обходим детальные страницы В ТОМ ЖЕ контексте ──
+            List<PartPrice> results = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            int count = 0;
+            int attempt = 0;
+
+            for (String detailUrl : prioritized) {
+                if (count >= limit) break;
+                if (!seen.add(detailUrl)) continue;
+                if (attempt > 0) try { Thread.sleep(1000 + (long) (Math.random() * 800)); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+                attempt++;
+                log.info("[попытка {}, результат {}/{}] {}", attempt, count + 1, limit, detailUrl);
+
+                try {
+                    page.navigate(detailUrl, new Page.NavigateOptions()
+                            .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED)
+                            .setReferer(searchUrl));
+                    page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+                    Thread.sleep(800);
+
+                    if (hasCaptcha(page)) {
+                        log.info("Капча на детальной странице: {}", detailUrl);
+                        boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
+                        if (solved) saveSession(ctx);
+                        if (!solved) {
+                            if (!headless) {
+                                log.info("Капча — жду ручного решения 120 сек...");
+                                page.waitForFunction("() => { try { return !document.body.innerText.includes('Вы не робот'); } catch(e) { return false; } }",
+                                        null, new Page.WaitForFunctionOptions().setTimeout(120_000));
+                                saveSession(ctx);
+                            } else {
+                                log.warn("Капча не решена, пропускаем: {}", detailUrl);
+                                continue;
+                            }
+                        }
+                        page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+                        Thread.sleep(800);
+                    }
+
+                    PartPrice part = extractPartFromPage(page, detailUrl);
+                    if (part != null) { results.add(part); count++; }
+                } catch (Exception e) {
+                    log.warn("Ошибка [{}]: {}", detailUrl, e.getMessage());
                 }
             }
 
-            page.waitForLoadState(LoadState.NETWORKIDLE);
-            Thread.sleep(2000);
-
-            List<String> allUrls = collectListingLinks(page);
-            String regionSlug = "/" + region + "/";
-            List<String> detailUrls = allUrls.stream()
-                    .filter(u -> u.contains(regionSlug))
-                    .collect(Collectors.toList());
-            log.info("Найдено ссылок: {} (в регионе {}: {})", allUrls.size(), region, detailUrls.size());
-
-            Set<String> seen = new HashSet<>();
-            int count = 0;
-            for (String detailUrl : detailUrls) {
-                if (count >= limit) break;
-                if (!seen.add(detailUrl)) continue;
-
-                if (count > 0) Thread.sleep(1500 + (long) (Math.random() * 2000));
-                log.info("[{}/{}] {}", count + 1, limit, detailUrl);
-
-                PartPrice part = parseDetailPage(ctx, detailUrl);
-                if (part != null) { results.add(part); count++; }
-            }
-
             results.sort((a, b) -> a.getPrice().compareTo(b.getPrice()));
+            log.info("Собрано в [{}]: {} предложений", region, results.size());
+            return results;
+
         } catch (Exception e) {
             log.error("Ошибка парсинга [{}]: {}", region, e.getMessage());
+            return List.of();
         } finally {
             page.close();
             ctx.close();
         }
-
-        log.info("Собрано в [{}]: {} предложений", region, results.size());
-        return results;
     }
 
     // ==================== ПАРСИНГ ПО СИБИРИ (ограниченный) ====================
@@ -244,37 +310,32 @@ public class DromParser {
 
     // ==================== ДЕТАЛЬНАЯ СТРАНИЦА ====================
 
-    private PartPrice parseDetailPage(BrowserContext ctx, String url) {
-        Page detailPage = null;
+    /** Извлекает данные объявления из уже загруженной страницы. */
+    private PartPrice extractPartFromPage(Page page, String originalUrl) {
         try {
-            detailPage = ctx.newPage();
-            detailPage.navigate(url);
-            detailPage.waitForLoadState(LoadState.NETWORKIDLE);
-            Thread.sleep(1200);
+            String actualUrl = page.url();
 
-            String actualUrl = detailPage.url();
-
-            String priceText = getTextByAttr(detailPage, "data-field", "price");
+            String priceText = getTextByAttr(page, "data-field", "price");
             if (priceText == null) return null;
             priceText = priceText.replaceAll("[^\\d.]", "");
             if (priceText.isEmpty()) return null;
             BigDecimal price = new BigDecimal(priceText);
 
             String title = "";
-            ElementHandle titleEl = detailPage.querySelector("h1.subject span");
+            ElementHandle titleEl = page.querySelector("h1.subject span");
             if (titleEl != null) title = titleEl.innerText().trim();
 
-            String condition    = getTextByAttr(detailPage, "data-field", "condition");
-            String authenticity = getTextByAttr(detailPage, "data-field", "autoPartsAuthenticity");
-            String manufacturer = getTextByAttr(detailPage, "data-field", "manufacturer");
-            String oem          = getTextByAttr(detailPage, "data-field", "autoPartsOemNumber");
-            String desc         = getTextByAttr(detailPage, "data-field", "text");
-            String publishedDate = extractDate(detailPage);
-            String city          = extractCity(detailPage);
-            List<String> photos  = extractPhotoUrls(detailPage, 3);
+            String condition    = getTextByAttr(page, "data-field", "condition");
+            String authenticity = getTextByAttr(page, "data-field", "autoPartsAuthenticity");
+            String manufacturer = getTextByAttr(page, "data-field", "manufacturer");
+            String oem          = getTextByAttr(page, "data-field", "autoPartsOemNumber");
+            String desc         = getTextByAttr(page, "data-field", "text");
+            String publishedDate = extractDate(page);
+            String city          = extractCity(page);
+            List<String> photos  = extractPhotoUrls(page, 3);
 
             String seller = "";
-            ElementHandle sellerEl = detailPage.querySelector(".userNick a");
+            ElementHandle sellerEl = page.querySelector(".userNick a");
             if (sellerEl != null) seller = sellerEl.innerText().trim();
 
             StringBuilder sb = new StringBuilder();
@@ -291,6 +352,7 @@ public class DromParser {
 
             return PartPrice.builder()
                     .title(title).price(price).url(actualUrl)
+                    .oem(oem != null ? oem.replaceAll("\\s+", "").toUpperCase() : null)
                     .location(city).dealer(seller)
                     .publishedDate(publishedDate)
                     .photoUrls(photos)
@@ -298,10 +360,48 @@ public class DromParser {
                     .build();
 
         } catch (Exception e) {
+            log.warn("Ошибка извлечения данных {}: {}", originalUrl, e.getMessage());
+            return null;
+        }
+    }
+
+    /** Открывает собственный контекст для парсинга одной страницы (не используется в parseParts). */
+    private PartPrice parseDetailPage(String url) {
+        BrowserContext ctx = newContext();
+        Page detailPage = null;
+        try {
+            detailPage = newPage(ctx);
+            detailPage.navigate(url, new Page.NavigateOptions().setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
+            detailPage.waitForLoadState(LoadState.DOMCONTENTLOADED);
+            Thread.sleep(1200);
+
+            if (hasCaptcha(detailPage)) {
+                log.info("Капча на детальной странице: {}", url);
+                boolean solved = tryClickDromCheckbox(detailPage) || captchaSolver.solve(detailPage);
+                if (solved) saveSession(ctx);
+                if (!solved) {
+                    if (!headless) {
+                        log.info("Капча — жду ручного решения 120 сек...");
+                        detailPage.waitForFunction("() => { try { return !document.body.innerText.includes('Вы не робот'); } catch(e) { return false; } }",
+                                null, new Page.WaitForFunctionOptions().setTimeout(120_000));
+                        saveSession(ctx);
+                    } else {
+                        log.warn("Капча не решена, пропускаем: {}", url);
+                        return null;
+                    }
+                }
+                detailPage.waitForLoadState(LoadState.DOMCONTENTLOADED);
+                Thread.sleep(800);
+            }
+
+            return extractPartFromPage(detailPage, url);
+
+        } catch (Exception e) {
             log.warn("Ошибка {}: {}", url, e.getMessage());
             return null;
         } finally {
             if (detailPage != null) detailPage.close();
+            ctx.close();
         }
     }
 
@@ -427,6 +527,146 @@ public class DromParser {
         return body.contains("Вы не робот") || body.contains("подозрительный трафик");
     }
 
+    /**
+     * Пытается пройти собственную капчу drom.ru кликом по чекбоксу "Я не робот".
+     * На /verify странице ждёт редиректа после клика (URL меняется).
+     * Возвращает true если капча пройдена.
+     */
+    boolean tryClickDromCheckbox(Page page) {
+        try {
+            boolean isVerifyPage = page.url().contains("/verify");
+            if (isVerifyPage) {
+                log.debug("Страница /verify: тело — {}", page.innerText("body").substring(0, Math.min(300, page.innerText("body").length())));
+            }
+
+            // Шаг 1: кликаем по чекбоксу (расширенный набор селекторов)
+            String[] checkboxSelectors = {
+                "label:has-text('Я не робот')",
+                "label:has-text('не робот')",
+                "input[type='checkbox']",
+                ".checkbox__input",
+                ".verify-checkbox",
+                ".checkbox",
+                "[class*='checkbox']",
+                "[class*='verify']",
+                "[class*='robot']"
+            };
+            boolean clicked = false;
+            for (String sel : checkboxSelectors) {
+                ElementHandle el = page.querySelector(sel);
+                if (el != null) {
+                    log.info("Кликаем по чекбоксу капчи: {}", sel);
+                    el.click();
+                    Thread.sleep(1500);
+                    clicked = true;
+                    break;
+                }
+            }
+
+            // Если ни один CSS-селектор не сработал — пробуем JS (нестандартный чекбокс /verify)
+            if (!clicked && isVerifyPage) {
+                log.info("CSS-селекторы не нашли чекбокс, пробуем JS-клик");
+                page.evaluate("""
+                        (function() {
+                            var el = document.querySelector('input[type="checkbox"]')
+                                  || document.querySelector('[class*="checkbox"]')
+                                  || document.querySelector('[class*="verify"]')
+                                  || document.querySelector('label');
+                            if (el) el.click();
+                        })()
+                        """);
+                Thread.sleep(2000);
+            }
+
+            // Шаг 2: кликаем по кнопке "Продолжить"
+            String[] submitSelectors = {
+                "button:has-text('Продолжить')",
+                "a:has-text('Продолжить')",
+                "input[type='submit']",
+                "button[type='submit']"
+            };
+            for (String sel : submitSelectors) {
+                ElementHandle el = page.querySelector(sel);
+                if (el != null) {
+                    log.info("Кликаем по кнопке продолжить: {}", sel);
+                    el.click();
+                    Thread.sleep(3000);
+                    break;
+                }
+            }
+
+            // Шаг 3: на /verify ждём редирект (URL уходит с /verify)
+            if (isVerifyPage) {
+                try {
+                    page.waitForURL(u -> !u.contains("/verify"),
+                            new Page.WaitForURLOptions().setTimeout(8_000));
+                    log.info("Капча /verify пройдена — редирект выполнен на {}", page.url());
+                    saveSession(page.context());
+                    return true;
+                } catch (Exception e) {
+                    log.debug("Редирект с /verify не произошёл: {}", e.getMessage());
+                }
+            }
+
+            page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+            if (!hasCaptcha(page)) {
+                log.info("Капча пройдена автоматически");
+                saveSession(page.context());
+                return true;
+            }
+        } catch (Exception e) {
+            log.debug("Автоклик по капче не сработал: {}", e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * Извлекает цену со страницы baza.drom.ru с несколькими запасными вариантами.
+     * 1. data-field="price"  — стандартный атрибут
+     * 2. itemprop="price"    — structured data
+     * 3. og:description      — мета-тег: "N ₽" / "N руб"
+     */
+    private BigDecimal extractPriceFromPage(Page page) {
+        // Попытка 1: стандартный data-field
+        String text = getTextByAttr(page, "data-field", "price");
+        if (text != null && !text.isBlank()) {
+            String d = text.replaceAll("[^\\d.]", "");
+            if (!d.isEmpty()) return new BigDecimal(d);
+        }
+
+        // Попытка 2: structured data itemprop или content
+        try {
+            Object val = page.evaluate("""
+                (() => {
+                    const el = document.querySelector('[itemprop="price"]');
+                    if (el) return el.getAttribute('content') || el.innerText;
+                    return null;
+                })()""");
+            if (val instanceof String s && !s.isBlank()) {
+                String d = s.replaceAll("[^\\d.]", "");
+                if (!d.isEmpty()) return new BigDecimal(d);
+            }
+        } catch (Exception ignored) {}
+
+        // Попытка 3: og:description — "2 500 ₽" или "2500 руб"
+        try {
+            Object ogDesc = page.evaluate(
+                "(() => { const m = document.querySelector('meta[property=\"og:description\"]'); return m ? m.content : ''; })()");
+            if (ogDesc instanceof String s && !s.isBlank()) {
+                // Ищем: одно или два слова из цифр, разделённые пробелом, перед ₽/руб
+                java.util.regex.Matcher m = java.util.regex.Pattern
+                        .compile("(\\d[\\d\\s]{1,5})\\s*(?:₽|руб)").matcher(s);
+                if (m.find()) {
+                    String d = m.group(1).replaceAll("[^\\d]", "");
+                    if (!d.isEmpty() && d.length() <= 7) return new BigDecimal(d);
+                }
+            }
+        } catch (Exception ignored) {}
+
+        log.warn("Не удалось извлечь цену со страницы {}", page.url());
+        return BigDecimal.ZERO;
+    }
+
     private String getTextByAttr(Page page, String attr, String value) {
         try {
             ElementHandle el = page.querySelector("[" + attr + "='" + value + "']");
@@ -437,17 +677,73 @@ public class DromParser {
     }
 
     private BrowserContext newContext() {
-        return browser.newContext(new Browser.NewContextOptions()
+        Browser.NewContextOptions opts = new Browser.NewContextOptions()
                 .setUserAgent(randomUserAgent())
-                .setViewportSize(1920, 1080)
-                .setLocale("ru-RU"));
+                .setViewportSize(1366, 768)
+                .setLocale("ru-RU");
+        if (proxyUrl != null && !proxyUrl.isBlank()) {
+            opts.setProxy(new Proxy(proxyUrl));
+            log.debug("Используем прокси: {}", proxyUrl.replaceAll(":[^@]+@", ":***@"));
+        }
+        if (Files.exists(SESSION_FILE)) {
+            opts.setStorageStatePath(SESSION_FILE);
+            log.debug("Загружена сохранённая сессия из {}", SESSION_FILE);
+        }
+        return browser.newContext(opts);
+    }
+
+    private void saveSession(BrowserContext ctx) {
+        try {
+            ctx.storageState(new BrowserContext.StorageStateOptions().setPath(SESSION_FILE));
+            log.debug("Сессия сохранена в {}", SESSION_FILE);
+        } catch (Exception e) {
+            log.debug("Не удалось сохранить сессию: {}", e.getMessage());
+        }
     }
 
     private Page newPage(BrowserContext ctx) {
         Page page = ctx.newPage();
+        page.setDefaultNavigationTimeout(90_000);
+        page.setDefaultTimeout(90_000);
         page.addInitScript("""
+                // Скрываем признаки headless/automation
                 Object.defineProperty(navigator, 'webdriver', { get: () => false });
                 delete navigator.__proto__.webdriver;
+
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [
+                        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+                        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+                    ]
+                });
+                Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
+                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+
+                window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+
+                const origQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (params) =>
+                    params.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : origQuery(params);
+
+                const getParam = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(p) {
+                    if (p === 37445) return 'Intel Inc.';
+                    if (p === 37446) return 'Intel Iris OpenGL Engine';
+                    return getParam.call(this, p);
+                };
+
+                if (typeof RTCPeerConnection !== 'undefined') {
+                    const OrigRTC = window.RTCPeerConnection;
+                    window.RTCPeerConnection = function(...args) {
+                        const cfg = args[0] || {};
+                        cfg.iceServers = [];
+                        return new OrigRTC(cfg);
+                    };
+                    window.RTCPeerConnection.prototype = OrigRTC.prototype;
+                }
                 """);
         return page;
     }

@@ -1,0 +1,49 @@
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.3.0)
+
+2026-05-25T01:54:07.884+03:00  INFO 17676 --- [price-aggregator] [           main] ru.retail.service.Main                   : Starting Main v1.0.0 using Java 21.0.10 with PID 17676 (C:\Users\Владислав\IdeaProjects\app-drom-price-parser\target\drom-price-parser-1.0.0.jar started by Владислав in C:\Users\Владислав\IdeaProjects\app-drom-price-parser)
+2026-05-25T01:54:07.887+03:00  INFO 17676 --- [price-aggregator] [           main] ru.retail.service.Main                   : No active profile set, falling back to 1 default profile: "default"
+2026-05-25T01:54:09.720+03:00  INFO 17676 --- [price-aggregator] [           main] o.s.b.w.embedded.tomcat.TomcatWebServer  : Tomcat initialized with port 8081 (http)
+2026-05-25T01:54:09.751+03:00  INFO 17676 --- [price-aggregator] [           main] o.apache.catalina.core.StandardService   : Starting service [Tomcat]
+2026-05-25T01:54:09.751+03:00  INFO 17676 --- [price-aggregator] [           main] o.apache.catalina.core.StandardEngine    : Starting Servlet engine: [Apache Tomcat/10.1.24]
+2026-05-25T01:54:09.801+03:00  INFO 17676 --- [price-aggregator] [           main] o.a.c.c.C.[Tomcat].[localhost].[/]       : Initializing Spring embedded WebApplicationContext
+2026-05-25T01:54:09.802+03:00  INFO 17676 --- [price-aggregator] [           main] w.s.c.ServletWebServerApplicationContext : Root WebApplicationContext: initialization completed in 1830 ms
+2026-05-25T01:54:18.927+03:00  INFO 17676 --- [price-aggregator] [           main] o.s.b.w.embedded.tomcat.TomcatWebServer  : Tomcat started on port 8081 (http) with context path '/'
+2026-05-25T01:54:18.952+03:00  INFO 17676 --- [price-aggregator] [           main] ru.retail.service.Main                   : Started Main in 11.815 seconds (process running for 12.601)
+2026-05-25T01:54:22.215+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-1] o.a.c.c.C.[Tomcat].[localhost].[/]       : Initializing Spring DispatcherServlet 'dispatcherServlet'
+2026-05-25T01:54:22.216+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-1] o.s.web.servlet.DispatcherServlet        : Initializing Servlet 'dispatcherServlet'
+2026-05-25T01:54:22.217+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-1] o.s.web.servlet.DispatcherServlet        : Completed initialization in 1 ms
+2026-05-25T01:54:46.180+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.PriceAnalyzer   : === Анализ OEM: 4525013140 | Регион: barnaul ===
+2026-05-25T01:54:46.181+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Парсинг моего объявления: https://baza.drom.ru/barnaul/sell_spare_parts/kolonka-rulevaja-toyota-corolla-4525013140-nze121-1nzfe-g17986560772.html
+2026-05-25T01:54:50.827+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Кликаем по чекбоксу капчи: label:has-text('Я не робот')
+2026-05-25T01:54:52.383+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Кликаем по кнопке продолжить: input[type='submit']
+2026-05-25T01:55:01.306+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Капча /verify пройдена — редирект выполнен на https://baza.drom.ru/barnaul/sell_spare_parts/kolonka-rulevaja-toyota-corolla-4525013140-nze121-1nzfe-g17986560772.html
+2026-05-25T01:55:02.429+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Моё объявление: Колонка рулевая Toyota Corolla 4525013140 NZE121 1 — 9000₽, дата: сегодня в 07:30, фото: 3
+2026-05-25T01:55:02.459+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.PriceAnalyzer   : Моё объявление: цена=9000₽, дата=сегодня в 07:30, фото=3
+2026-05-25T01:55:02.459+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Парсинг конкурентов [barnaul]: https://baza.drom.ru/barnaul/sell_spare_parts/?query=4525013140
+2026-05-25T01:55:12.445+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Ссылок всего: 10 | в регионе: 1 | с OEM в URL: 1 (идут первыми)
+2026-05-25T01:55:12.445+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : [попытка 1, результат 1/10] https://baza.drom.ru/barnaul/sell_spare_parts/kolonka-rulevaja-toyota-corolla-4525013140-nze121-1nzfe-g17986560772.html
+2026-05-25T01:55:14.089+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : [525013140-nze121-1nzfe-g17986560772.html] 9000₽ | фото:3
+2026-05-25T01:55:14.090+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Собрано в [barnaul]: 1 предложений
+2026-05-25T01:55:14.119+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.PriceAnalyzer   : Конкуренты в городе: 0 (до фильтра: 0)
+2026-05-25T01:55:14.119+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.PriceAnalyzer   : Старое объявление: false | Конкурентов в городе: 0 (нужно 10+) → Поиск в novosibirsk: true
+2026-05-25T01:55:14.119+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Парсинг конкурентов [novosibirsk]: https://baza.drom.ru/novosibirsk/sell_spare_parts/?query=4525013140
+2026-05-25T01:55:23.725+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Ссылок всего: 11 | в регионе: 1 | с OEM в URL: 1 (идут первыми)
+2026-05-25T01:55:23.725+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : [попытка 1, результат 1/10] https://baza.drom.ru/novosibirsk/sell_spare_parts/kolonka-rulevaja-toyota-spacio-039-03-039-07-kontraktnaja-4525013140-4525013141-p2001-g13017642520.html
+2026-05-25T01:55:25.534+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : [13140-4525013141-p2001-g13017642520.html] 2510₽ | фото:2
+2026-05-25T01:55:25.534+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] ru.retail.service.service.DromParser     : Собрано в [novosibirsk]: 1 предложений
+2026-05-25T01:55:25.568+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.PriceAnalyzer   : novosibirsk после фильтра: 1 (до фильтра: 1)
+2026-05-25T01:55:25.568+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.AIPriceAdvisor  : Шаг 1/3: Оценка фотографий...
+2026-05-25T01:55:36.087+03:00 DEBUG 17676 --- [price-aggregator] [pool-1-thread-1] r.retail.service.service.AIPriceAdvisor  : Gemini raw response [моя деталь] HTTP 200: {"id":"4oETaquyOIuVmecPx4ao4AE","created":1779663330,"model":"gemini-3.5-flash","object":"chat.completion","choices":[{"finish_reason":"stop","index":0,"message":{"content":"```json\n{\"condition\":\"удовлетворительное\",\"defects\":\"значительная поверхностная ржавчина на корпусе электромотора и металлических кронштейнах, следы окисления, маркерные надписи\",\"coefficient\":0.72}\n```","role":"assistant","images":[],"thinking_blocks":[],"provider_specific_fields":{"thought_signatures":["AY89a1+
+2026-05-25T01:55:36.108+03:00  INFO 17676 --- [price-aggregator] [pool-1-thread-1] r.retail.service.service.AIPriceAdvisor  : Gemini vision [моя деталь]: удовлетворительное (коэф. 0.72)
+2026-05-25T01:55:36.108+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.AIPriceAdvisor  : Мои фото: удовлетворительное (коэф. 0.72)
+2026-05-25T01:55:36.109+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.AIPriceAdvisor  : Шаг 2/3: Классификация 0 городских конкурентов...
+2026-05-25T01:55:36.109+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.AIPriceAdvisor  : Шаг 2b/3: Классификация 1 новосибирских конкурентов...
+2026-05-25T01:55:39.664+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.AIPriceAdvisor  : Шаг 3/3: Расчёт конкурентной цены...
+2026-05-25T01:55:39.669+03:00  INFO 17676 --- [price-aggregator] [nio-8081-exec-6] r.retail.service.service.AIPriceAdvisor  : Рекомендация: 2799 руб. | уверенность: средняя | причина: Мало предложений в городе. Ориентир — Новосибирск (+15% местная надбавка (нет доставки)) есть аналоги дешевле (от 2887₽). Снижаем на 3% — до 2799₽. На рынке представлен один прямой конкурент — оригинальная контрактная деталь с тем же номером. Его коэффициент оценки (0.8) немного выше вашего (0.72), но разница менее 0.10, что в рамках допустимого для категории 'similar'. Оба предложения — б/у оригинальные запчасти Toyota в контрактном состоянии. Рынок узкий, альтернатив по качеству нет.

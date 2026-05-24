@@ -61,7 +61,8 @@ API: конфиг `deepseek.api.base-url` (текущий: `https://open.blackro
 - `AggregationResult` — итог: статистика (min/max/avg/median), cityCompetitorCount, siberiaCompetitorCount, recommendedPrice, aiReason, photoNote
 
 ### Логика Сибири (PriceAnalyzer)
-- `CITY_ANALOG_THRESHOLD = 3` — если в городе меньше → ищем Сибирь
+- `PriceAnalyzer.CITY_ANALOG_THRESHOLD = 10` — если в городе меньше → ЗАПРАШИВАЕМ данные по НСК
+- `AIPriceAdvisor.MIN_CITY_COMPETITORS = 3` — если в городе меньше → ИСПОЛЬЗУЕМ НСК как ценовой ориентир
 - `SIBERIA_REGIONS`: barnaul, novosibirsk, omsk, tomsk, kemerovo, krasnoyarsk
 - `isOlderThan6Months()` — парсит русские форматы дат: "вчера"/"сегодня"/"назад" → false; "15 ноября 2024" и "dd.MM.yyyy" → сравниваем с порогом
 
