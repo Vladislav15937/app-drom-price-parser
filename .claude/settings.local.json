@@ -56,7 +56,9 @@
       "PowerShell($resp = Invoke-WebRequest -Uri \"https://baza.drom.ru/g17763892191.html\" -UseBasicParsing -UserAgent \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36\"; $resp.Content.Substring\\(0, 500\\))",
       "PowerShell(Get-Content \"C:\\\\tmp\\\\app.log\" | Where-Object { $_ -match \"17763\" } | ForEach-Object { $_ })",
       "PowerShell($resp = Invoke-WebRequest -Uri \"https://baza.drom.ru/barnaul/sell_spare_parts/?query=4525013140\" -UseBasicParsing -UserAgent \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36\"; $content = $resp.Content; \\($content | Select-String \"17763892191\" -AllMatches\\).Matches | Select-Object -First 3 | ForEach-Object { $content.Substring\\([Math]::Max\\(0,$_.Index-100\\), 300\\) })",
-      "PowerShell(Select-String *)"
+      "PowerShell(Select-String *)",
+      "PowerShell(Start-Process java -ArgumentList @\\('-jar', 'target\\\\drom-price-parser-1.0.0.jar'\\) -WorkingDirectory 'C:\\\\Users\\\\Владислав\\\\IdeaProjects\\\\app-drom-price-parser' -PassThru | Select-Object Id)",
+      "PowerShell(Get-Command *)"
     ]
   }
 }

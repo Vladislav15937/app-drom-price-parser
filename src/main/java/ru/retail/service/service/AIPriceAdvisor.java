@@ -223,8 +223,14 @@ public class AIPriceAdvisor {
 
         if (competitors.isEmpty()) return CompetitorClassification.empty();
 
+        String myTitle = myListing.getTitle() != null ? myListing.getTitle().toLowerCase() : "";
+        String mySide     = extractSide(myTitle);
+        String myPosition = extractPosition(myTitle);
+
         StringBuilder sb = new StringBuilder();
         sb.append("МОЯ ДЕТАЛЬ:\n");
+        if (myListing.getTitle() != null && !myListing.getTitle().isBlank())
+            sb.append("Название: ").append(myListing.getTitle()).append("\n");
         sb.append("Состояние: ").append(myListing.getCondition()).append("\n");
         sb.append("Производитель: ").append(myListing.getManufacturer()).append("\n");
         sb.append("Описание: ").append(myListing.getDescription()).append("\n");
@@ -250,6 +256,12 @@ public class AIPriceAdvisor {
                         .trim();
                 if (desc.length() > 10) sb.append(" | ").append(desc, 0, Math.min(150, desc.length()));
             }
+
+            String competitorTitle = p.getTitle() != null ? p.getTitle().toLowerCase() : "";
+            if (isSideMismatch(mySide, competitorTitle) || isPositionMismatch(myPosition, competitorTitle)) {
+                sb.append(" [ДРУГАЯ СТОРОНА/ПОЗИЦИЯ — классифицируй строго как worse]");
+                log.debug("Помечено как другая сторона: {}", p.getTitle());
+            }
             sb.append("\n");
         }
 
@@ -258,10 +270,17 @@ public class AIPriceAdvisor {
                 Учитывай: оценку по фото (коэффициент и состояние), производителя, состояние из описания, дефекты.
                 Игнорируй: продавца, рейтинг, доставку, город.
 
-                Классификация относительно МОЕЙ детали:
+                ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА (применяй первыми, до оценки качества):
+                - Если в названии МОЕЙ ДЕТАЛИ указано "левый", а у конкурента "правый" — это другая запчасть, классифицируй как "worse".
+                - Если в названии МОЕЙ ДЕТАЛИ указано "правый", а у конкурента "левый" — это другая запчасть, классифицируй как "worse".
+                - Если в названии МОЕЙ ДЕТАЛИ указано "передний", а у конкурента "задний" — это другая запчасть, классифицируй как "worse".
+                - Если в названии МОЕЙ ДЕТАЛИ указано "задний", а у конкурента "передний" — это другая запчасть, классифицируй как "worse".
+                - Если сторона/расположение конкурента явно не указаны — считай что совместимо.
+
+                Классификация относительно МОЕЙ детали (после проверки расположения):
                 - "similar" = аналогичное качество (коэф. конкурента в пределах ±0.10 от моего, схожее состояние)
                 - "better"  = явно лучше (новый vs б/у, оригинал vs аналог, или коэф. выше на 0.15+)
-                - "worse"   = явно хуже (дефекты, плохое фото, дешёвый аналог при моём оригинале)
+                - "worse"   = явно хуже (дефекты, плохое фото, дешёвый аналог при моём оригинале, или другая сторона)
 
                 Верни СТРОГО ТОЛЬКО JSON (цены — числа из списка конкурентов):
                 {"similar":[цены],"better":[цены],"worse":[цены],"comment":"краткий вывод о рынке"}
@@ -358,17 +377,17 @@ public class AIPriceAdvisor {
 
         if (!similar.isEmpty()) {
             double minSimilar = similar.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
-            if (myPrice > minSimilar) {
-                // Есть аналоги дешевле → ОБЯЗАТЕЛЬНО снижаем
+            if (myPrice >= minSimilar) {
+                // Есть аналоги дешевле или по той же цене → снижаем на 3%
                 target     = BigDecimal.valueOf(minSimilar * 0.97).setScale(0, RoundingMode.DOWN);
                 confidence = similar.size() >= 3 ? "высокая" : "средняя";
-                reason     = String.format("%s есть аналоги дешевле (от %.0f₽). Снижаем на 3%% — до %.0f₽.",
+                reason     = String.format("%s есть аналоги по цене от %.0f₽. Снижаем на 3%% — до %.0f₽.",
                         scope, minSimilar, target.doubleValue());
             } else {
-                // Мы уже дешевле или наравне — не трогаем
+                // Мы уже дешевле всех аналогов — не трогаем
                 target     = myCurrentPrice;
                 confidence = "высокая";
-                reason     = String.format("%s наша цена уже ниже или равна аналогам (мин. аналог %.0f₽). Цена оптимальна.",
+                reason     = String.format("%s наша цена ниже всех аналогов (мин. аналог %.0f₽). Цена оптимальна.",
                         scope, minSimilar);
             }
 
@@ -553,6 +572,32 @@ public class AIPriceAdvisor {
                 .filter(o -> o instanceof Number)
                 .map(o -> ((Number) o).doubleValue())
                 .collect(Collectors.toList());
+    }
+
+    // ==================== ОПРЕДЕЛЕНИЕ СТОРОНЫ/ПОЗИЦИИ ====================
+
+    private String extractSide(String title) {
+        if (title.contains("левый") || title.contains("левой") || title.contains("левая")) return "левый";
+        if (title.contains("правый") || title.contains("правой") || title.contains("правая")) return "правый";
+        return "";
+    }
+
+    private String extractPosition(String title) {
+        if (title.contains("передний") || title.contains("передней") || title.contains("передняя")) return "передний";
+        if (title.contains("задний") || title.contains("задней") || title.contains("задняя")) return "задний";
+        return "";
+    }
+
+    private boolean isSideMismatch(String mySide, String competitorTitle) {
+        if (mySide.isEmpty()) return false;
+        String opposite = mySide.equals("левый") ? "прав" : "лев";
+        return competitorTitle.contains(opposite);
+    }
+
+    private boolean isPositionMismatch(String myPosition, String competitorTitle) {
+        if (myPosition.isEmpty()) return false;
+        String opposite = myPosition.equals("передний") ? "задн" : "передн";
+        return competitorTitle.contains(opposite);
     }
 
     // ==================== ЗАПИСИ ====================
