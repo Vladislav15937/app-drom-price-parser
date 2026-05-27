@@ -79,7 +79,8 @@
       "Bash(kill 5742)",
       "Bash(JAVA_HOME=\"/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home\" \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile)",
       "Bash(JAVA_HOME=\"/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home\" \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" package -DskipTests -q)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(jar tf *)"
     ]
   }
 }

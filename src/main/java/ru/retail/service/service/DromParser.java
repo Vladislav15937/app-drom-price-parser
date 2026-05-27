@@ -57,11 +57,16 @@ public class DromParser {
     private String proxyUrl;
 
     private final CaptchaSolverService captchaSolver;
+    private final ApifyDromService apifyDromService;
+    private final LocalSocksProxy localSocksProxy;
     // Фиксированный UA на весь сеанс — смена UA между запросами инвалидирует сессию Drom.ru
     private final String fixedUserAgent = USER_AGENTS[(int) (Math.random() * USER_AGENTS.length)];
 
-    public DromParser(CaptchaSolverService captchaSolver) {
+    public DromParser(CaptchaSolverService captchaSolver, ApifyDromService apifyDromService,
+                      LocalSocksProxy localSocksProxy) {
         this.captchaSolver = captchaSolver;
+        this.apifyDromService = apifyDromService;
+        this.localSocksProxy = localSocksProxy;
     }
 
     @PostConstruct
@@ -77,9 +82,13 @@ public class DromParser {
                         "--lang=ru-RU",
                         "--window-size=1366,768"
                 ));
-        if (proxyUrl != null && !proxyUrl.isBlank()) {
-            // Playwright требует глобальный прокси при запуске, если контексты используют per-context прокси
-            launchOptions.setProxy(new Proxy(proxyUrl));
+        String localProxyUrl = localSocksProxy.getLocalProxyUrl();
+        if (localProxyUrl != null) {
+            // SOCKS5 с авторизацией: Chromium не поддерживает, используем локальный HTTP-мост
+            launchOptions.setProxy(new Proxy(localProxyUrl));
+            log.info("Прокси: через локальный SOCKS5-мост → {}", localProxyUrl);
+        } else if (proxyUrl != null && !proxyUrl.isBlank()) {
+            launchOptions.setProxy(buildProxy(proxyUrl));
         }
         browser = playwright.chromium().launch(launchOptions);
     }
@@ -88,6 +97,28 @@ public class DromParser {
     public void destroy() {
         if (browser != null) browser.close();
         if (playwright != null) playwright.close();
+    }
+
+    private Proxy buildProxy(String url) {
+        // Разбираем http://user:pass@host:port — Playwright не принимает credentials в URL напрямую
+        try {
+            java.net.URI uri = new java.net.URI(url);
+            String server = uri.getScheme() + "://" + uri.getHost() + ":" + uri.getPort();
+            Proxy proxy = new Proxy(server);
+            String userInfo = uri.getUserInfo();
+            if (userInfo != null) {
+                int sep = userInfo.indexOf(':');
+                if (sep > 0) {
+                    proxy.setUsername(userInfo.substring(0, sep));
+                    proxy.setPassword(userInfo.substring(sep + 1));
+                }
+            }
+            log.info("Прокси: {} (пользователь: {})", server, uri.getUserInfo() != null ? userInfo.split(":")[0] : "—");
+            return proxy;
+        } catch (Exception e) {
+            log.warn("Не удалось разобрать URL прокси, передаём как есть: {}", e.getMessage());
+            return new Proxy(url);
+        }
     }
 
     // ==================== ПАРСИНГ МОёГО ОБЪЯВЛЕНИЯ ====================
@@ -176,6 +207,17 @@ public class DromParser {
     }
 
     public List<PartPrice> parseParts(String oemNumber, String region, int limit, Set<String> excludeUrls) {
+        if (apifyDromService.isEnabled()) {
+            log.info("Apify: делегируем парсинг [{}] OEM={}", region, oemNumber);
+            Set<String> normalizedExcludes = excludeUrls.stream()
+                    .map(u -> u.toLowerCase().replaceAll("/+$", ""))
+                    .collect(Collectors.toSet());
+            return apifyDromService.parseParts(oemNumber, region, limit).stream()
+                    .filter(p -> normalizedExcludes.isEmpty() ||
+                            !normalizedExcludes.contains(p.getUrl().toLowerCase().replaceAll("/+$", "")))
+                    .collect(Collectors.toList());
+        }
+
         String searchUrl = buildSearchUrl(oemNumber, region);
         log.info("Парсинг конкурентов [{}]: {}", region, searchUrl);
 
@@ -813,8 +855,12 @@ public class DromParser {
                 .setUserAgent(fixedUserAgent)
                 .setViewportSize(1366, 768)
                 .setLocale("ru-RU");
-        if (proxyUrl != null && !proxyUrl.isBlank()) {
-            opts.setProxy(new Proxy(proxyUrl));
+        String localProxyUrl = localSocksProxy.getLocalProxyUrl();
+        if (localProxyUrl != null) {
+            opts.setProxy(new Proxy(localProxyUrl));
+            log.debug("Контекст: прокси через локальный мост → {}", localProxyUrl);
+        } else if (proxyUrl != null && !proxyUrl.isBlank()) {
+            opts.setProxy(buildProxy(proxyUrl));
             log.debug("Используем прокси: {}", proxyUrl.replaceAll(":[^@]+@", ":***@"));
         }
         if (Files.exists(SESSION_FILE)) {

@@ -21,6 +21,7 @@ springdoc:
   show-actuator: false
 
 apify:
+  enabled: false
   api:
     token: apify_api_yUzydG8Qrpt5gkdTGO6WdHLVRtDR5a4j9qoD
     base-url: https://api.apify.com
@@ -30,7 +31,7 @@ apify:
 drom:
   headless: false  # false для отладки, true для продакшена
   proxy:
-    url:  # http://login:pass@ip:port
+    url: socks5://NUs4Re:BahAN6KyU6eT@bproxy.site:15517
 
 twocaptcha:
   enabled: true   # true для автоматического решения капчи
