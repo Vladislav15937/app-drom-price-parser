@@ -22,7 +22,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -55,6 +57,8 @@ public class DromParser {
     private String proxyUrl;
 
     private final CaptchaSolverService captchaSolver;
+    // Фиксированный UA на весь сеанс — смена UA между запросами инвалидирует сессию Drom.ru
+    private final String fixedUserAgent = USER_AGENTS[(int) (Math.random() * USER_AGENTS.length)];
 
     public DromParser(CaptchaSolverService captchaSolver) {
         this.captchaSolver = captchaSolver;
@@ -164,10 +168,14 @@ public class DromParser {
     // ==================== ПАРСИНГ КОНКУРЕНТОВ В ГОРОДЕ ====================
 
     public List<PartPrice> parseParts(String oemNumber, String region) {
-        return parseParts(oemNumber, region, 10);
+        return parseParts(oemNumber, region, 10, Set.of());
     }
 
     public List<PartPrice> parseParts(String oemNumber, String region, int limit) {
+        return parseParts(oemNumber, region, limit, Set.of());
+    }
+
+    public List<PartPrice> parseParts(String oemNumber, String region, int limit, Set<String> excludeUrls) {
         String searchUrl = buildSearchUrl(oemNumber, region);
         log.info("Парсинг конкурентов [{}]: {}", region, searchUrl);
 
@@ -198,22 +206,53 @@ public class DromParser {
             page.waitForLoadState(LoadState.DOMCONTENTLOADED);
             Thread.sleep(2000);
 
-            // ── Шаг 2: собираем ссылки ──
-            List<String> allUrls = collectListingLinks(page);
+            // ── Шаг 2: собираем ссылки с именами дилеров ──
+            List<SearchEntry> entries = collectSearchEntries(page);
+            Set<String> normalizedExcludes = excludeUrls.stream()
+                    .map(u -> u.toLowerCase().replaceAll("/+$", ""))
+                    .collect(Collectors.toSet());
+            List<String> allUrls = entries.stream()
+                    .map(SearchEntry::url)
+                    .filter(u -> normalizedExcludes.isEmpty() ||
+                            !normalizedExcludes.contains(u.toLowerCase().replaceAll("/+$", "")))
+                    .collect(Collectors.toList());
+            // Объявления на baza.drom.ru используют /g[ID].html — регион в URL отсутствует.
+            // Страница поиска уже отфильтрована по региону, поэтому используем все URL напрямую.
             String regionSlug = "/" + region + "/";
-            String oemLower = oemNumber.toLowerCase().replaceAll("\\s+", "");
-            Set<String> withOemSet = allUrls.stream()
-                    .filter(u -> u.contains(regionSlug))
-                    .filter(u -> u.toLowerCase().contains(oemLower))
-                    .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
+            String normalizedOem = oemNumber.replaceAll("\\s+", "").toUpperCase();
             List<String> regional = allUrls.stream()
                     .filter(u -> u.contains(regionSlug))
                     .distinct()
                     .collect(Collectors.toList());
+            if (regional.isEmpty()) {
+                // Новый формат URL /g[ID].html без региона в пути — берём все
+                regional = new ArrayList<>(allUrls);
+            }
+
+            // Пре-фильтр по OEM прямо со страницы поиска: исключаем чужие OEM без захода на детальную
+            Map<String, String> urlToOem = entries.stream()
+                    .filter(e -> !e.oem().isBlank())
+                    .collect(Collectors.toMap(SearchEntry::url, e -> e.oem().toUpperCase(),
+                            (a1, b) -> a1));
+            List<String> oemFiltered = regional.stream()
+                    .filter(u -> {
+                        String pageOem = urlToOem.get(u);
+                        return pageOem == null || pageOem.equals(normalizedOem)
+                                || pageOem.contains(normalizedOem) || normalizedOem.contains(pageOem);
+                    })
+                    .collect(Collectors.toList());
+            // Если пре-фильтр убрал всё — значит OEM не распознан, берём все
+            if (oemFiltered.isEmpty()) oemFiltered = regional;
+
+            // Приоритет: OEM в URL (старый формат) идут первыми
+            String oemLower = oemNumber.toLowerCase().replaceAll("\\s+", "");
+            Set<String> withOemSet = oemFiltered.stream()
+                    .filter(u -> u.toLowerCase().contains(oemLower))
+                    .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
             List<String> prioritized = new ArrayList<>(withOemSet);
-            regional.stream().filter(u -> !withOemSet.contains(u)).forEach(prioritized::add);
-            log.info("Ссылок всего: {} | в регионе: {} | с OEM в URL: {} (идут первыми)",
-                    allUrls.size(), regional.size(), withOemSet.size());
+            oemFiltered.stream().filter(u -> !withOemSet.contains(u)).forEach(prioritized::add);
+            log.info("Ссылок всего: {} | региональных: {} | после OEM-фильтра: {} | исключено: {}",
+                    entries.size(), regional.size(), oemFiltered.size(), excludeUrls.size());
 
             // ── Шаг 3: обходим детальные страницы В ТОМ ЖЕ контексте ──
             List<PartPrice> results = new ArrayList<>();
@@ -407,18 +446,111 @@ public class DromParser {
 
     // ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
 
+    /** Данные объявления, извлечённые прямо со страницы результатов поиска. */
+    record SearchEntry(String url, String dealer, String oem, String title, BigDecimal price, String date) {
+        SearchEntry(String url, String dealer) { this(url, dealer, "", "", null, ""); }
+        SearchEntry(String url, String dealer, String oem) { this(url, dealer, oem, "", null, ""); }
+    }
+
     private List<String> collectListingLinks(Page page) {
-        List<String> detailUrls = new ArrayList<>();
-        List<ElementHandle> allLinks = page.querySelectorAll("a[href*='/sell_spare_parts/']");
+        return collectSearchEntries(page).stream().map(SearchEntry::url).collect(Collectors.toList());
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<SearchEntry> collectSearchEntries(Page page) {
+        try {
+            // Объявления имеют URL вида /g[ID].html (без /sell_spare_parts/ в пути)
+            Object raw = page.evaluate("""
+                JSON.stringify(
+                  Array.from(document.querySelectorAll('tr.bull-list-item-js')).map(row => {
+                    const a = row.querySelector('a[data-role="bulletin-link"]');
+                    if (!a || !a.href) return null;
+                    const dealer = row.querySelector('.ellipsis-text__left-side');
+                    // OEM: из .searchSnippet или второй .bull-item__annotation-row
+                    const snippetEl = row.querySelector('.searchSnippet, .searchMatchHilight');
+                    const annRows = row.querySelectorAll('.bull-item__annotation-row');
+                    let oem = snippetEl ? snippetEl.textContent.trim().replace(/\\s+/g,'') : '';
+                    if (!oem && annRows.length >= 2) oem = annRows[1].textContent.trim().replace(/\\s+/g,'');
+                    // Цена: [data-field="price"] или .bull-item__price
+                    const priceEl = row.querySelector('[data-field="price"], .bull-item__price, .price-value');
+                    let priceText = priceEl ? priceEl.textContent.replace(/[^\\d]/g,'') : '';
+                    // Заголовок
+                    const titleText = a.textContent.trim();
+                    // Дата
+                    const dateEl = row.querySelector('.date, .bull-item__date, .viewbull-actual-date');
+                    const dateText = dateEl ? dateEl.textContent.trim() : '';
+                    return { url: a.href, dealer: dealer ? dealer.textContent.trim() : '',
+                             oem: oem, title: titleText, price: priceText, date: dateText };
+                  }).filter(e => e && e.url && e.url.length > 15)
+                )
+                """);
+            if (raw == null) return List.of();
+            List<Map<String, Object>> list = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(raw.toString(), List.class);
+            List<SearchEntry> entries = new ArrayList<>();
+            for (Map<String, Object> m : list) {
+                String url    = (String) m.get("url");
+                String dealer = m.get("dealer") instanceof String s ? s : "";
+                String oem    = m.get("oem")    instanceof String o ? o : "";
+                String title  = m.get("title")  instanceof String t ? t : "";
+                String date   = m.get("date")   instanceof String d ? d : "";
+                String priceStr = m.get("price") instanceof String p ? p : "";
+                BigDecimal price = null;
+                try { if (!priceStr.isBlank()) price = new BigDecimal(priceStr); } catch (Exception ignored) {}
+                if (url != null && !url.isBlank()) entries.add(new SearchEntry(url, dealer, oem, title, price, date));
+            }
+            if (!entries.isEmpty()) return entries;
+        } catch (Exception e) {
+            log.warn("collectSearchEntries JS error: {}", e.getMessage());
+        }
+        // fallback: ищем по data-role или классу bulletinLink
+        List<SearchEntry> entries = new ArrayList<>();
+        List<ElementHandle> allLinks = page.querySelectorAll("a[data-role='bulletin-link'], a.bulletinLink");
         for (ElementHandle link : allLinks) {
             String href = link.getAttribute("href");
-            if (href != null && href.contains("sell_spare_parts") && href.length() > 30
-                    && (href.contains("-g") || href.contains(".html"))) {
+            if (href != null && href.length() > 15) {
                 String full = href.startsWith("http") ? href : "https://baza.drom.ru" + href;
-                if (!detailUrls.contains(full)) detailUrls.add(full);
+                entries.add(new SearchEntry(full, ""));
             }
         }
-        return detailUrls;
+        return entries;
+    }
+
+    /**
+     * Находит URL объявления компании myCompany прямо на странице результатов поиска,
+     * не заходя на детальные страницы. Возвращает null, если не найдено.
+     */
+    public String findMyListingUrl(String oemNumber, String region, String myCompany) {
+        String searchUrl = buildSearchUrl(oemNumber, region);
+        BrowserContext ctx = newContext();
+        Page page = newPage(ctx);
+        try {
+            page.navigate(searchUrl, new Page.NavigateOptions()
+                    .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
+            Thread.sleep(3000);
+            if (hasCaptcha(page)) {
+                boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
+                if (solved) saveSession(ctx);
+                if (!solved && !headless) {
+                    page.waitForURL(searchUrl, new Page.WaitForURLOptions().setTimeout(120_000));
+                    saveSession(ctx);
+                } else if (!solved) return null;
+                page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+            }
+            Thread.sleep(1500);
+            String companyLower = myCompany.toLowerCase();
+            return collectSearchEntries(page).stream()
+                    .filter(e -> e.dealer().toLowerCase().contains(companyLower))
+                    .map(SearchEntry::url)
+                    .findFirst()
+                    .orElse(null);
+        } catch (Exception e) {
+            log.warn("findMyListingUrl error: {}", e.getMessage());
+            return null;
+        } finally {
+            page.close();
+            ctx.close();
+        }
     }
 
     /**
@@ -678,7 +810,7 @@ public class DromParser {
 
     private BrowserContext newContext() {
         Browser.NewContextOptions opts = new Browser.NewContextOptions()
-                .setUserAgent(randomUserAgent())
+                .setUserAgent(fixedUserAgent)
                 .setViewportSize(1366, 768)
                 .setLocale("ru-RU");
         if (proxyUrl != null && !proxyUrl.isBlank()) {

@@ -13,6 +13,8 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -151,6 +153,102 @@ public class PriceAnalyzer {
         sb.append("В городе: ").append(cityCount).append(" предл.");
         if (usedFallback) sb.append(" | Новосибирск: ").append(fallbackCount).append(" предл.");
         return sb.toString().trim();
+    }
+
+    /**
+     * Анализирует цену по OEM из каталога.
+     * Автоматически находит объявление myCompany на Drom.ru и запускает анализ конкурентов.
+     */
+    public AggregationResult analyzeFromCatalog(
+            String oemNumber, BigDecimal catalogPrice, String region, String myCompany) {
+
+        log.info("=== Каталог OEM: {} | Регион: {} | Компания: {} ===", oemNumber, region, myCompany);
+
+        // 1. Быстро ищем URL нашего объявления по имени компании прямо на странице поиска
+        String myListingUrl = dromParser.findMyListingUrl(oemNumber, region, myCompany);
+
+        if (myListingUrl == null) {
+            log.info("Объявлений «{}» для OEM {} не найдено в [{}]", myCompany, oemNumber, region);
+            return AggregationResult.builder()
+                    .oemNumber(oemNumber)
+                    .recommendedPrice(BigDecimal.ZERO)
+                    .aiReason("Объявление компании «" + myCompany + "» не найдено для OEM " + oemNumber)
+                    .aiConfidence("нет данных")
+                    .totalFound(0).cityCompetitorCount(0).siberiaCompetitorCount(0)
+                    .searchedSiberia(false)
+                    .items(Collections.emptyList()).siberiaItems(Collections.emptyList())
+                    .collectedAt(java.time.Instant.now())
+                    .build();
+        }
+
+        log.info("Найдено объявление {}: {}", myCompany, myListingUrl);
+
+        // 2. Парсим конкурентов, исключая наш URL прямо на этапе сбора ссылок
+        Set<String> myUrls = Set.of(myListingUrl);
+        List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region, 10, myUrls);
+        List<PartPrice> cityPrices = filterAssemblies(cityRaw, oemNumber);
+
+        // 3. Полная информация о нашем объявлении
+        MyListingInfo myListingInfo = dromParser.parseMyListing(myListingUrl);
+        BigDecimal myPrice = (catalogPrice != null && catalogPrice.compareTo(BigDecimal.ZERO) > 0)
+                ? catalogPrice
+                : myListingInfo.getPrice().compareTo(BigDecimal.ZERO) > 0
+                        ? myListingInfo.getPrice()
+                        : BigDecimal.ZERO;
+
+        log.info("Цена: {}₽", myPrice);
+
+        // 6. Сибирский фоллбэк (та же логика, что в analyze())
+        boolean isOldListing = isOlderThan6Months(myListingInfo.getPublishedDate());
+        boolean fewCityCompetitors = cityPrices.size() < CITY_ANALOG_THRESHOLD;
+        boolean needFallback = isOldListing || fewCityCompetitors;
+
+        log.info("Старое: {} | Город: {} | Фоллбэк: {}", isOldListing, cityPrices.size(), needFallback);
+
+        List<PartPrice> siberiaPrices = Collections.emptyList();
+        if (needFallback && !region.equals(FALLBACK_REGION)) {
+            List<PartPrice> fallbackRaw = dromParser.parseParts(oemNumber, FALLBACK_REGION);
+            siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
+            log.info("{} после фильтра: {}", FALLBACK_REGION, siberiaPrices.size());
+        }
+
+        // 7. AI-анализ
+        AIPriceAdvisor.AIRecommendation ai = aiAdvisor.analyze(
+                myListingInfo, myPrice, cityPrices, siberiaPrices, isOldListing);
+
+        // 8. Статистика
+        BigDecimal minPrice = BigDecimal.ZERO, maxPrice = BigDecimal.ZERO,
+                   avgPrice = BigDecimal.ZERO, medianPrice = BigDecimal.ZERO;
+        List<PartPrice> statSource = !cityPrices.isEmpty() ? cityPrices : siberiaPrices;
+        if (!statSource.isEmpty()) {
+            List<BigDecimal> sorted = statSource.stream().map(PartPrice::getPrice).sorted().toList();
+            minPrice = sorted.get(0);
+            maxPrice = sorted.get(sorted.size() - 1);
+            avgPrice = sorted.stream().reduce(BigDecimal.ZERO, BigDecimal::add)
+                    .divide(BigDecimal.valueOf(sorted.size()), 2, RoundingMode.HALF_UP);
+            medianPrice = sorted.size() % 2 == 0
+                    ? sorted.get(sorted.size() / 2 - 1).add(sorted.get(sorted.size() / 2))
+                          .divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP)
+                    : sorted.get(sorted.size() / 2);
+        }
+
+        return AggregationResult.builder()
+                .oemNumber(oemNumber)
+                .totalFound(cityPrices.size() + siberiaPrices.size())
+                .cityCompetitorCount(cityPrices.size())
+                .siberiaCompetitorCount(siberiaPrices.size())
+                .searchedSiberia(needFallback)
+                .minPrice(minPrice).maxPrice(maxPrice).avgPrice(avgPrice).medianPrice(medianPrice)
+                .recommendedPrice(ai.recommendedPrice())
+                .aiConfidence(ai.confidence())
+                .aiReason(ai.reason())
+                .myPhotoAssessment(ai.photoNote())
+                .myListingDate(myListingInfo.getPublishedDate())
+                .marketNote(buildMarketNote(isOldListing, cityPrices.size(), siberiaPrices.size(), needFallback))
+                .items(cityPrices)
+                .siberiaItems(siberiaPrices)
+                .collectedAt(java.time.Instant.now())
+                .build();
     }
 
     /**

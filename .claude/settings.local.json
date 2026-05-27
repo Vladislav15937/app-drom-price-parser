@@ -58,7 +58,28 @@
       "PowerShell($resp = Invoke-WebRequest -Uri \"https://baza.drom.ru/barnaul/sell_spare_parts/?query=4525013140\" -UseBasicParsing -UserAgent \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36\"; $content = $resp.Content; \\($content | Select-String \"17763892191\" -AllMatches\\).Matches | Select-Object -First 3 | ForEach-Object { $content.Substring\\([Math]::Max\\(0,$_.Index-100\\), 300\\) })",
       "PowerShell(Select-String *)",
       "PowerShell(Start-Process java -ArgumentList @\\('-jar', 'target\\\\drom-price-parser-1.0.0.jar'\\) -WorkingDirectory 'C:\\\\Users\\\\Владислав\\\\IdeaProjects\\\\app-drom-price-parser' -PassThru | Select-Object Id)",
-      "PowerShell(Get-Command *)"
+      "PowerShell(Get-Command *)",
+      "Bash(mvn spring-boot:run -q)",
+      "Bash(echo \"PID=$!\")",
+      "Bash(java -version)",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" --version)",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" package -q -DskipTests)",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" package -DskipTests)",
+      "Bash(/usr/libexec/java_home -V)",
+      "Bash(JAVA_HOME=/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home '/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn' package -DskipTests)",
+      "Bash(iconv -f windows-1251 -t utf-8 /Users/vladislav/IdeaProjects/app-drom-price-parser/catalog_25-05-26_19-13.csv)",
+      "Bash(open *)",
+      "Bash(pkill -f \"drom-price-parser\")",
+      "Bash(JAVA_HOME=/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home '/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn' package -DskipTests -q)",
+      "Bash(JAVA_HOME=/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home /Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home/bin/java -jar /Users/vladislav/IdeaProjects/app-drom-price-parser/target/drom-price-parser-1.0.0.jar)",
+      "Bash(xargs kill -9)",
+      "Bash(JAVA_HOME=\"/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home\" \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" package -DskipTests)",
+      "Bash(export JAVA_HOME)",
+      "Bash(nohup /Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home/bin/java -jar /Users/vladislav/IdeaProjects/app-drom-price-parser/target/drom-price-parser-1.0.0.jar)",
+      "Bash(kill 5742)",
+      "Bash(JAVA_HOME=\"/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home\" \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile)",
+      "Bash(JAVA_HOME=\"/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home\" \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" package -DskipTests -q)",
+      "Bash(python3 *)"
     ]
   }
 }

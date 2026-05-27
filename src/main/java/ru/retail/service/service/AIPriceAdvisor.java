@@ -292,8 +292,6 @@ public class AIPriceAdvisor {
     // ==================== СТРАТЕГИЯ КОНКУРЕНТНОГО ЦЕНООБРАЗОВАНИЯ ====================
 
     private static final int MIN_CITY_COMPETITORS = 3;
-    /** Надбавка к ценам НСК: барнаульский покупатель экономит на доставке (~300–500₽ ≈ +15%). */
-    private static final double NSK_BARNAUL_PREMIUM = 1.15;
 
     /**
      * Правила:
@@ -317,18 +315,12 @@ public class AIPriceAdvisor {
                     "В городе", photoNote);
         }
 
-        // === Мало конкурентов в городе или старое объявление → Новосибирск с местной надбавкой ===
+        // === Мало конкурентов в городе или старое объявление → Новосибирск (единый рынок) ===
         if (!siberiaPrices.isEmpty()) {
-            // Масштабируем цены НСК: покупатель из Барнаула платит NSK_цена + доставка,
-            // поэтому барнаульский продавец конкурентоспособен при цене ≤ NSK × (1 + доставка).
-            List<PartPrice> scaledNsk = scaleMarketPrices(siberiaPrices, NSK_BARNAUL_PREMIUM);
-            CompetitorClassification scaledNskClass = scaleClassification(siberiaClass, NSK_BARNAUL_PREMIUM);
-
-            String premiumNote = String.format("+%.0f%% местная надбавка (нет доставки)", (NSK_BARNAUL_PREMIUM - 1) * 100);
             String scope = isOldListing
-                    ? "Объявление старше 6 мес. Ориентир — Новосибирск (" + premiumNote + ")"
-                    : "Мало предложений в городе. Ориентир — Новосибирск (" + premiumNote + ")";
-            return strategyForMarket(scaledNskClass, scaledNsk, myPhoto, myCurrentPrice, scope, photoNote);
+                    ? "Объявление старше 6 мес. Ориентир — Новосибирск"
+                    : "Мало предложений в городе. Ориентир — Новосибирск";
+            return strategyForMarket(siberiaClass, siberiaPrices, myPhoto, myCurrentPrice, scope, photoNote);
         }
 
         // === Есть только городские (мало, но Новосибирск пуст) ===
@@ -339,26 +331,6 @@ public class AIPriceAdvisor {
 
         return new AIRecommendation(myCurrentPrice, "низкая",
                 "Недостаточно данных для анализа. Цена оставлена без изменений.", photoNote);
-    }
-
-    /** Создаёт копию списка с ценами, умноженными на factor. */
-    private List<PartPrice> scaleMarketPrices(List<PartPrice> prices, double factor) {
-        return prices.stream().map(p -> PartPrice.builder()
-                .title(p.getTitle()).url(p.getUrl()).location(p.getLocation())
-                .dealer(p.getDealer()).publishedDate(p.getPublishedDate())
-                .photoUrls(p.getPhotoUrls()).oem(p.getOem()).description(p.getDescription())
-                .price(p.getPrice().multiply(BigDecimal.valueOf(factor)).setScale(0, RoundingMode.HALF_UP))
-                .build()).collect(Collectors.toList());
-    }
-
-    /** Масштабирует числовые цены в классификации на factor. */
-    private CompetitorClassification scaleClassification(CompetitorClassification cls, double factor) {
-        return new CompetitorClassification(
-                cls.similar().stream().map(p -> p * factor).collect(Collectors.toList()),
-                cls.better().stream().map(p -> p * factor).collect(Collectors.toList()),
-                cls.worse().stream().map(p -> p * factor).collect(Collectors.toList()),
-                cls.comment()
-        );
     }
 
     private AIRecommendation strategyForMarket(
