@@ -131,15 +131,20 @@ public class PriceAnalyzer {
             "комплект направляющ", "болт", "пружин", "шплинт"
     );
 
+    private static String normalizeOem(String oem) {
+        return oem.replaceAll("[^A-Za-z0-9]", "").toUpperCase();
+    }
+
     private List<PartPrice> filterAssemblies(List<PartPrice> parts, String targetOem) {
-        String normalizedTarget = targetOem.replaceAll("\\s+", "").toUpperCase();
+        String normalizedTarget = normalizeOem(targetOem);
         return parts.stream()
                 .filter(p -> {
                     String title = p.getTitle() == null ? "" : p.getTitle().toLowerCase();
                     if (NON_ASSEMBLY_KEYWORDS.stream().anyMatch(title::contains)) return false;
                     if (p.getOem() != null && !p.getOem().isBlank()) {
-                        boolean match = p.getOem().equalsIgnoreCase(normalizedTarget);
-                        if (!match) log.debug("Исключён по OEM: {} (ожидался {})", p.getOem(), normalizedTarget);
+                        String normalizedOem = normalizeOem(p.getOem());
+                        boolean match = normalizedOem.equals(normalizedTarget);
+                        if (!match) log.debug("Исключён по OEM: {} → {} (ожидался {})", p.getOem(), normalizedOem, normalizedTarget);
                         return match;
                     }
                     return true;
