@@ -71,7 +71,8 @@ public class DromParser {
 
     @PostConstruct
     public void init() {
-        playwright = Playwright.create();
+        playwright = createPlaywright();
+        ensurePlaywrightBrowsersInstalled();
         BrowserType.LaunchOptions launchOptions = new BrowserType.LaunchOptions()
                 .setHeadless(headless)
                 .setArgs(List.of(
@@ -97,6 +98,106 @@ public class DromParser {
     public void destroy() {
         if (browser != null) browser.close();
         if (playwright != null) playwright.close();
+    }
+
+    private void ensurePlaywrightBrowsersInstalled() {
+        try {
+            playwright.chromium().launch(new BrowserType.LaunchOptions().setHeadless(true)).close();
+        } catch (com.microsoft.playwright.PlaywrightException e) {
+            if (e.getMessage() == null || !e.getMessage().contains("Executable doesn't exist")) throw e;
+            log.info("Playwright: браузеры не найдены, запускаем установку...");
+            runPlaywrightInstallWithProgressUI();
+            playwright.close();
+            playwright = createPlaywright();
+        }
+    }
+
+    private void runPlaywrightInstallWithProgressUI() {
+        javax.swing.JDialog[] dialogRef = new javax.swing.JDialog[1];
+        try {
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                javax.swing.JDialog dialog = new javax.swing.JDialog((java.awt.Frame) null, "Первый запуск", false);
+                dialog.setDefaultCloseOperation(javax.swing.JDialog.DO_NOTHING_ON_CLOSE);
+                javax.swing.JPanel panel = new javax.swing.JPanel();
+                panel.setLayout(new javax.swing.BoxLayout(panel, javax.swing.BoxLayout.Y_AXIS));
+                panel.setBorder(javax.swing.BorderFactory.createEmptyBorder(24, 32, 24, 32));
+
+                javax.swing.JLabel title = new javax.swing.JLabel("Устанавливается браузер Chromium (~150 МБ)");
+                title.setFont(title.getFont().deriveFont(java.awt.Font.BOLD, 14f));
+                title.setAlignmentX(java.awt.Component.CENTER_ALIGNMENT);
+
+                javax.swing.JProgressBar progress = new javax.swing.JProgressBar();
+                progress.setIndeterminate(true);
+                progress.setPreferredSize(new java.awt.Dimension(420, 18));
+                progress.setMaximumSize(new java.awt.Dimension(Integer.MAX_VALUE, 18));
+
+                javax.swing.JLabel sub = new javax.swing.JLabel("Пожалуйста, подождите — это требуется только при первом запуске");
+                sub.setForeground(java.awt.Color.GRAY);
+                sub.setFont(sub.getFont().deriveFont(java.awt.Font.PLAIN, 12f));
+                sub.setAlignmentX(java.awt.Component.CENTER_ALIGNMENT);
+
+                panel.add(title);
+                panel.add(javax.swing.Box.createVerticalStrut(14));
+                panel.add(progress);
+                panel.add(javax.swing.Box.createVerticalStrut(10));
+                panel.add(sub);
+
+                dialog.setContentPane(panel);
+                dialog.pack();
+                dialog.setLocationRelativeTo(null);
+                dialog.setVisible(true);
+                dialogRef[0] = dialog;
+            });
+        } catch (Exception ex) {
+            log.warn("Не удалось показать диалог установки: {}", ex.getMessage());
+        }
+
+        try {
+            runPlaywrightInstall();
+        } finally {
+            javax.swing.SwingUtilities.invokeLater(() -> {
+                if (dialogRef[0] != null) dialogRef[0].dispose();
+            });
+        }
+    }
+
+    private void runPlaywrightInstall() {
+        try {
+            String javaExe = ProcessHandle.current().info().command()
+                    .orElse(System.getProperty("java.home") + java.io.File.separator + "bin" + java.io.File.separator + "java");
+            String classPath = System.getProperty("java.class.path");
+
+            ProcessBuilder pb = new ProcessBuilder(javaExe, "-cp", classPath,
+                    "com.microsoft.playwright.CLI", "install", "chromium");
+            pb.redirectErrorStream(true);
+            String browsersPath = System.getProperty("playwright.browsers.path");
+            if (browsersPath != null && !browsersPath.isBlank()) {
+                pb.environment().put("PLAYWRIGHT_BROWSERS_PATH", browsersPath);
+            }
+
+            Process process = pb.start();
+            try (var reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) log.info("playwright-install: {}", line);
+            }
+            int exit = process.waitFor();
+            if (exit != 0) throw new RuntimeException("playwright install завершился с кодом " + exit);
+            log.info("Playwright: Chromium установлен успешно");
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RuntimeException("Не удалось установить браузеры Playwright: " + e.getMessage(), e);
+        }
+    }
+
+    private Playwright createPlaywright() {
+        String customPath = System.getProperty("playwright.browsers.path");
+        if (customPath != null && !customPath.isBlank()) {
+            log.info("Playwright: браузеры из бандла → {}", customPath);
+            return Playwright.create(new Playwright.CreateOptions()
+                    .setEnv(Map.of("PLAYWRIGHT_BROWSERS_PATH", customPath)));
+        }
+        return Playwright.create();
     }
 
     private Proxy buildProxy(String url) {

@@ -80,7 +80,26 @@
       "Bash(JAVA_HOME=\"/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home\" \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile)",
       "Bash(JAVA_HOME=\"/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home\" \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" package -DskipTests -q)",
       "Bash(python3 *)",
-      "Bash(jar tf *)"
+      "Bash(jar tf *)",
+      "Bash(/usr/local/bin/mvn compile *)",
+      "Read(//Users/vladislav/.sdkman/candidates/java/current/bin/**)",
+      "Read(//Users/vladislav/**)",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile -q)",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile)",
+      "Bash(JAVA_HOME=/Users/vladislav/.jdks/temurin-22.0.2 \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile -q)",
+      "Bash(JAVA_HOME=/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile -q)",
+      "Bash(chmod +x /Users/vladislav/IdeaProjects/app-drom-price-parser/build-windows-dist.sh)",
+      "Bash(bash *)",
+      "Bash(unzip -l /Users/vladislav/IdeaProjects/app-drom-price-parser/dist/DromPriceParser.zip)",
+      "Bash(ipconfig getifaddr *)",
+      "Bash(xargs cat -n)",
+      "Bash(pkill -f \"app-drom-price-parser\")",
+      "WebFetch(domain:open.blackroute.space)",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(git reset *)"
     ]
   }
 }

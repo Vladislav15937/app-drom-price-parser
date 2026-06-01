@@ -84,4 +84,43 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <profile>
+            <id>windows-dist</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>com.akathist.maven.plugins.launch4j</groupId>
+                        <artifactId>launch4j-maven-plugin</artifactId>
+                        <version>2.5.1</version>
+                        <executions>
+                            <execution>
+                                <id>windows-exe</id>
+                                <phase>verify</phase>
+                                <goals><goal>launch4j</goal></goals>
+                                <configuration>
+                                    <dontWrapJar>false</dontWrapJar>
+                                    <headerType>gui</headerType>
+                                    <jar>${project.build.directory}/${project.artifactId}-${project.version}.jar</jar>
+                                    <outfile>${project.build.directory}/DromPriceParser.exe</outfile>
+                                    <jre>
+                                        <path>jre</path>
+                                        <minVersion>21</minVersion>
+                                        <opts>
+                                            <opt>-Xmx512m</opt>
+                                            <opt>-Dfile.encoding=UTF-8</opt>
+                                            <opt>-Dplaywright.browsers.path=%EXEDIR%\browsers</opt>
+                                            <opt>--add-opens=java.base/java.lang=ALL-UNNAMED</opt>
+                                            <opt>--add-opens=java.base/java.util=ALL-UNNAMED</opt>
+                                        </opts>
+                                    </jre>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

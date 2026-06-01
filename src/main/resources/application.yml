@@ -6,6 +6,13 @@ spring:
     name: price-aggregator
   main:
     allow-bean-definition-overriding: false
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+  mvc:
+    async:
+      request-timeout: -1
 
 # Swagger/OpenAPI (должен быть на корневом уровне, НЕ внутри spring!)
 springdoc:
@@ -31,7 +38,7 @@ apify:
 drom:
   headless: false  # false для отладки, true для продакшена
   proxy:
-    url: socks5://NUs4Re:BahAN6KyU6eT@bproxy.site:15517
+    url: http://sUxCAy:aTYcmATpajez@mproxy.site:16532
 
 twocaptcha:
   enabled: true   # true для автоматического решения капчи
@@ -39,7 +46,7 @@ twocaptcha:
 
 gemini:
   api:
-    key: sk-jx8ewiNBTyp_0ca8xoI7zA
+    key: sk-7ug6l6ES8RO6Ws10VL6vbA
     base-url: https://open.blackroute.space/v1/chat/completions
   vision:
     model: gemini-3.5-flash
@@ -70,3 +77,4 @@ logging:
     ru.retail.service.client: DEBUG
     feign: DEBUG
     ru.retail.service.service.AIPriceAdvisor: DEBUG
+    ru.retail.service.controller: DEBUG
