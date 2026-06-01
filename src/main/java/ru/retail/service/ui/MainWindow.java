@@ -3,6 +3,7 @@ package ru.retail.service.ui;
 import ru.retail.service.dto.AggregationResult;
 import ru.retail.service.dto.PartPrice;
 import ru.retail.service.service.PriceAnalyzer;
+import ru.retail.service.service.TunnelService;
 
 import javax.swing.*;
 import javax.swing.event.ListSelectionEvent;
@@ -31,6 +32,9 @@ public class MainWindow extends JFrame {
     private static final Color BLUE   = new Color(96, 165, 250);
 
     private final PriceAnalyzer priceAnalyzer;
+    private final TunnelService tunnelService;
+    private JLabel publicUrlLabel;
+
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "analysis-thread");
         t.setDaemon(true);
@@ -80,8 +84,9 @@ public class MainWindow extends JFrame {
     private JLabel batchDetailHint;
     private JScrollPane batchDetailScroll;
 
-    public MainWindow(PriceAnalyzer priceAnalyzer) {
+    public MainWindow(PriceAnalyzer priceAnalyzer, TunnelService tunnelService) {
         this.priceAnalyzer = priceAnalyzer;
+        this.tunnelService = tunnelService;
         buildUI();
     }
 
@@ -99,9 +104,75 @@ public class MainWindow extends JFrame {
         tabs.addTab("Анализ по ссылке", buildSinglePanel());
         tabs.addTab("Анализ по каталогу", buildBatchPanel());
 
-        setContentPane(tabs);
+        JPanel content = new JPanel(new BorderLayout());
+        content.add(buildUrlBar(), BorderLayout.NORTH);
+        content.add(tabs, BorderLayout.CENTER);
+        setContentPane(content);
         pack();
         setLocationRelativeTo(null);
+
+        // Ждём публичный URL в фоне и обновляем строку
+        Thread urlWaiter = new Thread(() -> {
+            String pub = tunnelService.waitForPublicUrl();
+            SwingUtilities.invokeLater(() -> updatePublicUrl(pub));
+        }, "url-waiter");
+        urlWaiter.setDaemon(true);
+        urlWaiter.start();
+    }
+
+    private JPanel buildUrlBar() {
+        JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 14, 5));
+        bar.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, new Color(60, 60, 60)));
+        bar.setBackground(new Color(43, 43, 43));
+
+        String local = tunnelService.getLocalUrl() != null
+                ? tunnelService.getLocalUrl() : "http://localhost:8081";
+
+        JLabel localLbl = new JLabel("Локальный: " + local);
+        localLbl.setFont(localLbl.getFont().deriveFont(Font.PLAIN, 12f));
+        localLbl.setForeground(DIM);
+        localLbl.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        localLbl.setToolTipText("Нажмите, чтобы скопировать");
+        localLbl.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                Toolkit.getDefaultToolkit().getSystemClipboard()
+                        .setContents(new StringSelection(local), null);
+            }
+            @Override public void mouseEntered(java.awt.event.MouseEvent e) { localLbl.setForeground(BLUE); }
+            @Override public void mouseExited(java.awt.event.MouseEvent e)  { localLbl.setForeground(DIM); }
+        });
+
+        JLabel sep = new JLabel("  |  ");
+        sep.setForeground(new Color(80, 80, 80));
+
+        publicUrlLabel = new JLabel("Публичный: определяется...");
+        publicUrlLabel.setFont(publicUrlLabel.getFont().deriveFont(Font.PLAIN, 12f));
+        publicUrlLabel.setForeground(DIM);
+
+        bar.add(localLbl);
+        bar.add(sep);
+        bar.add(publicUrlLabel);
+        return bar;
+    }
+
+    private void updatePublicUrl(String pub) {
+        if (pub != null) {
+            publicUrlLabel.setText("Публичный: " + pub);
+            publicUrlLabel.setForeground(GREEN);
+            publicUrlLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            publicUrlLabel.setToolTipText("Нажмите, чтобы скопировать");
+            publicUrlLabel.addMouseListener(new java.awt.event.MouseAdapter() {
+                @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                    Toolkit.getDefaultToolkit().getSystemClipboard()
+                            .setContents(new StringSelection(pub), null);
+                }
+                @Override public void mouseEntered(java.awt.event.MouseEvent e) { publicUrlLabel.setForeground(BLUE); }
+                @Override public void mouseExited(java.awt.event.MouseEvent e)  { publicUrlLabel.setForeground(GREEN); }
+            });
+        } else {
+            publicUrlLabel.setText("Публичный: cloudflared не найден  →  brew install cloudflared");
+            publicUrlLabel.setForeground(YELLOW);
+        }
     }
 
     // ──────────────────────────────────────────────────────

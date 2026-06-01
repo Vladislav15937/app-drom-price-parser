@@ -7,8 +7,11 @@ import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import jakarta.servlet.http.HttpServletResponse;
 import ru.retail.service.dto.AggregationResult;
 import ru.retail.service.service.PriceAnalyzer;
+import ru.retail.service.service.TunnelService;
 
 import java.io.IOException;
 import java.math.BigDecimal;
@@ -16,6 +19,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -27,6 +31,7 @@ public class PriceAggregatorController {
 
     private final PriceAnalyzer priceAnalyzer;
     private final ObjectMapper objectMapper;
+    private final TunnelService tunnelService;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "web-analysis");
@@ -40,6 +45,28 @@ public class PriceAggregatorController {
         return t;
     });
 
+    // ── Хранилище заданий для polling-архитектуры ───────────────
+    record JobResult(String status, Object result, String error, long createdAt) {}
+    private final ConcurrentHashMap<String, JobResult> jobs = new ConcurrentHashMap<>();
+
+    {
+        // Очистка завершённых заданий старше 30 минут
+        keepAliveScheduler.scheduleAtFixedRate(() -> {
+            long cutoff = System.currentTimeMillis() - 30 * 60 * 1000L;
+            jobs.entrySet().removeIf(e -> e.getValue().createdAt() < cutoff);
+        }, 10, 10, TimeUnit.MINUTES);
+    }
+
+    // ── Информация о сервере ────────────────────────────────
+
+    @GetMapping("/info")
+    public Map<String, String> info() {
+        Map<String, String> map = new java.util.LinkedHashMap<>();
+        map.put("localUrl",  tunnelService.getLocalUrl() != null ? tunnelService.getLocalUrl() : "");
+        map.put("publicUrl", tunnelService.getPublicUrl() != null ? tunnelService.getPublicUrl() : "");
+        return map;
+    }
+
     // ── Одиночный анализ (SSE) ──────────────────────────────
 
     @PostMapping(value = "/analyze/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
@@ -47,8 +74,11 @@ public class PriceAggregatorController {
             @RequestParam String oem,
             @RequestParam String region,
             @RequestParam String myListingUrl,
-            @RequestParam(required = false, defaultValue = "0") BigDecimal myPrice) {
+            @RequestParam(required = false, defaultValue = "0") BigDecimal myPrice,
+            HttpServletResponse response) {
 
+        response.setHeader("X-Accel-Buffering", "no");
+        response.setHeader("Cache-Control", "no-cache");
         SseEmitter emitter = new SseEmitter(0L);   // 0 = без таймаута на уровне Tomcat
         AtomicBoolean done = new AtomicBoolean(false);
         emitter.onCompletion(() -> done.set(true));
@@ -76,6 +106,78 @@ public class PriceAggregatorController {
         return emitter;
     }
 
+    // ── Анализ одной позиции из каталога (SSE, без файла) ──
+
+    @PostMapping(value = "/catalog-item/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter catalogItemStream(
+            @RequestParam String oem,
+            @RequestParam(defaultValue = "0") BigDecimal catalogPrice,
+            @RequestParam(defaultValue = "barnaul") String region,
+            @RequestParam(defaultValue = "YARD86") String company,
+            HttpServletResponse response) {
+
+        response.setHeader("X-Accel-Buffering", "no");
+        response.setHeader("Cache-Control", "no-cache");
+        SseEmitter emitter = new SseEmitter(0L);
+        AtomicBoolean done = new AtomicBoolean(false);
+        emitter.onCompletion(() -> done.set(true));
+        emitter.onTimeout(() -> done.set(true));
+        emitter.onError(e -> done.set(true));
+
+        ScheduledFuture<?> ping = keepAliveScheduler.scheduleAtFixedRate(() -> {
+            if (done.get()) return;
+            send(emitter, "ping", "");
+        }, 25, 25, TimeUnit.SECONDS);
+
+        executor.submit(() -> {
+            try {
+                AggregationResult result = priceAnalyzer.analyzeFromCatalog(oem, catalogPrice, region, company);
+                send(emitter, "result", objectMapper.writeValueAsString(result));
+            } catch (Exception e) {
+                send(emitter, "error", e.getMessage() != null ? e.getMessage() : "Ошибка анализа");
+            } finally {
+                ping.cancel(false);
+                emitter.complete();
+            }
+        });
+        return emitter;
+    }
+
+    // ── Polling: отправить задание и получить результат ────────
+
+    @PostMapping("/catalog-item/submit")
+    public Map<String, String> submitCatalogItem(
+            @RequestParam String oem,
+            @RequestParam(defaultValue = "0") BigDecimal catalogPrice,
+            @RequestParam(defaultValue = "barnaul") String region,
+            @RequestParam(defaultValue = "YARD86") String company) {
+        String jobId = UUID.randomUUID().toString();
+        long now = System.currentTimeMillis();
+        jobs.put(jobId, new JobResult("pending", null, null, now));
+        executor.submit(() -> {
+            jobs.put(jobId, new JobResult("running", null, null, now));
+            try {
+                AggregationResult result = priceAnalyzer.analyzeFromCatalog(oem, catalogPrice, region, company);
+                jobs.put(jobId, new JobResult("done", result, null, now));
+            } catch (Exception e) {
+                jobs.put(jobId, new JobResult("error", null,
+                        e.getMessage() != null ? e.getMessage() : "Ошибка анализа", now));
+            }
+        });
+        return Map.of("jobId", jobId);
+    }
+
+    @GetMapping("/job/{jobId}")
+    public Map<String, Object> getJobResult(@PathVariable String jobId) {
+        JobResult jr = jobs.get(jobId);
+        if (jr == null) return Map.of("status", "notFound");
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("status", jr.status());
+        if (jr.result() != null) resp.put("result", jr.result());
+        if (jr.error()  != null) resp.put("error",  jr.error());
+        return resp;
+    }
+
     // ── Пакетный анализ по CSV (SSE) ───────────────────────
 
     @PostMapping(value = "/batch/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
@@ -83,8 +185,11 @@ public class PriceAggregatorController {
             @RequestParam("file") MultipartFile file,
             @RequestParam(defaultValue = "barnaul") String region,
             @RequestParam(defaultValue = "YARD86") String company,
-            @RequestParam(defaultValue = "0") int limit) throws IOException {
+            @RequestParam(defaultValue = "0") int limit,
+            HttpServletResponse response) throws IOException {
 
+        response.setHeader("X-Accel-Buffering", "no");
+        response.setHeader("Cache-Control", "no-cache");
         byte[] csvBytes = file.getBytes();
         SseEmitter emitter = new SseEmitter(0L);   // 0 = без таймаута на уровне Tomcat
         AtomicBoolean stopped = new AtomicBoolean(false);

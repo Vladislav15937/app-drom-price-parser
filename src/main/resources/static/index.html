@@ -99,6 +99,13 @@ tr.selected td { background: #1e3a5f; }
 </head>
 <body>
 <div class="app">
+  <div id="url-bar" style="display:flex;align-items:center;gap:16px;padding:5px 2px 6px;border-bottom:1px solid var(--border);margin-bottom:10px;font-size:12px;color:var(--text-dim);flex-shrink:0">
+    <span>Локальный: <a id="url-local" href="#" onclick="copyToClipboard(event,'url-local-val')" title="Нажмите, чтобы скопировать"><span id="url-local-val">…</span></a></span>
+    <span style="color:#555">|</span>
+    <span>Публичный: <a id="url-pub" href="#" onclick="copyToClipboard(event,'url-pub-val')" title="Нажмите, чтобы скопировать"><span id="url-pub-val">определяется…</span></a></span>
+    <span id="url-copy-hint" style="color:var(--green);display:none">скопировано!</span>
+  </div>
+
   <h1>Анализ цен на запчасти — Drom.ru</h1>
 
   <div class="tabs">
@@ -117,13 +124,14 @@ tr.selected td { background: #1e3a5f; }
 
       <label>Регион:</label>
       <div class="row-inline">
-        <select id="s-region" style="width:160px">
-          <option>barnaul</option><option>novosibirsk</option><option>omsk</option>
-          <option>tomsk</option><option>kemerovo</option><option>krasnoyarsk</option><option>irkutsk</option>
-        </select>
+        <input type="text" id="s-region" list="regions-dl" value="barnaul" style="width:160px" placeholder="barnaul">
         <label>Моя цена, ₽ (необяз.):</label>
         <input type="text" id="s-price" placeholder="оставьте пустым" style="width:160px">
       </div>
+      <datalist id="regions-dl">
+        <option value="barnaul"><option value="novosibirsk"><option value="omsk">
+        <option value="tomsk"><option value="kemerovo"><option value="krasnoyarsk"><option value="irkutsk">
+      </datalist>
 
       <label></label>
       <div class="row-inline">
@@ -178,10 +186,7 @@ tr.selected td { background: #1e3a5f; }
 
       <label>Регион:</label>
       <div class="row-inline">
-        <select id="b-region" style="width:160px">
-          <option>barnaul</option><option>novosibirsk</option><option>omsk</option>
-          <option>tomsk</option><option>kemerovo</option><option>krasnoyarsk</option><option>irkutsk</option>
-        </select>
+        <input type="text" id="b-region" list="regions-dl" value="barnaul" style="width:160px" placeholder="barnaul">
         <label>Компания на Drom:</label>
         <input type="text" id="b-company" value="YARD86" style="width:140px">
         <label>Кол-во OEM (0=все):</label>
@@ -219,6 +224,59 @@ tr.selected td { background: #1e3a5f; }
 </div>
 
 <script>
+// ══════════════════════════════════════════════════════════════
+// URL-bar — адреса сервера
+// ══════════════════════════════════════════════════════════════
+
+async function loadServerInfo() {
+  try {
+    const r = await fetch('/api/v1/info');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.localUrl) {
+      document.getElementById('url-local-val').textContent = d.localUrl;
+      document.getElementById('url-local').href = d.localUrl;
+    }
+    if (d.publicUrl) {
+      document.getElementById('url-pub-val').textContent = d.publicUrl;
+      document.getElementById('url-pub').href = d.publicUrl;
+      document.getElementById('url-pub-val').style.color = 'var(--green)';
+    } else {
+      document.getElementById('url-pub-val').textContent = 'cloudflared не найден → brew install cloudflared';
+      document.getElementById('url-pub-val').style.color = 'var(--yellow)';
+    }
+  } catch (e) {}
+}
+
+let _copyTimer;
+function copyToClipboard(e, spanId) {
+  e.preventDefault();
+  const text = document.getElementById(spanId).textContent;
+  if (!text || text.includes('…') || text.includes('cloudflared')) return;
+  navigator.clipboard.writeText(text).then(() => {
+    const hint = document.getElementById('url-copy-hint');
+    hint.style.display = '';
+    clearTimeout(_copyTimer);
+    _copyTimer = setTimeout(() => { hint.style.display = 'none'; }, 1800);
+  }).catch(() => {});
+}
+
+// Если tunnelService ещё определяет URL — опрашиваем раз в 5 с пока не появится
+async function pollUntilPublicUrl() {
+  for (let i = 0; i < 12; i++) {
+    await new Promise(r => setTimeout(r, 5000));
+    try {
+      const d = await (await fetch('/api/v1/info')).json();
+      if (d.publicUrl) {
+        document.getElementById('url-pub-val').textContent = d.publicUrl;
+        document.getElementById('url-pub').href = d.publicUrl;
+        document.getElementById('url-pub-val').style.color = 'var(--green)';
+        break;
+      }
+    } catch (e) {}
+  }
+}
+
 // ══════════════════════════════════════════════════════════════
 // localStorage — сохранение состояния между перезагрузками
 // ══════════════════════════════════════════════════════════════
@@ -481,21 +539,29 @@ function appendBatchRow(tbody, i, item, status) {
 }
 
 async function runBatch() {
-  const file = document.getElementById('b-file-input').files[0];
-  if (!file) { alert('Выберите CSV-файл для запуска анализа'); return; }
+  if (!csvRows || csvRows.length === 0) { alert('Выберите CSV-файл для запуска анализа'); return; }
 
   const region  = document.getElementById('b-region').value;
   const company = document.getElementById('b-company').value.trim() || 'YARD86';
-  const limit   = parseInt(document.getElementById('b-limit').value) || 0;
+  const limitVal = parseInt(document.getElementById('b-limit').value) || 0;
+
+  // Фильтруем строки с OEM
+  const items = [];
+  csvRows.forEach(row => {
+    const oem = col(row, 4);
+    if (!oem) return;
+    items.push({ oem, catalogPrice: col(row, 5) || '0', partName: col(row, 3), brand: col(row, 8), model: col(row, 9) });
+  });
+  const total = (limitVal > 0 && limitVal < items.length) ? limitVal : items.length;
 
   // Сброс всех строк в "Ожидает"
-  const rowCount = document.getElementById('b-tbody').rows.length;
-  batchResults = new Array(rowCount).fill(null);
+  batchResults = new Array(total).fill(null);
   selectedRow = -1;
   document.getElementById('b-detail').innerHTML =
     '<span class="hint">Выберите строку в таблице, чтобы увидеть детали анализа</span>';
   document.querySelectorAll('#b-tbody tr').forEach(tr => {
-    const i = tr.dataset.index;
+    const i = parseInt(tr.dataset.index);
+    if (i >= total) return;
     const stEl  = document.getElementById('b-st-'  + i);
     const recEl = document.getElementById('b-rec-' + i);
     const cntEl = document.getElementById('b-cnt-' + i);
@@ -507,46 +573,83 @@ async function runBatch() {
 
   document.getElementById('b-btn').disabled = true;
   document.getElementById('b-stop').disabled = false;
-  setStatus('b-status', 'running', 'Запускаем...');
-
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('region', region);
-  fd.append('company', company);
-  fd.append('limit', limit);
+  setStatus('b-status', 'running', `Анализируется 0 / ${total}...`);
 
   batchAbort = new AbortController();
-  let total = 0;
-  try {
-    const resp = await fetch('/api/v1/batch/stream', { method: 'POST', body: fd, signal: batchAbort.signal });
-    if (!resp.ok) { setStatus('b-status', 'err', 'Ошибка сервера: ' + resp.status); return; }
+  const signal = batchAbort.signal;
 
-    await readSse(resp, (type, data) => {
-      if (type === 'total') {
-        total = parseInt(data);
-        setStatus('b-status', 'running', `Анализируется 0 / ${total}...`);
-      } else if (type === 'progress') {
-        const d = JSON.parse(data);
-        const stEl = document.getElementById('b-st-' + d.index);
-        if (stEl) stEl.innerHTML = '<span class="tag tag-run">Анализируется...</span>';
-        const tr = document.getElementById('b-row-' + d.index);
-        if (tr) tr.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        setStatus('b-status', 'running', `Анализируется ${d.index + 1} / ${total}...`);
-      } else if (type === 'row') {
-        const d = JSON.parse(data);
-        batchResults[d.index] = d;
-        updateBatchRow(d);
-        LS.save('b_results', batchResults);
-        setStatus('b-status', 'running', `Готово ${d.index + 1} / ${total}...`);
-        if (selectedRow === d.index) showBatchDetail(d);
-      } else if (type === 'done') {
-        const stopped = data === 'stopped';
-        setStatus('b-status', stopped ? 'warn' : 'ok', stopped ? 'Остановлено' : 'Анализ завершён');
-        LS.save('b_results', batchResults);
-      } else if (type === 'error') {
-        setStatus('b-status', 'err', 'Ошибка: ' + data);
+  try {
+    for (let i = 0; i < total; i++) {
+      if (signal.aborted) break;
+
+      const item = items[i];
+      // Показываем "Анализируется..."
+      const stEl = document.getElementById('b-st-' + i);
+      if (stEl) stEl.innerHTML = '<span class="tag tag-run">Анализируется...</span>';
+      const tr = document.getElementById('b-row-' + i);
+      if (tr) tr.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      setStatus('b-status', 'running', `Анализируется ${i + 1} / ${total}...`);
+
+      const params = new URLSearchParams({
+        oem: item.oem,
+        catalogPrice: item.catalogPrice,
+        region,
+        company
+      });
+
+      let result = null;
+      let itemError = null;
+      try {
+        const submitResp = await fetch('/api/v1/catalog-item/submit?' + params, { method: 'POST', signal });
+        if (!submitResp.ok) {
+          itemError = 'HTTP ' + submitResp.status;
+        } else {
+          const { jobId } = await submitResp.json();
+          // Опрашиваем каждые 4 секунды пока задание не завершится
+          pollLoop: while (!signal.aborted) {
+            await new Promise(r => setTimeout(r, 4000));
+            if (signal.aborted) break;
+            let pollResp;
+            try {
+              pollResp = await fetch('/api/v1/job/' + jobId, { signal });
+            } catch (pe) {
+              if (pe.name === 'AbortError') break;
+              itemError = 'Ошибка опроса: ' + pe.message;
+              break;
+            }
+            if (!pollResp.ok) { itemError = 'Poll HTTP ' + pollResp.status; break; }
+            const job = await pollResp.json();
+            if (job.status === 'done')  { result = job.result; break; }
+            if (job.status === 'error') { itemError = job.error || 'Ошибка анализа'; break; }
+            // pending / running — продолжаем ждать
+          }
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') break;
+        itemError = e.message;
       }
-    });
+
+      const row = {
+        index: i,
+        oem: item.oem,
+        partName: item.partName,
+        brand: item.brand,
+        model: item.model,
+        catalogPrice: item.catalogPrice,
+        result,
+        status: itemError ? 'error' : (result && result.recommendedPrice > 0 ? 'done' : 'notFound'),
+        error: itemError
+      };
+      batchResults[i] = row;
+      updateBatchRow(row);
+      LS.save('b_results', batchResults);
+      setStatus('b-status', 'running', `Готово ${i + 1} / ${total}...`);
+      if (selectedRow === i) showBatchDetail(row);
+    }
+
+    const stopped = signal.aborted;
+    setStatus('b-status', stopped ? 'warn' : 'ok', stopped ? 'Остановлено' : 'Анализ завершён');
+    LS.save('b_results', batchResults);
   } catch (e) {
     if (e.name !== 'AbortError') setStatus('b-status', 'err', 'Ошибка: ' + e.message);
     else setStatus('b-status', 'warn', 'Остановлено');
@@ -669,7 +772,7 @@ function bindInputPersist() {
   ['s-oem', 's-url', 's-price'].forEach(id =>
     document.getElementById(id).addEventListener('input', e => LS.save(id, e.target.value)));
   ['s-region', 'b-region'].forEach(id =>
-    document.getElementById(id).addEventListener('change', e => LS.save(id, e.target.value)));
+    document.getElementById(id).addEventListener('input', e => LS.save(id, e.target.value)));
   ['b-company', 'b-limit'].forEach(id =>
     document.getElementById(id).addEventListener('input', e => LS.save(id, e.target.value)));
 }
@@ -684,6 +787,12 @@ document.addEventListener('keydown', e => {
 document.addEventListener('DOMContentLoaded', () => {
   bindInputPersist();
   restoreState();
+  loadServerInfo().then(() => {
+    // Если публичный URL ещё не готов — продолжаем опрашивать
+    if (document.getElementById('url-pub-val').textContent === 'определяется…') {
+      pollUntilPublicUrl();
+    }
+  });
 });
 </script>
 </body>

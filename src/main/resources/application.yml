@@ -1,5 +1,8 @@
 server:
   port: 8081
+  forward-headers-strategy: native
+  tomcat:
+    connection-timeout: 20000
 
 spring:
   application:

@@ -99,7 +99,17 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
-      "Bash(git reset *)"
+      "Bash(git reset *)",
+      "Bash(git commit *)",
+      "Bash(./mvnw compile *)",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile -f /Users/vladislav/IdeaProjects/app-drom-price-parser/pom.xml -q)",
+      "Bash(brew install *)",
+      "Bash(cloudflared tunnel *)",
+      "Bash(kill %1)",
+      "Bash(wait)",
+      "Bash(sudo killall -HUP mDNSResponder)",
+      "Bash(ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -R 80:localhost:8081 serveo.net)",
+      "Bash(/opt/homebrew/opt/maven/bin/mvn compile *)"
     ]
   }
 }
