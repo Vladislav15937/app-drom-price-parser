@@ -109,7 +109,10 @@
       "Bash(wait)",
       "Bash(sudo killall -HUP mDNSResponder)",
       "Bash(ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -R 80:localhost:8081 serveo.net)",
-      "Bash(/opt/homebrew/opt/maven/bin/mvn compile *)"
+      "Bash(/opt/homebrew/opt/maven/bin/mvn compile *)",
+      "Bash(/opt/homebrew/bin/mvn compile *)",
+      "Bash(java --version)",
+      "Bash(JAVA_HOME=/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile -f /Users/vladislav/IdeaProjects/app-drom-price-parser/pom.xml -q)"
     ]
   }
 }

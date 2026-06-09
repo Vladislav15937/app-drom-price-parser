@@ -49,7 +49,7 @@ twocaptcha:
 
 gemini:
   api:
-    key: sk-7ug6l6ES8RO6Ws10VL6vbA
+    key: sk-8F54DRY3xVtgEQnTdgxGRg
     base-url: https://open.blackroute.space/v1/chat/completions
   vision:
     model: gemini-3.5-flash

@@ -57,15 +57,6 @@ public class AIPriceAdvisor {
 
     // ==================== ПУБЛИЧНЫЙ МЕТОД ====================
 
-    /**
-     * Анализирует рынок и рекомендует конкурентную цену.
-     *
-     * @param myListing      данные моего объявления (описание, фото, дата)
-     * @param myCurrentPrice текущая цена (из объявления или переданная вручную)
-     * @param cityPrices     конкуренты в городе (с фото)
-     * @param siberiaPrices  конкуренты по Сибири (пусто если не нужны)
-     * @param isOldListing   объявление старше 6 месяцев
-     */
     public AIRecommendation analyze(
             MyListingInfo myListing, BigDecimal myCurrentPrice,
             List<PartPrice> cityPrices, List<PartPrice> siberiaPrices,
@@ -77,29 +68,21 @@ public class AIPriceAdvisor {
         }
 
         try {
-            // ШАГ 1: Параллельная оценка фотографий (мои + конкурентов)
-            log.info("Шаг 1/3: Оценка фотографий...");
-            PhotoAssessment myPhoto = evaluatePhotosAsync(myListing.getPhotoUrls(), "моя деталь").join();
+            // ШАГ 1: Оценка моих фото (один раз)
+            log.info("Шаг 1/3: Оценка моих фотографий...");
+            PhotoAssessment myPhoto = evaluatePhotosAsync(myListing.getPhotoUrls(), myListing.getTitle()).join();
             log.info("Мои фото: {} (коэф. {})", myPhoto.condition(), myPhoto.coefficient());
 
-            List<CompletableFuture<PhotoAssessment>> competitorPhotoFutures = cityPrices.stream()
-                    .map(p -> evaluatePhotosAsync(p.getPhotoUrls(), p.getTitle()))
-                    .collect(Collectors.toList());
-            List<PhotoAssessment> competitorPhotos = competitorPhotoFutures.stream()
-                    .map(CompletableFuture::join)
-                    .collect(Collectors.toList());
-
-            // ШАГ 2: Классификация конкурентов
-            log.info("Шаг 2/3: Классификация {} городских конкурентов...", cityPrices.size());
+            // ШАГ 2: Попарное сравнение конкурентов (параллельная оценка фото + текстовая классификация)
+            log.info("Шаг 2/3: Попарное сравнение {} городских конкурентов...", cityPrices.size());
+            List<PhotoAssessment> cityPhotos = evaluateAllPhotosParallel(cityPrices);
             CompetitorClassification cityClassification = classifyCompetitors(
-                    cityPrices, competitorPhotos, myListing, myPhoto);
+                    cityPrices, cityPhotos, myListing, myPhoto);
 
             CompetitorClassification siberiaClassification = CompetitorClassification.empty();
             if (!siberiaPrices.isEmpty()) {
-                log.info("Шаг 2b/3: Классификация {} новосибирских конкурентов...", siberiaPrices.size());
-                List<PhotoAssessment> siberiaPhotos = siberiaPrices.stream()
-                        .map(p -> new PhotoAssessment("нет оценки", "", 0.80))
-                        .collect(Collectors.toList());
+                log.info("Шаг 2b/3: Попарное сравнение {} новосибирских конкурентов...", siberiaPrices.size());
+                List<PhotoAssessment> siberiaPhotos = evaluateAllPhotosParallel(siberiaPrices);
                 siberiaClassification = classifyCompetitors(siberiaPrices, siberiaPhotos, myListing, myPhoto);
             }
 
@@ -121,13 +104,25 @@ public class AIPriceAdvisor {
 
     // ==================== АГЕНТ 1: VISION — оценка фотографий ====================
 
+    private boolean isVisionActive() {
+        return geminiApiKey != null && !geminiApiKey.isBlank();
+    }
+
+    /** Параллельно оценивает фото всех конкурентов в списке. */
+    private List<PhotoAssessment> evaluateAllPhotosParallel(List<PartPrice> competitors) {
+        List<CompletableFuture<PhotoAssessment>> futures = competitors.stream()
+                .map(p -> evaluatePhotosAsync(p.getPhotoUrls(), p.getTitle()))
+                .collect(Collectors.toList());
+        return futures.stream().map(CompletableFuture::join).collect(Collectors.toList());
+    }
+
     private CompletableFuture<PhotoAssessment> evaluatePhotosAsync(List<String> photoUrls, String context) {
         return CompletableFuture.supplyAsync(() -> evaluatePhotos(photoUrls, context), photoExecutor);
     }
 
     private PhotoAssessment evaluatePhotos(List<String> photoUrls, String context) {
-        if (geminiApiKey == null || geminiApiKey.isBlank()) {
-            log.debug("Gemini API key не задан, vision пропущен для '{}'", context);
+        if (!isVisionActive()) {
+            log.debug("Vision отключён (ключ не задан), пропускаем для '{}'", context);
             return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
         }
         return evaluatePhotosViaApi(photoUrls, context);
@@ -150,7 +145,10 @@ public class AIPriceAdvisor {
             content.add(imageItem);
             added++;
         }
-        content.add(Map.of("type", "text", "text", """
+
+        String partHint = (context != null && !context.isBlank())
+                ? "Деталь: " + context + ".\n" : "";
+        content.add(Map.of("type", "text", "text", partHint + """
                 Оцени автозапчасть на фото по внешнему виду и состоянию.
                 Учитывай: видимые повреждения, износ, царапины, сколы, ржавчину, общий вид и качество самого фото.
                 Игнорируй бренд и марку — только визуальное состояние детали.
@@ -166,7 +164,7 @@ public class AIPriceAdvisor {
             body.put("model", geminiVisionModel);
             body.put("messages", List.of(Map.of("role", "user", "content", content)));
             body.put("temperature", 0.1);
-            body.put("max_tokens", 1000);
+            body.put("max_tokens", 1500);
 
             String json = objectMapper.writeValueAsString(body);
             HttpRequest req = HttpRequest.newBuilder()
@@ -179,11 +177,11 @@ public class AIPriceAdvisor {
 
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
             responseBody = resp.body();
-            log.debug("Gemini raw response [{}] HTTP {}: {}", context, resp.statusCode(),
+            log.debug("Gemini [{}] HTTP {}: {}", context, resp.statusCode(),
                     responseBody.substring(0, Math.min(500, responseBody.length())));
 
             if (resp.statusCode() == 429) {
-                log.info("Gemini vision: квота исчерпана (429), используем нейтральный коэф. для '{}'", context);
+                log.info("Gemini vision: квота исчерпана (429) для '{}'", context);
                 return new PhotoAssessment("неизвестно", "квота Gemini исчерпана", 0.80);
             }
             if (resp.statusCode() != 200) {
@@ -192,7 +190,6 @@ public class AIPriceAdvisor {
                 return new PhotoAssessment("неизвестно", "ошибка Gemini", 0.80);
             }
 
-            // Gemini иногда оборачивает ответ в массив — нормализуем
             String normalized = responseBody.trim();
             if (normalized.startsWith("[")) {
                 normalized = normalized.substring(1, normalized.lastIndexOf(']')).trim();
@@ -201,22 +198,27 @@ public class AIPriceAdvisor {
             Map<String, Object> map = objectMapper.readValue(normalized, Map.class);
             List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
             if (choices == null || choices.isEmpty()) {
-                throw new IllegalStateException("choices отсутствует в ответе Gemini: "
+                throw new IllegalStateException("choices отсутствует: "
                         + normalized.substring(0, Math.min(300, normalized.length())));
             }
             String raw = (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
             PhotoAssessment result = parsePhotoAssessment(raw);
-            log.info("Gemini vision [{}]: {} (коэф. {})", context, result.condition(), result.coefficient());
+            log.info("Vision [{}]: {} (коэф. {})", context, result.condition(), result.coefficient());
             return result;
 
         } catch (Exception e) {
-            log.warn("Gemini vision недоступен для '{}': {}. Используем нейтральный коэф.", context, e.getMessage());
+            log.warn("Vision недоступен для '{}': {}. Нейтральный коэф.", context, e.getMessage());
             return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
         }
     }
 
-    // ==================== АГЕНТ 2: Классификатор конкурентов ====================
+    // ==================== АГЕНТ 2: Попарный классификатор конкурентов ====================
 
+    /**
+     * Для каждого конкурента строит попарное сравнение с моим объявлением:
+     * учитывает описание, производителя, состояние и оценку фото (если vision активен).
+     * Возвращает список вердиктов better/similar/worse с обоснованием по каждому.
+     */
     private CompetitorClassification classifyCompetitors(
             List<PartPrice> competitors, List<PhotoAssessment> photos,
             MyListingInfo myListing, PhotoAssessment myPhoto) {
@@ -226,27 +228,41 @@ public class AIPriceAdvisor {
         String myTitle = myListing.getTitle() != null ? myListing.getTitle().toLowerCase() : "";
         String mySide     = extractSide(myTitle);
         String myPosition = extractPosition(myTitle);
+        boolean visionOn  = isVisionActive();
 
+        // --- Моё объявление ---
         StringBuilder sb = new StringBuilder();
-        sb.append("МОЯ ДЕТАЛЬ:\n");
+        sb.append("МОЁ ОБЪЯВЛЕНИЕ:\n");
         if (myListing.getTitle() != null && !myListing.getTitle().isBlank())
             sb.append("Название: ").append(myListing.getTitle()).append("\n");
         sb.append("Состояние: ").append(myListing.getCondition()).append("\n");
         sb.append("Производитель: ").append(myListing.getManufacturer()).append("\n");
-        sb.append("Описание: ").append(myListing.getDescription()).append("\n");
-        sb.append("Оценка по фото: ").append(myPhoto.condition())
-          .append(" (коэф. ").append(myPhoto.coefficient()).append(")\n\n");
-        sb.append("КОНКУРЕНТЫ:\n");
+        if (myListing.getDescription() != null && !myListing.getDescription().isBlank())
+            sb.append("Описание: ").append(myListing.getDescription(), 0,
+                    Math.min(300, myListing.getDescription().length())).append("\n");
+        if (visionOn) {
+            sb.append("Фото: ").append(myPhoto.condition())
+              .append(String.format(" (коэф. %.2f)", myPhoto.coefficient()));
+            if (myPhoto.defects() != null && !myPhoto.defects().isBlank())
+                sb.append(", дефекты: ").append(myPhoto.defects());
+            sb.append("\n");
+        } else {
+            sb.append("Фото: оценка недоступна — опирайся только на текст описания\n");
+        }
+
+        // --- Список конкурентов ---
+        sb.append("\nКОНКУРЕНТЫ (попарно сравни каждого с МОЁ ОБЪЯВЛЕНИЕ выше):\n");
 
         for (int i = 0; i < competitors.size(); i++) {
             PartPrice p = competitors.get(i);
             PhotoAssessment pa = i < photos.size() ? photos.get(i) : new PhotoAssessment("нет фото", "", 0.80);
 
-            sb.append(i + 1).append(". Цена: ").append(p.getPrice()).append("₽");
+            sb.append("\n--- КОНКУРЕНТ ").append(i + 1)
+              .append(" (цена: ").append(p.getPrice()).append("₽) ---\n");
+
             if (p.getTitle() != null && !p.getTitle().isBlank())
-                sb.append(" | Название: ").append(p.getTitle(), 0, Math.min(80, p.getTitle().length()));
-            sb.append(" | Фото: ").append(pa.condition())
-              .append(" (коэф. ").append(pa.coefficient()).append(")");
+                sb.append("Название: ")
+                  .append(p.getTitle(), 0, Math.min(120, p.getTitle().length())).append("\n");
 
             if (p.getDescription() != null && !p.getDescription().isBlank()) {
                 String desc = p.getDescription()
@@ -254,39 +270,72 @@ public class AIPriceAdvisor {
                         .replaceAll("(?m)Рейтинг:.*$", "")
                         .replaceAll("(?m)Город:.*$", "")
                         .trim();
-                if (desc.length() > 10) sb.append(" | ").append(desc, 0, Math.min(150, desc.length()));
+                if (desc.length() > 10)
+                    sb.append("Описание: ")
+                      .append(desc, 0, Math.min(200, desc.length())).append("\n");
             }
 
-            String competitorTitle = p.getTitle() != null ? p.getTitle().toLowerCase() : "";
-            if (isSideMismatch(mySide, competitorTitle) || isPositionMismatch(myPosition, competitorTitle)) {
-                sb.append(" [ДРУГАЯ СТОРОНА/ПОЗИЦИЯ — классифицируй строго как worse]");
-                log.debug("Помечено как другая сторона: {}", p.getTitle());
+            if (visionOn) {
+                sb.append("Фото: ").append(pa.condition())
+                  .append(String.format(" (коэф. %.2f)", pa.coefficient()));
+                if (pa.defects() != null && !pa.defects().isBlank())
+                    sb.append(", дефекты: ").append(pa.defects());
+                sb.append("\n");
+                // Явная подсказка по фото для сравнения
+                double diff = pa.coefficient() - myPhoto.coefficient();
+                if (diff > 0.10)
+                    sb.append("→ фото этого конкурента ЗАМЕТНО ЛУЧШЕ моего\n");
+                else if (diff < -0.10)
+                    sb.append("→ фото этого конкурента ЗАМЕТНО ХУЖЕ моего\n");
+                else
+                    sb.append("→ фото сопоставимо с моим\n");
             }
-            sb.append("\n");
+
+            String compTitle = p.getTitle() != null ? p.getTitle().toLowerCase() : "";
+            if (isSideMismatch(mySide, compTitle) || isPositionMismatch(myPosition, compTitle)) {
+                sb.append("[ДРУГАЯ СТОРОНА/ПОЗИЦИЯ — вердикт строго worse]\n");
+                log.debug("Другая сторона: {}", p.getTitle());
+            }
         }
 
-        String response = callTextAI("""
-                Ты эксперт по автозапчастям. Сравни качество каждого конкурента с моей деталью.
-                Учитывай: оценку по фото (коэффициент и состояние), производителя, состояние из описания, дефекты.
+        String systemPrompt = buildClassifierSystemPrompt(visionOn);
+        String response = callTextAI(systemPrompt, sb.toString());
+        return parseCompetitorClassification(response);
+    }
+
+    private String buildClassifierSystemPrompt(boolean visionOn) {
+        String photoInstruction = visionOn
+                ? "Учитывай совокупность: описание (состояние, дефекты, производитель) и оценку фото (коэффициент, подсказка «лучше/хуже/сопоставимо»)."
+                : "Оценка фото недоступна — учитывай только текст: состояние из описания, производитель (оригинал/аналог), упомянутые дефекты.";
+
+        return """
+                Ты эксперт по автозапчастям. Для каждого пронумерованного конкурента выполни ПОПАРНОЕ сравнение с МОЁ ОБЪЯВЛЕНИЕ.
+                """ + photoInstruction + """
+
                 Игнорируй: продавца, рейтинг, доставку, город.
 
-                ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА (применяй первыми, до оценки качества):
-                - Если в названии МОЕЙ ДЕТАЛИ указано "левый", а у конкурента "правый" — это другая запчасть, классифицируй как "worse".
-                - Если в названии МОЕЙ ДЕТАЛИ указано "правый", а у конкурента "левый" — это другая запчасть, классифицируй как "worse".
-                - Если в названии МОЕЙ ДЕТАЛИ указано "передний", а у конкурента "задний" — это другая запчасть, классифицируй как "worse".
-                - Если в названии МОЕЙ ДЕТАЛИ указано "задний", а у конкурента "передний" — это другая запчасть, классифицируй как "worse".
-                - Если сторона/расположение конкурента явно не указаны — считай что совместимо.
+                ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА (применяй первыми):
+                - Разные стороны (левый/правый) → "worse" без исключений.
+                - Разные позиции (передний/задний) → "worse" без исключений.
+                - Если сторона конкурента явно не указана → считай совместимым.
+                - Конкурент "новый" а моё б/у → "better".
+                - Конкурент аналог а моё оригинал → "worse".
+                - Конкурент оригинал а моё аналог → "better".
 
-                Классификация относительно МОЕЙ детали (после проверки расположения):
-                - "similar" = аналогичное качество (коэф. конкурента в пределах ±0.10 от моего, схожее состояние)
-                - "better"  = явно лучше (новый vs б/у, оригинал vs аналог, или коэф. выше на 0.15+)
-                - "worse"   = явно хуже (дефекты, плохое фото, дешёвый аналог при моём оригинале, или другая сторона)
+                Вердикт (относительно МОЕГО объявления):
+                - "better"  = конкурент явно лучше: лучшее состояние, коэф. фото выше на 0.10+, новый vs б/у, оригинал vs аналог
+                - "similar" = сопоставимое качество: схожее состояние, коэф. фото в пределах ±0.10
+                - "worse"   = явно хуже: дефекты, ниже класс детали, другая сторона, коэф. фото ниже на 0.10+
 
-                Верни СТРОГО ТОЛЬКО JSON (цены — числа из списка конкурентов):
-                {"similar":[цены],"better":[цены],"worse":[цены],"comment":"краткий вывод о рынке"}
-                """, sb.toString());
-
-        return parseCompetitorClassification(response);
+                Верни СТРОГО ТОЛЬКО JSON без пояснений вне него:
+                {
+                  "comparisons": [
+                    {"n":1,"price":цена_числом,"verdict":"better/similar/worse","reason":"1-2 предложения с конкретным обоснованием"},
+                    {"n":2,"price":цена_числом,"verdict":"...","reason":"..."}
+                  ],
+                  "summary": "1-2 предложения: общий вывод о рынке и позиции моего товара"
+                }
+                """;
     }
 
     // ==================== СТРАТЕГИЯ КОНКУРЕНТНОГО ЦЕНООБРАЗОВАНИЯ ====================
@@ -295,9 +344,9 @@ public class AIPriceAdvisor {
 
     /**
      * Правила:
-     * 1. Свежее объявление + в городе ≥3 конкурентов → используем только город
-     * 2. Свежее объявление + в городе <3 конкурентов → Новосибирск с местной надбавкой ×1.15
-     * 3. Старое объявление → Новосибирск с местной надбавкой ×1.15
+     * 1. Свежее объявление + в городе ≥3 конкурентов → используем только городские данные
+     * 2. Свежее объявление + в городе <3 конкурентов → Новосибирск как ориентир
+     * 3. Старое объявление → Новосибирск как ориентир
      * 4. Фото-дисконт при коэф. < 0.70
      */
     private AIRecommendation computeCompetitivePrice(
@@ -309,13 +358,11 @@ public class AIPriceAdvisor {
                 ? String.format(" Мои фото: %s (коэф. %.2f).", myPhoto.condition(), myPhoto.coefficient())
                 : "";
 
-        // === Достаточно городских конкурентов — используем только город ===
-        if (!isOldListing && cityPrices.size() >= MIN_CITY_COMPETITORS) {
-            return strategyForMarket(cityClass, cityPrices, myPhoto, myCurrentPrice,
-                    "В городе", photoNote);
+        boolean cityClassValid = !cityClass.similar().isEmpty() || !cityClass.better().isEmpty() || !cityClass.worse().isEmpty();
+        if (!isOldListing && cityPrices.size() >= MIN_CITY_COMPETITORS && cityClassValid) {
+            return strategyForMarket(cityClass, cityPrices, myPhoto, myCurrentPrice, "В городе", photoNote);
         }
 
-        // === Мало конкурентов в городе или старое объявление → Новосибирск (единый рынок) ===
         if (!siberiaPrices.isEmpty()) {
             String scope = isOldListing
                     ? "Объявление старше 6 мес. Ориентир — Новосибирск"
@@ -323,7 +370,6 @@ public class AIPriceAdvisor {
             return strategyForMarket(siberiaClass, siberiaPrices, myPhoto, myCurrentPrice, scope, photoNote);
         }
 
-        // === Есть только городские (мало, но Новосибирск пуст) ===
         if (!cityPrices.isEmpty()) {
             return strategyForMarket(cityClass, cityPrices, myPhoto, myCurrentPrice,
                     "В городе (мало данных)", photoNote);
@@ -349,14 +395,25 @@ public class AIPriceAdvisor {
 
         if (!similar.isEmpty()) {
             double minSimilar = similar.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
-            if (myPrice >= minSimilar) {
-                // Есть аналоги дешевле или по той же цене → снижаем на 3%
-                target     = BigDecimal.valueOf(minSimilar * 0.97).setScale(0, RoundingMode.DOWN);
+            double target97   = minSimilar * 0.97;
+
+            if (myPrice > target97) {
+                // Мы дороже минимального аналога → снижаем на 3%
+                target     = BigDecimal.valueOf(target97).setScale(0, RoundingMode.DOWN);
                 confidence = similar.size() >= 3 ? "высокая" : "средняя";
-                reason     = String.format("%s есть аналоги по цене от %.0f₽. Снижаем на 3%% — до %.0f₽.",
+                reason     = String.format("%s есть аналоги по цене от %.0f₽. Снижаем до %.0f₽ (−3%%).",
                         scope, minSimilar, target.doubleValue());
+
+            } else if (myPrice < minSimilar * 0.75) {
+                // Мы на 25%+ ниже рынка → поднимаем до конкурентного уровня
+                target     = BigDecimal.valueOf(target97).setScale(0, RoundingMode.DOWN);
+                confidence = similar.size() >= 3 ? "высокая" : "средняя";
+                reason     = String.format(
+                        "%s наша цена значительно ниже рынка (%.0f₽ vs мин. аналог %.0f₽). Поднимаем до %.0f₽ (−3%% от минимума).",
+                        scope, myPrice, minSimilar, target.doubleValue());
+
             } else {
-                // Мы уже дешевле всех аналогов — не трогаем
+                // Мы уже немного ниже рынка — оптимально
                 target     = myCurrentPrice;
                 confidence = "высокая";
                 reason     = String.format("%s наша цена ниже всех аналогов (мин. аналог %.0f₽). Цена оптимальна.",
@@ -364,30 +421,29 @@ public class AIPriceAdvisor {
             }
 
         } else if (!worse.isEmpty() && better.isEmpty()) {
-            // Мы лучшие на рынке → небольшая премия
             double minWorse = worse.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
             target     = BigDecimal.valueOf(minWorse * 1.20).setScale(0, RoundingMode.HALF_UP);
             confidence = "средняя";
-            reason     = String.format("%s наш товар лучше всех конкурентов. +20%% к дешёвому (%.0f₽).", scope, minWorse);
+            reason     = String.format("%s наш товар лучше всех конкурентов. Премия +20%% к минимуму (%.0f₽).",
+                    scope, minWorse);
 
         } else if (!better.isEmpty() && worse.isEmpty()) {
-            // Мы хуже всех → нужна существенная скидка
             double minBetter = better.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
             target     = BigDecimal.valueOf(minBetter * 0.80).setScale(0, RoundingMode.DOWN);
             confidence = "средняя";
-            reason     = String.format("%s наш товар хуже конкурентов. −20%% от минимума (%.0f₽).", scope, minBetter);
+            reason     = String.format("%s наш товар хуже конкурентов. Скидка −20%% от минимума (%.0f₽).",
+                    scope, minBetter);
 
         } else if (similar.isEmpty() && worse.isEmpty() && better.isEmpty()) {
-            // Нет конкурентов вообще
             target     = myCurrentPrice;
             confidence = "высокая";
             reason     = scope + " аналогов нет. Цена не меняется.";
 
         } else {
-            // Смешанный рынок без чётких аналогов
+            // Смешанный рынок (есть и better, и worse, нет similar)
             target     = stats.median().multiply(BigDecimal.valueOf(0.95)).setScale(0, RoundingMode.HALF_UP);
             confidence = "низкая";
-            reason     = String.format("Нет чётких аналогов (%s). Медиана (%.0f₽) × 0.95.",
+            reason     = String.format("Неоднородный рынок (%s). Медиана (%.0f₽) × 0.95.",
                     scope.toLowerCase(), stats.median().doubleValue());
         }
 
@@ -398,28 +454,24 @@ public class AIPriceAdvisor {
             target = bounded;
         }
 
-        if (cls.comment() != null && !cls.comment().isBlank()) reason += " " + cls.comment();
+        if (cls.summary() != null && !cls.summary().isBlank()) reason += " " + cls.summary();
         return new AIRecommendation(target, confidence, reason, photoNote);
     }
 
-    /** Дополнительный дисконт если фото плохое (коэф. ниже 0.70) */
+    /** Дисконт если фото плохое (коэф. < 0.70) — пропорционально до −30%. */
     private BigDecimal applyPhotoDiscount(BigDecimal price, PhotoAssessment myPhoto) {
         if (myPhoto.coefficient() < 0.70) {
-            double discount = myPhoto.coefficient() / 0.70; // до −30%
+            double discount = myPhoto.coefficient() / 0.70;
             log.info("Фото-дисконт: коэф={} → ×{}", myPhoto.coefficient(), String.format("%.2f", discount));
             return price.multiply(BigDecimal.valueOf(discount)).setScale(0, RoundingMode.DOWN);
         }
         return price;
     }
 
-    /**
-     * Нижний порог: не ниже 80% от минимальной цены на рынке (защита от аномально низких значений).
-     * Верхний потолок не применяется — если аналоги дорогие, цена должна это отражать.
-     */
+    /** Нижний порог: не ниже 80% от минимума рынка. Верхний потолок не применяется. */
     private BigDecimal applyBounds(BigDecimal price, MarketStats stats) {
         BigDecimal floor = stats.min().multiply(BigDecimal.valueOf(0.80)).setScale(0, RoundingMode.DOWN);
-        if (price.compareTo(floor) < 0) return floor;
-        return price;
+        return price.compareTo(floor) < 0 ? floor : price;
     }
 
     // ==================== МАТЕМАТИКА ====================
@@ -459,8 +511,7 @@ public class AIPriceAdvisor {
             String mimeType = resp.headers().firstValue("content-type")
                     .map(ct -> ct.split(";")[0].trim())
                     .orElse("image/jpeg");
-            String base64 = Base64.getEncoder().encodeToString(resp.body());
-            return "data:" + mimeType + ";base64," + base64;
+            return "data:" + mimeType + ";base64," + Base64.getEncoder().encodeToString(resp.body());
         } catch (Exception e) {
             log.debug("Ошибка загрузки фото {}: {}", url, e.getMessage());
             return null;
@@ -478,7 +529,7 @@ public class AIPriceAdvisor {
                             Map.of("role", "user", "content", user)
                     ),
                     "temperature", 0.1,
-                    "max_tokens", 500
+                    "max_tokens", 2000
             );
             String json = objectMapper.writeValueAsString(body);
             HttpRequest req = HttpRequest.newBuilder()
@@ -489,11 +540,17 @@ public class AIPriceAdvisor {
                     .timeout(Duration.ofSeconds(90))
                     .build();
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            Map<String, Object> map = objectMapper.readValue(resp.body(), Map.class);
+            Object parsed = objectMapper.readValue(resp.body(), Object.class);
+            Map<String, Object> map;
+            if (parsed instanceof List<?> list && !list.isEmpty()) {
+                map = (Map<String, Object>) list.get(0);
+            } else {
+                map = (Map<String, Object>) parsed;
+            }
             List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
             if (choices == null || choices.isEmpty()) {
                 String preview = resp.body().substring(0, Math.min(300, resp.body().length()));
-                throw new IllegalStateException("choices отсутствует в ответе API: " + preview);
+                throw new IllegalStateException("choices отсутствует в ответе: " + preview);
             }
             return (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
         } catch (Exception e) {
@@ -526,6 +583,31 @@ public class AIPriceAdvisor {
             String c = content.replaceAll("```json|```", "").trim();
             if (!c.startsWith("{")) c = c.substring(c.indexOf('{'));
             Map<String, Object> m = objectMapper.readValue(c, Map.class);
+
+            // Новый формат: {comparisons:[{n, price, verdict, reason}], summary}
+            if (m.containsKey("comparisons")) {
+                List<Map<String, Object>> comps = (List<Map<String, Object>>) m.get("comparisons");
+                List<Double> similar = new ArrayList<>();
+                List<Double> better  = new ArrayList<>();
+                List<Double> worse   = new ArrayList<>();
+                for (Map<String, Object> comp : comps) {
+                    Object priceObj = comp.get("price");
+                    if (priceObj == null) continue;
+                    double price   = ((Number) priceObj).doubleValue();
+                    String verdict = String.valueOf(comp.getOrDefault("verdict", "similar"));
+                    String reason  = String.valueOf(comp.getOrDefault("reason", ""));
+                    log.debug("Конкурент {}₽ → {} | {}", (long) price, verdict, reason);
+                    switch (verdict) {
+                        case "better"  -> better.add(price);
+                        case "worse"   -> worse.add(price);
+                        default        -> similar.add(price);
+                    }
+                }
+                String summary = (String) m.getOrDefault("summary", "");
+                return new CompetitorClassification(similar, better, worse, summary);
+            }
+
+            // Обратная совместимость со старым форматом {similar:[], better:[], worse:[]}
             return new CompetitorClassification(
                     toDoubleList(m.get("similar")),
                     toDoubleList(m.get("better")),
@@ -582,7 +664,7 @@ public class AIPriceAdvisor {
 
     public record PhotoAssessment(String condition, String defects, double coefficient) {}
 
-    private record CompetitorClassification(List<Double> similar, List<Double> better, List<Double> worse, String comment) {
+    private record CompetitorClassification(List<Double> similar, List<Double> better, List<Double> worse, String summary) {
         static CompetitorClassification empty() {
             return new CompetitorClassification(List.of(), List.of(), List.of(), "");
         }
