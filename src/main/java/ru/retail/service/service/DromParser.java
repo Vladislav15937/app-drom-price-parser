@@ -42,6 +42,12 @@ public class DromParser {
 
     private static final Path SESSION_FILE = Paths.get("drom-session.json");
 
+    private static final List<String> SKIP_TITLE_KEYWORDS = List.of(
+            "ремкомплект", "ремонтный", "поршень", "направляющ",
+            "пыльник", "скоба", "уплотнитель", "манжет", "прокладк",
+            "болт", "пружин", "шплинт"
+    );
+
     private Playwright playwright;
     private Browser browser;
 
@@ -389,8 +395,21 @@ public class DromParser {
                     .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
             List<String> prioritized = new ArrayList<>(withOemSet);
             oemFiltered.stream().filter(u -> !withOemSet.contains(u)).forEach(prioritized::add);
-            log.info("Ссылок всего: {} | региональных: {} | после OEM-фильтра: {} | исключено: {}",
-                    entries.size(), regional.size(), oemFiltered.size(), excludeUrls.size());
+
+            // Пред-фильтр по заголовку — ремкомплекты/компоненты без захода на детальную страницу
+            Map<String, String> urlToTitle = new LinkedHashMap<>();
+            for (SearchEntry e : entries) {
+                if (!e.title().isBlank()) urlToTitle.put(e.url(), e.title().toLowerCase());
+            }
+            List<String> workList = prioritized.stream()
+                    .filter(u -> {
+                        String t = urlToTitle.getOrDefault(u, "");
+                        return SKIP_TITLE_KEYWORDS.stream().noneMatch(t::contains);
+                    })
+                    .collect(Collectors.toList());
+            int skippedByTitle = prioritized.size() - workList.size();
+            log.info("Ссылок всего: {} | региональных: {} | после OEM-фильтра: {} | пред-фильтр: −{} | исключено: {}",
+                    entries.size(), regional.size(), oemFiltered.size(), skippedByTitle, excludeUrls.size());
 
             // ── Шаг 3: обходим детальные страницы В ТОМ ЖЕ контексте ──
             List<PartPrice> results = new ArrayList<>();
@@ -398,7 +417,7 @@ public class DromParser {
             int count = 0;
             int attempt = 0;
 
-            for (String detailUrl : prioritized) {
+            for (String detailUrl : workList) {
                 if (count >= limit) break;
                 if (!seen.add(detailUrl)) continue;
                 if (attempt > 0) try { Thread.sleep(1000 + (long) (Math.random() * 800)); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }

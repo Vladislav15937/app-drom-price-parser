@@ -17,6 +17,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -79,17 +80,20 @@ public class AIPriceAdvisor {
             PhotoAssessment myPhoto = evaluatePhotosAsync(myListing.getPhotoUrls(), myListing.getTitle()).join();
             log.info("Мои фото: {} (коэф. {})", myPhoto.condition(), myPhoto.coefficient());
 
-            // ШАГ 2: Попарное сравнение конкурентов (параллельная оценка фото + текстовая классификация)
+            // ШАГ 2: Vision только для городских конкурентов ≤ моей цены × 1.10
+            // Необоценённые конкуренты получают коэффициент = мой, чтобы не вызывать ложный "better"
             log.info("Шаг 2/3: Попарное сравнение {} городских конкурентов...", cityPrices.size());
-            List<PhotoAssessment> cityPhotos = evaluateAllPhotosParallel(cityPrices);
+            List<PhotoAssessment> cityPhotos = evaluatePhotosSelective(cityPrices, myCurrentPrice, myPhoto.coefficient());
             CompetitorClassification cityClassification = classifyCompetitors(
-                    cityPrices, cityPhotos, myListing, myPhoto);
+                    cityPrices, cityPhotos, myListing, myPhoto, isVisionActive());
 
+            // НСК: без vision — нейтральный коэффициент = мой, чтобы избежать ложной классификации
             CompetitorClassification siberiaClassification = CompetitorClassification.empty();
             if (!siberiaPrices.isEmpty()) {
-                log.info("Шаг 2b/3: Попарное сравнение {} новосибирских конкурентов...", siberiaPrices.size());
-                List<PhotoAssessment> siberiaPhotos = evaluateAllPhotosParallel(siberiaPrices);
-                siberiaClassification = classifyCompetitors(siberiaPrices, siberiaPhotos, myListing, myPhoto);
+                log.info("Шаг 2b/3: Попарное сравнение {} новосибирских конкурентов (без vision)...", siberiaPrices.size());
+                List<PhotoAssessment> neutralPhotos = Collections.nCopies(
+                        siberiaPrices.size(), new PhotoAssessment("неизвестно", "", myPhoto.coefficient()));
+                siberiaClassification = classifyCompetitors(siberiaPrices, neutralPhotos, myListing, myPhoto, false);
             }
 
             // ШАГ 3: Стратегия ценообразования
@@ -114,10 +118,20 @@ public class AIPriceAdvisor {
         return geminiApiKey != null && !geminiApiKey.isBlank();
     }
 
-    /** Параллельно оценивает фото всех конкурентов в списке. */
-    private List<PhotoAssessment> evaluateAllPhotosParallel(List<PartPrice> competitors) {
+    /**
+     * Vision только для конкурентов с ценой ≤ моей × 1.10. Необоценённым ставим
+     * нейтральный коэффициент = коэф. моих фото, чтобы разница 0.0 не давала ложный "better".
+     */
+    private List<PhotoAssessment> evaluatePhotosSelective(List<PartPrice> competitors, BigDecimal myPrice, double neutralCoef) {
+        double threshold = myPrice.doubleValue() * 1.10;
+        long visionCount = competitors.stream()
+                .filter(p -> p.getPrice().doubleValue() <= threshold).count();
+        log.info("Vision: {} из {} городских конкурентов (цена ≤ {}₽)",
+                visionCount, competitors.size(), String.format("%.0f", threshold));
         List<CompletableFuture<PhotoAssessment>> futures = competitors.stream()
-                .map(p -> evaluatePhotosAsync(p.getPhotoUrls(), p.getTitle()))
+                .map(p -> p.getPrice().doubleValue() <= threshold
+                        ? evaluatePhotosAsync(p.getPhotoUrls(), p.getTitle())
+                        : CompletableFuture.completedFuture(new PhotoAssessment("неизвестно", "", neutralCoef)))
                 .collect(Collectors.toList());
         return futures.stream().map(CompletableFuture::join).collect(Collectors.toList());
     }
@@ -178,7 +192,7 @@ public class AIPriceAdvisor {
                     .header("Content-Type", "application/json")
                     .header("Authorization", "Bearer " + geminiApiKey)
                     .POST(HttpRequest.BodyPublishers.ofString(json))
-                    .timeout(Duration.ofSeconds(90))
+                    .timeout(Duration.ofSeconds(25))
                     .build();
 
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
@@ -227,14 +241,14 @@ public class AIPriceAdvisor {
      */
     private CompetitorClassification classifyCompetitors(
             List<PartPrice> competitors, List<PhotoAssessment> photos,
-            MyListingInfo myListing, PhotoAssessment myPhoto) {
+            MyListingInfo myListing, PhotoAssessment myPhoto, boolean useVision) {
 
         if (competitors.isEmpty()) return CompetitorClassification.empty();
 
         String myTitle = myListing.getTitle() != null ? myListing.getTitle().toLowerCase() : "";
         String mySide     = extractSide(myTitle);
         String myPosition = extractPosition(myTitle);
-        boolean visionOn  = isVisionActive();
+        boolean visionOn  = useVision;
 
         // --- Моё объявление ---
         StringBuilder sb = new StringBuilder();
@@ -393,37 +407,35 @@ public class AIPriceAdvisor {
         List<Double> similar = cls.similar();
         List<Double> worse   = cls.worse();
         List<Double> better  = cls.better();
-        double myPrice = myCurrentPrice.doubleValue();
 
         BigDecimal target;
         String confidence;
         String reason;
 
         if (!similar.isEmpty()) {
+            // Анкер — медиана аналогов (конкурентный уровень, а не демпинг под минимум).
+            // Двигаем цену вверх/вниз в зависимости от того, скольких конкурентов мы лучше/хуже.
             double minSimilar = similar.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
-            double target97   = minSimilar * 0.97;
+            double medSimilar = median(similar);
+            int betterCnt = better.size();   // конкуренты ЛУЧШЕ нас
+            int worseCnt  = worse.size();    // конкуренты ХУЖЕ нас
+            int total     = betterCnt + worseCnt + similar.size();
 
-            if (myPrice > target97) {
-                // Мы дороже минимального аналога → снижаем на 3%
-                target     = BigDecimal.valueOf(target97).setScale(0, RoundingMode.DOWN);
-                confidence = similar.size() >= 3 ? "высокая" : "средняя";
-                reason     = String.format("%s есть аналоги по цене от %.0f₽. Снижаем до %.0f₽ (−3%%).",
-                        scope, minSimilar, target.doubleValue());
-
-            } else if (myPrice < minSimilar * 0.75) {
-                // Мы на 25%+ ниже рынка → поднимаем до конкурентного уровня
-                target     = BigDecimal.valueOf(target97).setScale(0, RoundingMode.DOWN);
-                confidence = similar.size() >= 3 ? "высокая" : "средняя";
-                reason     = String.format(
-                        "%s наша цена значительно ниже рынка (%.0f₽ vs мин. аналог %.0f₽). Поднимаем до %.0f₽ (−3%% от минимума).",
-                        scope, myPrice, minSimilar, target.doubleValue());
+            if (worseCnt > betterCnt) {
+                // Мы превосходим большинство → премия над медианой аналогов (до +15%)
+                double premium = 1.0 + Math.min(0.15, 0.05 * (worseCnt - betterCnt));
+                target     = BigDecimal.valueOf(medSimilar * premium).setScale(0, RoundingMode.HALF_UP);
+                confidence = total >= 4 ? "высокая" : "средняя";
+                reason     = String.format("%s наш товар лучше %d из %d конкурентов. Медиана аналогов %.0f₽ +%.0f%% → %.0f₽.",
+                        scope, worseCnt, total, medSimilar, (premium - 1) * 100, target.doubleValue());
 
             } else {
-                // Мы уже немного ниже рынка — оптимально
-                target     = myCurrentPrice;
-                confidence = "высокая";
-                reason     = String.format("%s наша цена ниже всех аналогов (мин. аналог %.0f₽). Цена оптимальна.",
-                        scope, minSimilar);
+                // Не превосходим рынок → держимся ровно на 3% ниже самого дешёвого аналога.
+                // Если были дешевле более чем на 3% — поднимаемся до этого уровня (забираем маржу).
+                target     = BigDecimal.valueOf(minSimilar * 0.97).setScale(0, RoundingMode.DOWN);
+                confidence = total >= 4 ? "высокая" : "средняя";
+                reason     = String.format("%s держим цену на 3%% ниже минимального аналога (%.0f₽) → %.0f₽.",
+                        scope, minSimilar, target.doubleValue());
             }
 
         } else if (!worse.isEmpty() && better.isEmpty()) {
@@ -446,17 +458,21 @@ public class AIPriceAdvisor {
             reason     = scope + " аналогов нет. Цена не меняется.";
 
         } else {
-            // Смешанный рынок (есть и better, и worse, нет similar)
-            target     = stats.median().multiply(BigDecimal.valueOf(0.95)).setScale(0, RoundingMode.HALF_UP);
+            // Смешанный рынок (есть и better, и worse, нет similar) — позиционируем по балансу
+            int betterCnt = better.size();
+            int worseCnt  = worse.size();
+            double net    = (worseCnt - betterCnt) / (double) (betterCnt + worseCnt); // −1..+1
+            double factor = 1.0 + 0.15 * net;                                          // ±15% от медианы
+            target     = stats.median().multiply(BigDecimal.valueOf(factor)).setScale(0, RoundingMode.HALF_UP);
             confidence = "низкая";
-            reason     = String.format("Неоднородный рынок (%s). Медиана (%.0f₽) × 0.95.",
-                    scope.toLowerCase(), stats.median().doubleValue());
+            reason     = String.format("Неоднородный рынок (%s): лучше нас %d, хуже %d. Медиана %.0f₽ ×%.2f → %.0f₽.",
+                    scope.toLowerCase(), betterCnt, worseCnt, stats.median().doubleValue(), factor, target.doubleValue());
         }
 
         target = applyPhotoDiscount(target, myPhoto);
-        BigDecimal bounded = applyBounds(target, stats);
+        BigDecimal bounded = applyBounds(target, stats, myCurrentPrice);
         if (bounded.compareTo(target) != 0) {
-            reason += String.format(" [нижний порог: %.0f₽]", bounded.doubleValue());
+            reason += String.format(" [в границах рынка: %.0f₽]", bounded.doubleValue());
             target = bounded;
         }
 
@@ -474,13 +490,36 @@ public class AIPriceAdvisor {
         return price;
     }
 
-    /** Нижний порог: не ниже 80% от минимума рынка. Верхний потолок не применяется. */
-    private BigDecimal applyBounds(BigDecimal price, MarketStats stats) {
+    /**
+     * Границы рекомендации:
+     * - Верхний потолок: не выше максимума рынка.
+     * - Если мы уже на минимуме рынка (или ниже) — не опускаемся ещё глубже, остаёмся на своей цене.
+     * - Нижний порог: не ниже 80% от минимума рынка.
+     */
+    private BigDecimal applyBounds(BigDecimal price, MarketStats stats, BigDecimal myCurrentPrice) {
+        // Верхний потолок — не выше максимума рынка
+        if (price.compareTo(stats.max()) > 0) price = stats.max();
+
+        // Уже самые дешёвые → не подрезаем себя ещё ниже, остаёмся на текущем уровне
+        if (myCurrentPrice.compareTo(stats.min()) <= 0 && price.compareTo(myCurrentPrice) < 0) {
+            price = myCurrentPrice;
+        }
+
+        // Нижний порог — не ниже 80% от минимума рынка
         BigDecimal floor = stats.min().multiply(BigDecimal.valueOf(0.80)).setScale(0, RoundingMode.DOWN);
-        return price.compareTo(floor) < 0 ? floor : price;
+        if (price.compareTo(floor) < 0) price = floor;
+
+        return price;
     }
 
     // ==================== МАТЕМАТИКА ====================
+
+    /** Медиана списка цен (для позиционирования внутри группы аналогов). */
+    private double median(List<Double> values) {
+        List<Double> s = values.stream().sorted().toList();
+        int n = s.size();
+        return n % 2 == 0 ? (s.get(n / 2 - 1) + s.get(n / 2)) / 2.0 : s.get(n / 2);
+    }
 
     private MarketStats computeStats(List<PartPrice> market) {
         List<BigDecimal> sorted = market.stream().map(PartPrice::getPrice).sorted().collect(Collectors.toList());

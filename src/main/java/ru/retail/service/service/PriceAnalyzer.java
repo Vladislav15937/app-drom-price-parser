@@ -21,7 +21,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class PriceAnalyzer {
 
-    private static final int CITY_ANALOG_THRESHOLD = 10; // меньше этого → ищем в Новосибирске
+    private static final int CITY_ANALOG_THRESHOLD = 10;
     private static final String FALLBACK_REGION = "novosibirsk";
 
     private final DromParser dromParser;
@@ -196,11 +196,9 @@ public class PriceAnalyzer {
 
         log.info("Цена: {}₽", myPrice);
 
-        // 6. Сибирский фоллбэк (та же логика, что в analyze())
         boolean isOldListing = isOlderThan6Months(myListingInfo.getPublishedDate());
         boolean fewCityCompetitors = cityPrices.size() < CITY_ANALOG_THRESHOLD;
         boolean needFallback = isOldListing || fewCityCompetitors;
-
         log.info("Старое: {} | Город: {} | Фоллбэк: {}", isOldListing, cityPrices.size(), needFallback);
 
         List<PartPrice> siberiaPrices = Collections.emptyList();
