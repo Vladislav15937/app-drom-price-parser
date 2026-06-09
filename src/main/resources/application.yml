@@ -41,7 +41,7 @@ apify:
 drom:
   headless: false  # false для отладки, true для продакшена
   proxy:
-    url: http://sUxCAy:aTYcmATpajez@mproxy.site:16532
+    url: http://vUfpEz:VeCyFGaP3Ah9@mproxy.site:21115
 
 twocaptcha:
   enabled: true   # true для автоматического решения капчи

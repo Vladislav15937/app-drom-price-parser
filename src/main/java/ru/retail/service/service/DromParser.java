@@ -42,11 +42,6 @@ public class DromParser {
 
     private static final Path SESSION_FILE = Paths.get("drom-session.json");
 
-    // Регионы Сибири для широкого поиска
-    static final List<String> SIBERIA_REGIONS = List.of(
-            "barnaul", "novosibirsk", "omsk", "tomsk", "kemerovo", "krasnoyarsk"
-    );
-
     private Playwright playwright;
     private Browser browser;
 
@@ -456,40 +451,6 @@ public class DromParser {
         }
     }
 
-    // ==================== ПАРСИНГ ПО СИБИРИ (ограниченный) ====================
-
-    /**
-     * Быстрый сбор цен по Сибирским регионам. Берёт не более 3 объявлений на регион.
-     * Исключает регион myCity, чтобы не дублировать городской поиск.
-     */
-    public List<PartPrice> parseSiberia(String oemNumber, String myCity) {
-        log.info("Поиск по Сибири (исключая {})", myCity);
-        List<PartPrice> all = new ArrayList<>();
-        Set<String> seenUrls = new HashSet<>();
-
-        for (String region : SIBERIA_REGIONS) {
-            if (region.equals(myCity)) continue;
-            if (all.size() >= 18) break;
-
-            try {
-                List<PartPrice> regionResults = parseParts(oemNumber, region, 3);
-                int added = 0;
-                for (PartPrice p : regionResults) {
-                    if (seenUrls.add(p.getUrl())) {
-                        all.add(p);
-                        added++;
-                    }
-                }
-                log.info("Сибирь [{}]: {} предложений, добавлено уникальных: {}", region, regionResults.size(), added);
-            } catch (Exception e) {
-                log.warn("Ошибка парсинга Сибирь [{}]: {}", region, e.getMessage());
-            }
-        }
-
-        log.info("Итого по Сибири: {} уникальных предложений", all.size());
-        return all;
-    }
-
     // ==================== ДЕТАЛЬНАЯ СТРАНИЦА ====================
 
     /** Извлекает данные объявления из уже загруженной страницы. */
@@ -547,56 +508,12 @@ public class DromParser {
         }
     }
 
-    /** Открывает собственный контекст для парсинга одной страницы (не используется в parseParts). */
-    private PartPrice parseDetailPage(String url) {
-        BrowserContext ctx = newContext();
-        Page detailPage = null;
-        try {
-            detailPage = newPage(ctx);
-            detailPage.navigate(url, new Page.NavigateOptions().setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
-            detailPage.waitForLoadState(LoadState.DOMCONTENTLOADED);
-            Thread.sleep(1200);
-
-            if (hasCaptcha(detailPage)) {
-                log.info("Капча на детальной странице: {}", url);
-                boolean solved = tryClickDromCheckbox(detailPage) || captchaSolver.solve(detailPage);
-                if (solved) saveSession(ctx);
-                if (!solved) {
-                    if (!headless) {
-                        log.info("Капча — жду ручного решения 120 сек...");
-                        detailPage.waitForFunction("() => { try { return !document.body.innerText.includes('Вы не робот'); } catch(e) { return false; } }",
-                                null, new Page.WaitForFunctionOptions().setTimeout(120_000));
-                        saveSession(ctx);
-                    } else {
-                        log.warn("Капча не решена, пропускаем: {}", url);
-                        return null;
-                    }
-                }
-                detailPage.waitForLoadState(LoadState.DOMCONTENTLOADED);
-                Thread.sleep(800);
-            }
-
-            return extractPartFromPage(detailPage, url);
-
-        } catch (Exception e) {
-            log.warn("Ошибка {}: {}", url, e.getMessage());
-            return null;
-        } finally {
-            if (detailPage != null) detailPage.close();
-            ctx.close();
-        }
-    }
-
     // ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
 
     /** Данные объявления, извлечённые прямо со страницы результатов поиска. */
     record SearchEntry(String url, String dealer, String oem, String title, BigDecimal price, String date) {
         SearchEntry(String url, String dealer) { this(url, dealer, "", "", null, ""); }
         SearchEntry(String url, String dealer, String oem) { this(url, dealer, oem, "", null, ""); }
-    }
-
-    private List<String> collectListingLinks(Page page) {
-        return collectSearchEntries(page).stream().map(SearchEntry::url).collect(Collectors.toList());
     }
 
     @SuppressWarnings("unchecked")
@@ -1025,10 +942,6 @@ public class DromParser {
                 }
                 """);
         return page;
-    }
-
-    private String randomUserAgent() {
-        return USER_AGENTS[(int) (Math.random() * USER_AGENTS.length)];
     }
 
     private String buildSearchUrl(String oem, String region) {

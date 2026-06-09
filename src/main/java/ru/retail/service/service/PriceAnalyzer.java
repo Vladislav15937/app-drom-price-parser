@@ -73,33 +73,13 @@ public class PriceAnalyzer {
         AIPriceAdvisor.AIRecommendation ai = aiAdvisor.analyze(
                 myListing, myPrice, cityPrices, siberiaPrices, isOldListing);
 
-        // 5. Статистика по городу
-        BigDecimal minPrice    = BigDecimal.ZERO;
-        BigDecimal maxPrice    = BigDecimal.ZERO;
-        BigDecimal avgPrice    = BigDecimal.ZERO;
-        BigDecimal medianPrice = BigDecimal.ZERO;
-
-        if (!cityPrices.isEmpty()) {
-            List<BigDecimal> sorted = cityPrices.stream().map(PartPrice::getPrice).sorted().toList();
-            minPrice    = sorted.get(0);
-            maxPrice    = sorted.get(sorted.size() - 1);
-            avgPrice    = sorted.stream().reduce(BigDecimal.ZERO, BigDecimal::add)
-                    .divide(BigDecimal.valueOf(sorted.size()), 2, RoundingMode.HALF_UP);
-            medianPrice = sorted.size() % 2 == 0
-                    ? sorted.get(sorted.size() / 2 - 1).add(sorted.get(sorted.size() / 2))
-                          .divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP)
-                    : sorted.get(sorted.size() / 2);
-        } else if (!siberiaPrices.isEmpty()) {
-            List<BigDecimal> sorted = siberiaPrices.stream().map(PartPrice::getPrice).sorted().toList();
-            minPrice    = sorted.get(0);
-            maxPrice    = sorted.get(sorted.size() - 1);
-            avgPrice    = sorted.stream().reduce(BigDecimal.ZERO, BigDecimal::add)
-                    .divide(BigDecimal.valueOf(sorted.size()), 2, RoundingMode.HALF_UP);
-            medianPrice = sorted.size() % 2 == 0
-                    ? sorted.get(sorted.size() / 2 - 1).add(sorted.get(sorted.size() / 2))
-                          .divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP)
-                    : sorted.get(sorted.size() / 2);
-        }
+        // 5. Статистика
+        PriceStats stats = !cityPrices.isEmpty() ? computePriceStats(cityPrices)
+                : !siberiaPrices.isEmpty() ? computePriceStats(siberiaPrices) : null;
+        BigDecimal minPrice    = stats != null ? stats.min()    : BigDecimal.ZERO;
+        BigDecimal maxPrice    = stats != null ? stats.max()    : BigDecimal.ZERO;
+        BigDecimal avgPrice    = stats != null ? stats.avg()    : BigDecimal.ZERO;
+        BigDecimal medianPrice = stats != null ? stats.median() : BigDecimal.ZERO;
 
         String marketNote = buildMarketNote(isOldListing, cityPrices.size(), siberiaPrices.size(), needFallback);
 
@@ -150,6 +130,19 @@ public class PriceAnalyzer {
                     return true;
                 })
                 .collect(java.util.stream.Collectors.toList());
+    }
+
+    private record PriceStats(BigDecimal min, BigDecimal max, BigDecimal avg, BigDecimal median) {}
+
+    private PriceStats computePriceStats(List<PartPrice> prices) {
+        List<BigDecimal> sorted = prices.stream().map(PartPrice::getPrice).sorted().toList();
+        int size = sorted.size();
+        BigDecimal sum = sorted.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal avg = sum.divide(BigDecimal.valueOf(size), 2, RoundingMode.HALF_UP);
+        BigDecimal median = size % 2 == 0
+                ? sorted.get(size / 2 - 1).add(sorted.get(size / 2)).divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP)
+                : sorted.get(size / 2);
+        return new PriceStats(sorted.get(0), sorted.get(size - 1), avg, median);
     }
 
     private String buildMarketNote(boolean isOld, int cityCount, int fallbackCount, boolean usedFallback) {
@@ -222,20 +215,12 @@ public class PriceAnalyzer {
                 myListingInfo, myPrice, cityPrices, siberiaPrices, isOldListing);
 
         // 8. Статистика
-        BigDecimal minPrice = BigDecimal.ZERO, maxPrice = BigDecimal.ZERO,
-                   avgPrice = BigDecimal.ZERO, medianPrice = BigDecimal.ZERO;
         List<PartPrice> statSource = !cityPrices.isEmpty() ? cityPrices : siberiaPrices;
-        if (!statSource.isEmpty()) {
-            List<BigDecimal> sorted = statSource.stream().map(PartPrice::getPrice).sorted().toList();
-            minPrice = sorted.get(0);
-            maxPrice = sorted.get(sorted.size() - 1);
-            avgPrice = sorted.stream().reduce(BigDecimal.ZERO, BigDecimal::add)
-                    .divide(BigDecimal.valueOf(sorted.size()), 2, RoundingMode.HALF_UP);
-            medianPrice = sorted.size() % 2 == 0
-                    ? sorted.get(sorted.size() / 2 - 1).add(sorted.get(sorted.size() / 2))
-                          .divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP)
-                    : sorted.get(sorted.size() / 2);
-        }
+        PriceStats catalogStats = statSource.isEmpty() ? null : computePriceStats(statSource);
+        BigDecimal minPrice    = catalogStats != null ? catalogStats.min()    : BigDecimal.ZERO;
+        BigDecimal maxPrice    = catalogStats != null ? catalogStats.max()    : BigDecimal.ZERO;
+        BigDecimal avgPrice    = catalogStats != null ? catalogStats.avg()    : BigDecimal.ZERO;
+        BigDecimal medianPrice = catalogStats != null ? catalogStats.median() : BigDecimal.ZERO;
 
         return AggregationResult.builder()
                 .oemNumber(oemNumber)

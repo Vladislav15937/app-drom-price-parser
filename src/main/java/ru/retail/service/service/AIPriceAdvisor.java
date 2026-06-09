@@ -1,6 +1,7 @@
 package ru.retail.service.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -53,6 +54,11 @@ public class AIPriceAdvisor {
         this.geminiVisionModel = geminiVisionModel;
         this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(60)).build();
         this.objectMapper = new ObjectMapper();
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        photoExecutor.shutdownNow();
     }
 
     // ==================== ПУБЛИЧНЫЙ МЕТОД ====================

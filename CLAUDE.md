@@ -30,18 +30,18 @@ PriceAnalyzer              (оркестрация + статистика)
 ### DromParser
 - Headless Chromium через Microsoft Playwright
 - Один браузер на всё приложение (`@PostConstruct`/`@PreDestroy`), отдельный `BrowserContext` на каждый запрос
-- Антибот: ротация User-Agent (5 штук), скрытие `navigator.webdriver`, задержки 1.5–3.5 с
+- Антибот: фиксированный User-Agent на весь сеанс (выбирается случайно из 5 при запуске), скрытие `navigator.webdriver`, задержки
 - `parseMyListing(url)` → `MyListingInfo` (моё объявление: описание, дата, фото, цена)
-- `parseParts(oem, region)` → до 10 объявлений конкурентов в городе
-- `parseSiberia(oem, myCity)` → до 3 объявлений из каждого из 6 сибирских регионов (исключая мой город)
+- `parseParts(oem, region)` → до 10 объявлений конкурентов в регионе
+- `findMyListingUrl(oem, region, company)` → URL моего объявления по имени компании на странице поиска (без захода на детальные страницы)
 - Извлечение фото: `data-image-info` JSON атрибут → `static.baza.drom.ru` img → og:image. Фото на baza.drom.ru **без расширений** в URL — не фильтровать по `*.jpg`.
 - Дата публикации: селектор `.viewbull-actual-date`
 - При CAPTCHA в headless-режиме возвращает пустой список; в GUI-режиме ждёт ручного решения 120 с
 
 ### AIPriceAdvisor
-API: конфиг `deepseek.api.base-url` (текущий: `https://open.blackroute.space/v1/chat/completions`), модель — `deepseek.text.model` (текущий: `deepseek-chat`).
+Текстовый агент: конфиг `deepseek.api.base-url`, модель — `deepseek.text.model`.
 
-**Vision-оценка фото отключена** — DeepSeek V4 не поддерживает изображения. Всегда возвращает нейтральный коэф. 0.80. Резервная реализация сохранена в `evaluatePhotosViaApi()`.
+**Vision-оценка фото** — активна при непустом `gemini.api.key`. Использует модель `gemini.vision.model` через `gemini.api.base-url`. При пустом ключе всегда возвращает нейтральный коэф. 0.80 без обращения к API.
 
 **Классификатор** (`classifyCompetitors`): сравнивает конкурентов с моим товаром, делит на `similar/better/worse`. Принимает только узлы в сборе — ремкомплекты и компоненты уже отфильтрованы в `PriceAnalyzer.filterAssemblies()`.
 
@@ -59,11 +59,12 @@ API: конфиг `deepseek.api.base-url` (текущий: `https://open.blackro
 - `MyListingInfo` — моё объявление (title, description, condition, manufacturer, oem, city, publishedDate, photoUrls, price)
 - `PartPrice` — объявление конкурента (price, url, location, dealer, publishedDate, photoUrls, description)
 - `AggregationResult` — итог: статистика (min/max/avg/median), cityCompetitorCount, siberiaCompetitorCount, recommendedPrice, aiReason, photoNote
+- `DromListingItem`, `RunActorRequest`, `RunResponse` — DTO для Apify-интеграции (`apify.enabled: false` по умолчанию)
 
 ### Логика Сибири (PriceAnalyzer)
 - `PriceAnalyzer.CITY_ANALOG_THRESHOLD = 10` — если в городе меньше → ЗАПРАШИВАЕМ данные по НСК
 - `AIPriceAdvisor.MIN_CITY_COMPETITORS = 3` — если в городе меньше → ИСПОЛЬЗУЕМ НСК как ценовой ориентир
-- `SIBERIA_REGIONS`: barnaul, novosibirsk, omsk, tomsk, kemerovo, krasnoyarsk
+- Фоллбэк-регион: `novosibirsk` (`FALLBACK_REGION`)
 - `isOlderThan6Months()` — парсит русские форматы дат: "вчера"/"сегодня"/"назад" → false; "15 ноября 2024" и "dd.MM.yyyy" → сравниваем с порогом
 
 ## Конфигурация (`application.yml`)
@@ -74,13 +75,18 @@ API: конфиг `deepseek.api.base-url` (текущий: `https://open.blackro
 | `deepseek.api.token` | Ключ DeepSeek API |
 | `deepseek.api.base-url` | URL API (default: `https://api.deepseek.com/v1/chat/completions`) |
 | `deepseek.text.model` | Текстовая модель (default: `deepseek-v4-flash`) |
-| `drom.proxy.url` | Прокси для парсера (опционально) |
+| `gemini.api.key` | Ключ Gemini для vision-оценки фото (если пусто — vision отключён) |
+| `gemini.api.base-url` | URL Gemini API |
+| `gemini.vision.model` | Модель для vision (default: `gemini-2.0-flash`) |
+| `drom.proxy.url` | Прокси для парсера (опционально, `http://` или `socks5://`) |
+| `twocaptcha.api-key` | Ключ 2captcha для автоматического решения капчи |
+| `twocaptcha.enabled` | Включить автоматическое решение капчи |
+| `apify.enabled` | Использовать Apify вместо Playwright (default: `false`) |
 
 ## Точки расширения
 
-- **Регионы Сибири** → `DromParser.SIBERIA_REGIONS`
 - **Порог мало конкурентов** → `PriceAnalyzer.CITY_ANALOG_THRESHOLD`
 - **Фильтр нецелевых товаров** → `PriceAnalyzer.NON_ASSEMBLY_KEYWORDS`
 - **Процент подрезания** → `0.97` в `AIPriceAdvisor.strategyForMarket()`
 - **Лимит объявлений на регион** → `parseParts(oemNumber, region, 10)` в `parseParts()`
-- **CSS-селекторы парсера** → `DromParser.parseDetailPage()` и `parseMyListing()`
+- **CSS-селекторы парсера** → `DromParser.extractPartFromPage()` и `parseMyListing()`
