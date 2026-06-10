@@ -40,6 +40,7 @@ apify:
 
 drom:
   headless: false  # false для отладки, true для продакшена
+  parallel-nsk: false  # true — парсить Новосибирск параллельно городу (отдельный браузер); требует устойчивого прокси
   proxy:
     url: http://vUfpEz:VeCyFGaP3Ah9@mproxy.site:21115
 

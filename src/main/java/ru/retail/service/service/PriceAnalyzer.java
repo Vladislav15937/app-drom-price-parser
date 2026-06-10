@@ -1,7 +1,9 @@
 package ru.retail.service.service;
 
+import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import ru.retail.service.dto.AggregationResult;
 import ru.retail.service.dto.MyListingInfo;
@@ -14,6 +16,9 @@ import java.time.format.DateTimeFormatter;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -21,11 +26,45 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class PriceAnalyzer {
 
-    private static final int CITY_ANALOG_THRESHOLD = 10;
+    private static final int CITY_ANALOG_THRESHOLD = 6;   // меньше этого → доищем в Новосибирске
     private static final String FALLBACK_REGION = "novosibirsk";
 
     private final DromParser dromParser;
     private final AIPriceAdvisor aiAdvisor;
+
+    @Value("${drom.parallel-nsk:false}")
+    private boolean parallelNsk;
+
+    private final ExecutorService nskExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "nsk-parser");
+        t.setDaemon(true);
+        return t;
+    });
+
+    @PreDestroy
+    public void shutdown() {
+        nskExecutor.shutdownNow();
+    }
+
+    /** Спекулятивно запускает НСК-парсинг в отдельном потоке/браузере, если включено. */
+    private Future<List<PartPrice>> startNskIfParallel(String oemNumber, String region) {
+        if (parallelNsk && !region.equals(FALLBACK_REGION)) {
+            return nskExecutor.submit(() -> dromParser.parsePartsBackground(oemNumber, FALLBACK_REGION));
+        }
+        return null;
+    }
+
+    /** Забирает результат параллельного НСК; при сбое — последовательный фолбэк. */
+    private List<PartPrice> fetchSiberiaRaw(String oemNumber, Future<List<PartPrice>> nskFuture) {
+        if (nskFuture != null) {
+            try {
+                return nskFuture.get();
+            } catch (Exception e) {
+                log.warn("Параллельный НСК упал ({}) — последовательный фолбэк", e.getMessage());
+            }
+        }
+        return dromParser.parseParts(oemNumber, FALLBACK_REGION);
+    }
 
     /**
      * Основной метод анализа. Принимает OEM-номер, мой регион и URL моего объявления.
@@ -40,6 +79,7 @@ public class PriceAnalyzer {
 
         // 1. Парсим моё объявление
         log.info("=== Анализ OEM: {} | Регион: {} ===", oemNumber, region);
+        Future<List<PartPrice>> nskFuture = startNskIfParallel(oemNumber, region);
         MyListingInfo myListing = dromParser.parseMyListing(myListingUrl);
         BigDecimal myPrice = (myPriceOverride != null && myPriceOverride.compareTo(BigDecimal.ZERO) > 0)
                 ? myPriceOverride
@@ -64,9 +104,11 @@ public class PriceAnalyzer {
 
         List<PartPrice> siberiaPrices = Collections.emptyList();
         if (needFallback && !region.equals(FALLBACK_REGION)) {
-            List<PartPrice> fallbackRaw = dromParser.parseParts(oemNumber, FALLBACK_REGION);
+            List<PartPrice> fallbackRaw = fetchSiberiaRaw(oemNumber, nskFuture);
             siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
             log.info("{} после фильтра: {} (до фильтра: {})", FALLBACK_REGION, siberiaPrices.size(), fallbackRaw.size());
+        } else if (nskFuture != null) {
+            nskFuture.cancel(true);   // город достаточен → спекулятивный НСК не нужен
         }
 
         // 4. AI-анализ
@@ -181,7 +223,8 @@ public class PriceAnalyzer {
 
         log.info("Найдено объявление {}: {}", myCompany, myListingUrl);
 
-        // 2. Парсим конкурентов, исключая наш URL прямо на этапе сбора ссылок
+        // 2. Спекулятивно запускаем НСК параллельно (если включено), затем парсим город
+        Future<List<PartPrice>> nskFuture = startNskIfParallel(oemNumber, region);
         Set<String> myUrls = Set.of(myListingUrl);
         List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region, 10, myUrls);
         List<PartPrice> cityPrices = filterAssemblies(cityRaw, oemNumber);
@@ -203,9 +246,11 @@ public class PriceAnalyzer {
 
         List<PartPrice> siberiaPrices = Collections.emptyList();
         if (needFallback && !region.equals(FALLBACK_REGION)) {
-            List<PartPrice> fallbackRaw = dromParser.parseParts(oemNumber, FALLBACK_REGION);
+            List<PartPrice> fallbackRaw = fetchSiberiaRaw(oemNumber, nskFuture);
             siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
             log.info("{} после фильтра: {}", FALLBACK_REGION, siberiaPrices.size());
+        } else if (nskFuture != null) {
+            nskFuture.cancel(true);   // город достаточен → спекулятивный НСК не нужен
         }
 
         // 7. AI-анализ

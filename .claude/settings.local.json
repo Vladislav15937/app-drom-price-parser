@@ -114,7 +114,15 @@
       "Bash(java --version)",
       "Bash(JAVA_HOME=/Users/vladislav/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile -f /Users/vladislav/IdeaProjects/app-drom-price-parser/pom.xml -q)",
       "Bash(/Users/vladislav/IdeaProjects/app-drom-price-parser/mvnw compile *)",
-      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile -q -f /Users/vladislav/IdeaProjects/app-drom-price-parser/pom.xml)"
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" compile -q -f /Users/vladislav/IdeaProjects/app-drom-price-parser/pom.xml)",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" -q -f /Users/vladislav/IdeaProjects/app-drom-price-parser/pom.xml spring-boot:run -Dspring-boot.run.arguments=\"--drom.headless=true --drom.parallel-nsk=false\")",
+      "Bash(tee /tmp/drom-run.log)",
+      "Bash(awk '{print $2, $11, $12, $13}')",
+      "Bash(awk '{print \"alive PID\",$2}')",
+      "Bash(pkill -f \"ru.retail.service.Main\")",
+      "Bash(pkill -f \"spring-boot:run\")",
+      "Bash(awk '{print $2}')",
+      "Bash(break)"
     ]
   }
 }

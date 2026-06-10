@@ -21,11 +21,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -41,6 +42,10 @@ public class DromParser {
     };
 
     private static final Path SESSION_FILE = Paths.get("drom-session.json");
+    private static final Path NSK_SESSION_FILE = Paths.get("drom-session-nsk.json");
+
+    private static final int DEFAULT_DETAIL_LIMIT = 6;   // сколько детальных страниц реально открываем
+    private static final long CACHE_TTL_MS = 30 * 60 * 1000L;
 
     private static final List<String> SKIP_TITLE_KEYWORDS = List.of(
             "ремкомплект", "ремонтный", "поршень", "направляющ",
@@ -50,6 +55,14 @@ public class DromParser {
 
     private Playwright playwright;
     private Browser browser;
+
+    // Отдельный Playwright+браузер для параллельного НСК-парсинга (ленивая инициализация на потоке-исполнителе)
+    private Playwright nskPlaywright;
+    private volatile Browser nskBrowser;
+
+    // Кэш детально разобранных объявлений по URL — соседние OEM выдают тех же конкурентов
+    private record CachedPart(PartPrice part, long ts) {}
+    private final ConcurrentHashMap<String, CachedPart> detailCache = new ConcurrentHashMap<>();
 
     @Value("${drom.headless:true}")
     private boolean headless;
@@ -74,6 +87,10 @@ public class DromParser {
     public void init() {
         playwright = createPlaywright();
         ensurePlaywrightBrowsersInstalled();
+        browser = playwright.chromium().launch(buildLaunchOptions());
+    }
+
+    private BrowserType.LaunchOptions buildLaunchOptions() {
         BrowserType.LaunchOptions launchOptions = new BrowserType.LaunchOptions()
                 .setHeadless(headless)
                 .setArgs(List.of(
@@ -92,12 +109,27 @@ public class DromParser {
         } else if (proxyUrl != null && !proxyUrl.isBlank()) {
             launchOptions.setProxy(buildProxy(proxyUrl));
         }
-        browser = playwright.chromium().launch(launchOptions);
+        return launchOptions;
+    }
+
+    /**
+     * Ленивая инициализация отдельного браузера для НСК. Создаётся на том же потоке,
+     * который его использует (single-thread executor), что соблюдает потоковую модель Playwright.
+     */
+    private synchronized Browser nskBrowser() {
+        if (nskBrowser == null) {
+            nskPlaywright = createPlaywright();
+            nskBrowser = nskPlaywright.chromium().launch(buildLaunchOptions());
+            log.info("НСК-браузер инициализирован (отдельный Playwright)");
+        }
+        return nskBrowser;
     }
 
     @PreDestroy
     public void destroy() {
-        if (browser != null) browser.close();
+        if (nskBrowser != null) try { nskBrowser.close(); } catch (Exception ignored) {}
+        if (nskPlaywright != null) try { nskPlaywright.close(); } catch (Exception ignored) {}
+        if (browser != null) try { browser.close(); } catch (Exception ignored) {}
         if (playwright != null) playwright.close();
     }
 
@@ -301,14 +333,24 @@ public class DromParser {
     // ==================== ПАРСИНГ КОНКУРЕНТОВ В ГОРОДЕ ====================
 
     public List<PartPrice> parseParts(String oemNumber, String region) {
-        return parseParts(oemNumber, region, 10, Set.of());
+        return parsePartsImpl(oemNumber, region, 10, DEFAULT_DETAIL_LIMIT, Set.of(), browser, SESSION_FILE);
     }
 
     public List<PartPrice> parseParts(String oemNumber, String region, int limit) {
-        return parseParts(oemNumber, region, limit, Set.of());
+        return parsePartsImpl(oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, Set.of(), browser, SESSION_FILE);
     }
 
     public List<PartPrice> parseParts(String oemNumber, String region, int limit, Set<String> excludeUrls) {
+        return parsePartsImpl(oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, excludeUrls, browser, SESSION_FILE);
+    }
+
+    /** Параллельный парсинг НСК — отдельный браузер/сессия, вызывается из выделенного потока. */
+    public List<PartPrice> parsePartsBackground(String oemNumber, String region) {
+        return parsePartsImpl(oemNumber, region, 10, DEFAULT_DETAIL_LIMIT, Set.of(), nskBrowser(), NSK_SESSION_FILE);
+    }
+
+    private List<PartPrice> parsePartsImpl(String oemNumber, String region, int limit, int detailLimit,
+                                           Set<String> excludeUrls, Browser b, Path sessionFile) {
         if (apifyDromService.isEnabled()) {
             log.info("Apify: делегируем парсинг [{}] OEM={}", region, oemNumber);
             Set<String> normalizedExcludes = excludeUrls.stream()
@@ -323,22 +365,22 @@ public class DromParser {
         String searchUrl = buildSearchUrl(oemNumber, region);
         log.info("Парсинг конкурентов [{}]: {}", region, searchUrl);
 
-        BrowserContext ctx = newContext();
+        BrowserContext ctx = newContext(b, sessionFile);
         Page page = newPage(ctx);
 
         try {
             // ── Шаг 1: загружаем страницу поиска ──
             page.navigate(searchUrl, new Page.NavigateOptions().setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
-            Thread.sleep(3000);
+            Thread.sleep(1500);
 
             if (hasCaptcha(page)) {
                 boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
-                if (solved) saveSession(ctx);
+                if (solved) saveSession(ctx, sessionFile);
                 if (!solved) {
                     if (!headless) {
                         log.info("Капча на поиске [{}] — жду ручного решения 120 сек...", region);
                         page.waitForURL(searchUrl, new Page.WaitForURLOptions().setTimeout(120_000));
-                        saveSession(ctx);
+                        saveSession(ctx, sessionFile);
                     } else {
                         log.error("Капча не решена автоматически, возвращаем пустой результат для [{}].", region);
                         return List.of();
@@ -348,117 +390,134 @@ public class DromParser {
             }
 
             page.waitForLoadState(LoadState.DOMCONTENTLOADED);
-            Thread.sleep(2000);
+            Thread.sleep(1000);
 
-            // ── Шаг 2: собираем ссылки с именами дилеров ──
+            // ── Шаг 2: собираем объявления прямо со страницы поиска (цена/заголовок/дата уже здесь) ──
             List<SearchEntry> entries = collectSearchEntries(page);
             Set<String> normalizedExcludes = excludeUrls.stream()
                     .map(u -> u.toLowerCase().replaceAll("/+$", ""))
                     .collect(Collectors.toSet());
-            List<String> allUrls = entries.stream()
-                    .map(SearchEntry::url)
-                    .filter(u -> normalizedExcludes.isEmpty() ||
-                            !normalizedExcludes.contains(u.toLowerCase().replaceAll("/+$", "")))
-                    .collect(Collectors.toList());
-            // Объявления на baza.drom.ru используют /g[ID].html — регион в URL отсутствует.
-            // Страница поиска уже отфильтрована по региону, поэтому используем все URL напрямую.
             String regionSlug = "/" + region + "/";
             String normalizedOem = oemNumber.replaceAll("\\s+", "").toUpperCase();
-            List<String> regional = allUrls.stream()
-                    .filter(u -> u.contains(regionSlug))
-                    .distinct()
+
+            // Исключаем свои URL + фильтр по региону (с фолбэком на все, если /регион/ нет в пути)
+            List<SearchEntry> regional = entries.stream()
+                    .filter(e -> normalizedExcludes.isEmpty()
+                            || !normalizedExcludes.contains(e.url().toLowerCase().replaceAll("/+$", "")))
+                    .filter(e -> e.url().contains(regionSlug))
                     .collect(Collectors.toList());
             if (regional.isEmpty()) {
-                // Новый формат URL /g[ID].html без региона в пути — берём все
-                regional = new ArrayList<>(allUrls);
+                regional = entries.stream()
+                        .filter(e -> normalizedExcludes.isEmpty()
+                                || !normalizedExcludes.contains(e.url().toLowerCase().replaceAll("/+$", "")))
+                        .collect(Collectors.toList());
             }
 
-            // Пре-фильтр по OEM прямо со страницы поиска: исключаем чужие OEM без захода на детальную
-            Map<String, String> urlToOem = entries.stream()
-                    .filter(e -> !e.oem().isBlank())
-                    .collect(Collectors.toMap(SearchEntry::url, e -> e.oem().toUpperCase(),
-                            (a1, b) -> a1));
-            List<String> oemFiltered = regional.stream()
-                    .filter(u -> {
-                        String pageOem = urlToOem.get(u);
+            // Пре-фильтр по OEM со страницы поиска
+            List<SearchEntry> oemFiltered = regional.stream()
+                    .filter(e -> {
+                        String pageOem = (e.oem() == null || e.oem().isBlank()) ? null : e.oem().toUpperCase();
                         return pageOem == null || pageOem.equals(normalizedOem)
                                 || pageOem.contains(normalizedOem) || normalizedOem.contains(pageOem);
                     })
                     .collect(Collectors.toList());
-            // Если пре-фильтр убрал всё — значит OEM не распознан, берём все
             if (oemFiltered.isEmpty()) oemFiltered = regional;
 
-            // Приоритет: OEM в URL (старый формат) идут первыми
-            String oemLower = oemNumber.toLowerCase().replaceAll("\\s+", "");
-            Set<String> withOemSet = oemFiltered.stream()
-                    .filter(u -> u.toLowerCase().contains(oemLower))
-                    .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
-            List<String> prioritized = new ArrayList<>(withOemSet);
-            oemFiltered.stream().filter(u -> !withOemSet.contains(u)).forEach(prioritized::add);
-
-            // Пред-фильтр по заголовку — ремкомплекты/компоненты без захода на детальную страницу
-            Map<String, String> urlToTitle = new LinkedHashMap<>();
-            for (SearchEntry e : entries) {
-                if (!e.title().isBlank()) urlToTitle.put(e.url(), e.title().toLowerCase());
-            }
-            List<String> workList = prioritized.stream()
-                    .filter(u -> {
-                        String t = urlToTitle.getOrDefault(u, "");
+            // Пред-фильтр по заголовку — ремкомплекты/компоненты не открываем
+            List<SearchEntry> candidates = oemFiltered.stream()
+                    .filter(e -> {
+                        String t = e.title() == null ? "" : e.title().toLowerCase();
                         return SKIP_TITLE_KEYWORDS.stream().noneMatch(t::contains);
                     })
                     .collect(Collectors.toList());
-            int skippedByTitle = prioritized.size() - workList.size();
+
+            // Дедуп по URL с сохранением порядка
+            LinkedHashMap<String, SearchEntry> uniq = new LinkedHashMap<>();
+            for (SearchEntry e : candidates) uniq.putIfAbsent(e.url(), e);
+            List<SearchEntry> deduped = new ArrayList<>(uniq.values());
+
+            // Сортировка по цене (с ценой — дешёвые первыми; без цены — в конец)
+            deduped.sort(Comparator.comparing(e -> e.price() == null
+                    ? BigDecimal.valueOf(Long.MAX_VALUE) : e.price()));
+
+            int skippedByTitle = oemFiltered.size() - candidates.size();
             log.info("Ссылок всего: {} | региональных: {} | после OEM-фильтра: {} | пред-фильтр: −{} | исключено: {}",
                     entries.size(), regional.size(), oemFiltered.size(), skippedByTitle, excludeUrls.size());
 
-            // ── Шаг 3: обходим детальные страницы В ТОМ ЖЕ контексте ──
+            // Рабочий набор — дешёвые `limit`. Детально открываем только первые `detailLimit`.
+            List<SearchEntry> working = deduped.size() > limit ? deduped.subList(0, limit) : deduped;
+            int toVisit = Math.min(detailLimit, working.size());
+
             List<PartPrice> results = new ArrayList<>();
-            Set<String> seen = new HashSet<>();
-            int count = 0;
+            int visited = 0;
             int attempt = 0;
 
-            for (String detailUrl : workList) {
-                if (count >= limit) break;
-                if (!seen.add(detailUrl)) continue;
-                if (attempt > 0) try { Thread.sleep(1000 + (long) (Math.random() * 800)); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            for (int i = 0; i < working.size(); i++) {
+                SearchEntry e = working.get(i);
+
+                // Кэш детальных данных (соседние OEM выдают тех же конкурентов)
+                CachedPart cached = detailCache.get(e.url());
+                if (cached != null && System.currentTimeMillis() - cached.ts() < CACHE_TTL_MS) {
+                    results.add(cached.part());
+                    continue;
+                }
+
+                // За пределами detailLimit — лёгкая запись со страницы поиска (без захода)
+                if (i >= toVisit) {
+                    if (e.price() != null) results.add(lightweightPart(e, region));
+                    continue;
+                }
+
+                if (attempt > 0) {
+                    try { Thread.sleep(500 + (long) (Math.random() * 500)); }
+                    catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+                }
                 attempt++;
-                log.info("[попытка {}, результат {}/{}] {}", attempt, count + 1, limit, detailUrl);
+                log.info("[деталь {}/{}] {}", visited + 1, toVisit, e.url());
 
                 try {
-                    page.navigate(detailUrl, new Page.NavigateOptions()
+                    page.navigate(e.url(), new Page.NavigateOptions()
                             .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED)
                             .setReferer(searchUrl));
                     page.waitForLoadState(LoadState.DOMCONTENTLOADED);
-                    Thread.sleep(800);
+                    Thread.sleep(500);
 
                     if (hasCaptcha(page)) {
-                        log.info("Капча на детальной странице: {}", detailUrl);
+                        log.info("Капча на детальной странице: {}", e.url());
                         boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
-                        if (solved) saveSession(ctx);
+                        if (solved) saveSession(ctx, sessionFile);
                         if (!solved) {
                             if (!headless) {
                                 log.info("Капча — жду ручного решения 120 сек...");
                                 page.waitForFunction("() => { try { return !document.body.innerText.includes('Вы не робот'); } catch(e) { return false; } }",
                                         null, new Page.WaitForFunctionOptions().setTimeout(120_000));
-                                saveSession(ctx);
+                                saveSession(ctx, sessionFile);
                             } else {
-                                log.warn("Капча не решена, пропускаем: {}", detailUrl);
+                                log.warn("Капча не решена; используем данные со страницы поиска: {}", e.url());
+                                if (e.price() != null) results.add(lightweightPart(e, region));
                                 continue;
                             }
                         }
                         page.waitForLoadState(LoadState.DOMCONTENTLOADED);
-                        Thread.sleep(800);
+                        Thread.sleep(500);
                     }
 
-                    PartPrice part = extractPartFromPage(page, detailUrl);
-                    if (part != null) { results.add(part); count++; }
-                } catch (Exception e) {
-                    log.warn("Ошибка [{}]: {}", detailUrl, e.getMessage());
+                    PartPrice part = extractPartFromPage(page, e.url());
+                    if (part != null) {
+                        results.add(part);
+                        detailCache.put(e.url(), new CachedPart(part, System.currentTimeMillis()));
+                        visited++;
+                    } else if (e.price() != null) {
+                        results.add(lightweightPart(e, region));   // детально не вышло, но цена со страницы поиска есть
+                    }
+                } catch (Exception ex) {
+                    log.warn("Ошибка [{}]: {}", e.url(), ex.getMessage());
+                    if (e.price() != null) results.add(lightweightPart(e, region));   // фолбэк на данные поиска
                 }
             }
 
-            results.sort((a, b) -> a.getPrice().compareTo(b.getPrice()));
-            log.info("Собрано в [{}]: {} предложений", region, results.size());
+            results.sort((a, b2) -> a.getPrice().compareTo(b2.getPrice()));
+            log.info("Собрано в [{}]: {} предложений (детально: {})", region, results.size(), visited);
             return results;
 
         } catch (Exception e) {
@@ -468,6 +527,21 @@ public class DromParser {
             page.close();
             ctx.close();
         }
+    }
+
+    /** Лёгкая запись конкурента из данных страницы поиска (без захода на детальную). */
+    private PartPrice lightweightPart(SearchEntry e, String region) {
+        return PartPrice.builder()
+                .title(e.title())
+                .price(e.price())
+                .url(e.url())
+                .oem(e.oem() == null || e.oem().isBlank() ? null : e.oem().replaceAll("\\s+", "").toUpperCase())
+                .location(region)
+                .dealer(e.dealer())
+                .publishedDate(e.date())
+                .photoUrls(List.of())
+                .description("")
+                .build();
     }
 
     // ==================== ДЕТАЛЬНАЯ СТРАНИЦА ====================
@@ -550,9 +624,13 @@ public class DromParser {
                     const annRows = row.querySelectorAll('.bull-item__annotation-row');
                     let oem = snippetEl ? snippetEl.textContent.trim().replace(/\\s+/g,'') : '';
                     if (!oem && annRows.length >= 2) oem = annRows[1].textContent.trim().replace(/\\s+/g,'');
-                    // Цена: [data-field="price"] или .bull-item__price
-                    const priceEl = row.querySelector('[data-field="price"], .bull-item__price, .price-value');
-                    let priceText = priceEl ? priceEl.textContent.replace(/[^\\d]/g,'') : '';
+                    // Цена: строгий приоритет [data-role="price"] (полная цена), иначе фолбэки.
+                    // Берём первое число, чтобы не склеить платёж по рассрочке + полную цену.
+                    const priceEl = row.querySelector('[data-role="price"]')
+                                 || row.querySelector('.price-block__price')
+                                 || row.querySelector('.bull-item__price');
+                    let priceText = '';
+                    if (priceEl) { const pm = priceEl.textContent.replace(/\\s/g,'').match(/\\d+/); priceText = pm ? pm[0] : ''; }
                     // Заголовок
                     const titleText = a.textContent.trim();
                     // Дата
@@ -888,6 +966,10 @@ public class DromParser {
     }
 
     private BrowserContext newContext() {
+        return newContext(browser, SESSION_FILE);
+    }
+
+    private BrowserContext newContext(Browser b, Path sessionFile) {
         Browser.NewContextOptions opts = new Browser.NewContextOptions()
                 .setUserAgent(fixedUserAgent)
                 .setViewportSize(1366, 768)
@@ -900,17 +982,21 @@ public class DromParser {
             opts.setProxy(buildProxy(proxyUrl));
             log.debug("Используем прокси: {}", proxyUrl.replaceAll(":[^@]+@", ":***@"));
         }
-        if (Files.exists(SESSION_FILE)) {
-            opts.setStorageStatePath(SESSION_FILE);
-            log.debug("Загружена сохранённая сессия из {}", SESSION_FILE);
+        if (Files.exists(sessionFile)) {
+            opts.setStorageStatePath(sessionFile);
+            log.debug("Загружена сохранённая сессия из {}", sessionFile);
         }
-        return browser.newContext(opts);
+        return b.newContext(opts);
     }
 
     private void saveSession(BrowserContext ctx) {
+        saveSession(ctx, SESSION_FILE);
+    }
+
+    private void saveSession(BrowserContext ctx, Path sessionFile) {
         try {
-            ctx.storageState(new BrowserContext.StorageStateOptions().setPath(SESSION_FILE));
-            log.debug("Сессия сохранена в {}", SESSION_FILE);
+            ctx.storageState(new BrowserContext.StorageStateOptions().setPath(sessionFile));
+            log.debug("Сессия сохранена в {}", sessionFile);
         } catch (Exception e) {
             log.debug("Не удалось сохранить сессию: {}", e.getMessage());
         }
