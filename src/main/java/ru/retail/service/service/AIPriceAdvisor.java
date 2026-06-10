@@ -360,14 +360,17 @@ public class AIPriceAdvisor {
 
     // ==================== СТРАТЕГИЯ КОНКУРЕНТНОГО ЦЕНООБРАЗОВАНИЯ ====================
 
-    private static final int MIN_CITY_COMPETITORS = 3;
+    /** Уклон в быструю продажу: −5% от справедливой медианы (но не ниже минимума рынка). */
+    private static final double FAST_SALE_FACTOR = 0.95;
+
+    /** Меньше этого числа конкурентов на рынке → данным нельзя доверять, цену резко не двигаем. */
+    private static final int MIN_RELIABLE_COMPETITORS = 3;
+    /** Максимальное движение цены от текущей при тонких данных. */
+    private static final double THIN_DATA_MAX_MOVE = 0.10;
 
     /**
-     * Правила:
-     * 1. Свежее объявление + в городе ≥3 конкурентов → используем только городские данные
-     * 2. Свежее объявление + в городе <3 конкурентов → Новосибирск как ориентир
-     * 3. Старое объявление → Новосибирск как ориентир
-     * 4. Фото-дисконт при коэф. < 0.70
+     * Единый рынок из двух регионов (Барнаул + Новосибирск). Считаем справедливую цену:
+     * не самую низкую, но с лёгким уклоном в быструю продажу. Фото-дисконт при коэф. < 0.70.
      */
     private AIRecommendation computeCompetitivePrice(
             CompetitorClassification cityClass, List<PartPrice> cityPrices,
@@ -378,25 +381,26 @@ public class AIPriceAdvisor {
                 ? String.format(" Мои фото: %s (коэф. %.2f).", myPhoto.condition(), myPhoto.coefficient())
                 : "";
 
-        boolean cityClassValid = !cityClass.similar().isEmpty() || !cityClass.better().isEmpty() || !cityClass.worse().isEmpty();
-        if (!isOldListing && cityPrices.size() >= MIN_CITY_COMPETITORS && cityClassValid) {
-            return strategyForMarket(cityClass, cityPrices, myPhoto, myCurrentPrice, "В городе", photoNote);
+        // Объединяем оба региона в единый рынок
+        List<PartPrice> market = new ArrayList<>(cityPrices);
+        market.addAll(siberiaPrices);
+        if (market.isEmpty()) {
+            return new AIRecommendation(myCurrentPrice, "низкая",
+                    "Недостаточно данных для анализа. Цена оставлена без изменений.", photoNote);
         }
 
-        if (!siberiaPrices.isEmpty()) {
-            String scope = isOldListing
-                    ? "Объявление старше 6 мес. Ориентир — Новосибирск"
-                    : "Мало предложений в городе. Ориентир — Новосибирск";
-            return strategyForMarket(siberiaClass, siberiaPrices, myPhoto, myCurrentPrice, scope, photoNote);
-        }
+        CompetitorClassification merged = mergeClassifications(cityClass, siberiaClass);
+        String scope = String.format("По 2 регионам (Барнаул %d + НСК %d)", cityPrices.size(), siberiaPrices.size());
+        return strategyForMarket(merged, market, myPhoto, myCurrentPrice, scope, photoNote);
+    }
 
-        if (!cityPrices.isEmpty()) {
-            return strategyForMarket(cityClass, cityPrices, myPhoto, myCurrentPrice,
-                    "В городе (мало данных)", photoNote);
-        }
-
-        return new AIRecommendation(myCurrentPrice, "низкая",
-                "Недостаточно данных для анализа. Цена оставлена без изменений.", photoNote);
+    /** Сливает классификации двух регионов в одну (similar/better/worse). */
+    private CompetitorClassification mergeClassifications(CompetitorClassification a, CompetitorClassification b) {
+        List<Double> similar = new ArrayList<>(a.similar()); similar.addAll(b.similar());
+        List<Double> better  = new ArrayList<>(a.better());  better.addAll(b.better());
+        List<Double> worse   = new ArrayList<>(a.worse());   worse.addAll(b.worse());
+        String summary = (a.summary() != null && !a.summary().isBlank()) ? a.summary() : b.summary();
+        return new CompetitorClassification(similar, better, worse, summary);
     }
 
     private AIRecommendation strategyForMarket(
@@ -430,12 +434,13 @@ public class AIPriceAdvisor {
                         scope, worseCnt, total, medSimilar, (premium - 1) * 100, target.doubleValue());
 
             } else {
-                // Не превосходим рынок → держимся ровно на 3% ниже самого дешёвого аналога.
-                // Если были дешевле более чем на 3% — поднимаемся до этого уровня (забираем маржу).
-                target     = BigDecimal.valueOf(minSimilar * 0.97).setScale(0, RoundingMode.DOWN);
+                // Справедливая цена с уклоном в быструю продажу: медиана аналогов −5%,
+                // но НЕ ниже самого дешёвого аналога — мы не самые дешёвые, но привлекательны.
+                double fair = Math.max(minSimilar, medSimilar * FAST_SALE_FACTOR);
+                target     = BigDecimal.valueOf(fair).setScale(0, RoundingMode.DOWN);
                 confidence = total >= 4 ? "высокая" : "средняя";
-                reason     = String.format("%s держим цену на 3%% ниже минимального аналога (%.0f₽) → %.0f₽.",
-                        scope, minSimilar, target.doubleValue());
+                reason     = String.format("%s справедливая цена: медиана аналогов %.0f₽ −5%% (уклон в быструю продажу), не ниже минимума %.0f₽ → %.0f₽.",
+                        scope, medSimilar, minSimilar, target.doubleValue());
             }
 
         } else if (!worse.isEmpty() && better.isEmpty()) {
@@ -474,6 +479,23 @@ public class AIPriceAdvisor {
         if (bounded.compareTo(target) != 0) {
             reason += String.format(" [в границах рынка: %.0f₽]", bounded.doubleValue());
             target = bounded;
+        }
+
+        // Тонкие данные (<3 конкурентов) → ненадёжно. Не двигаем цену резко: не более ±10% от текущей.
+        if (stats.count() < MIN_RELIABLE_COMPETITORS) {
+            confidence = "низкая";
+            if (myCurrentPrice.compareTo(BigDecimal.ZERO) > 0) {
+                BigDecimal lo = myCurrentPrice.multiply(BigDecimal.valueOf(1 - THIN_DATA_MAX_MOVE)).setScale(0, RoundingMode.DOWN);
+                BigDecimal hi = myCurrentPrice.multiply(BigDecimal.valueOf(1 + THIN_DATA_MAX_MOVE)).setScale(0, RoundingMode.HALF_UP);
+                BigDecimal clamped = target.compareTo(hi) > 0 ? hi : (target.compareTo(lo) < 0 ? lo : target);
+                if (clamped.compareTo(target) != 0) {
+                    reason += String.format(" [мало данных (%d конк.): движение ограничено ±10%% → %.0f₽]",
+                            stats.count(), clamped.doubleValue());
+                    target = clamped;
+                } else {
+                    reason += String.format(" [мало данных (%d конк.): низкая уверенность]", stats.count());
+                }
+            }
         }
 
         if (cls.summary() != null && !cls.summary().isBlank()) reason += " " + cls.summary();

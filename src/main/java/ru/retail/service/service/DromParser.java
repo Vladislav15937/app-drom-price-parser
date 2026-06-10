@@ -345,8 +345,8 @@ public class DromParser {
     }
 
     /** Параллельный парсинг НСК — отдельный браузер/сессия, вызывается из выделенного потока. */
-    public List<PartPrice> parsePartsBackground(String oemNumber, String region) {
-        return parsePartsImpl(oemNumber, region, 10, DEFAULT_DETAIL_LIMIT, Set.of(), nskBrowser(), NSK_SESSION_FILE);
+    public List<PartPrice> parsePartsBackground(String oemNumber, String region, int limit) {
+        return parsePartsImpl(oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, Set.of(), nskBrowser(), NSK_SESSION_FILE);
     }
 
     private List<PartPrice> parsePartsImpl(String oemNumber, String region, int limit, int detailLimit,

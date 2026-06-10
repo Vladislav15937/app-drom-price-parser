@@ -26,7 +26,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class PriceAnalyzer {
 
-    private static final int CITY_ANALOG_THRESHOLD = 6;   // меньше этого → доищем в Новосибирске
+    private static final int TOP_N = 5;                    // сколько дешёвых конкурентов берём в каждом регионе
     private static final String FALLBACK_REGION = "novosibirsk";
 
     private final DromParser dromParser;
@@ -49,7 +49,7 @@ public class PriceAnalyzer {
     /** Спекулятивно запускает НСК-парсинг в отдельном потоке/браузере, если включено. */
     private Future<List<PartPrice>> startNskIfParallel(String oemNumber, String region) {
         if (parallelNsk && !region.equals(FALLBACK_REGION)) {
-            return nskExecutor.submit(() -> dromParser.parsePartsBackground(oemNumber, FALLBACK_REGION));
+            return nskExecutor.submit(() -> dromParser.parsePartsBackground(oemNumber, FALLBACK_REGION, TOP_N));
         }
         return null;
     }
@@ -63,7 +63,7 @@ public class PriceAnalyzer {
                 log.warn("Параллельный НСК упал ({}) — последовательный фолбэк", e.getMessage());
             }
         }
-        return dromParser.parseParts(oemNumber, FALLBACK_REGION);
+        return dromParser.parseParts(oemNumber, FALLBACK_REGION, TOP_N);
     }
 
     /**
@@ -87,50 +87,47 @@ public class PriceAnalyzer {
         log.info("Моё объявление: цена={}₽, дата={}, фото={}",
                 myPrice, myListing.getPublishedDate(), myListing.getPhotoUrls().size());
 
-        // 2. Парсим конкурентов в городе (только полные узлы, без ремкомплектов/поршней)
+        // 2. Парсим 5 дешёвых конкурентов в городе (без ремкомплектов/поршней)
         String normalizedMyUrl = myListingUrl.toLowerCase().replaceAll("/+$", "");
-        List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region).stream()
+        List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region, TOP_N).stream()
                 .filter(p -> !p.getUrl().toLowerCase().replaceAll("/+$", "").equals(normalizedMyUrl))
                 .collect(java.util.stream.Collectors.toList());
         List<PartPrice> cityPrices = filterAssemblies(cityRaw, oemNumber);
         log.info("Конкуренты в городе: {} (до фильтра: {})", cityPrices.size(), cityRaw.size());
 
-        // 3. Если конкурентов в городе меньше 10 → доищем в Новосибирске
+        // 3. Всегда добавляем 5 дешёвых из Новосибирска — работаем по двум регионам
         boolean isOldListing = isOlderThan6Months(myListing.getPublishedDate());
-        boolean fewCityCompetitors = cityPrices.size() < CITY_ANALOG_THRESHOLD;
-        boolean needFallback = isOldListing || fewCityCompetitors;
-        log.info("Старое объявление: {} | Конкурентов в городе: {} (нужно {}+) → Поиск в {}: {}",
-                isOldListing, cityPrices.size(), CITY_ANALOG_THRESHOLD, FALLBACK_REGION, needFallback);
-
+        boolean searchedNsk = !region.equals(FALLBACK_REGION);
         List<PartPrice> siberiaPrices = Collections.emptyList();
-        if (needFallback && !region.equals(FALLBACK_REGION)) {
+        if (searchedNsk) {
             List<PartPrice> fallbackRaw = fetchSiberiaRaw(oemNumber, nskFuture);
             siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
             log.info("{} после фильтра: {} (до фильтра: {})", FALLBACK_REGION, siberiaPrices.size(), fallbackRaw.size());
         } else if (nskFuture != null) {
-            nskFuture.cancel(true);   // город достаточен → спекулятивный НСК не нужен
+            nskFuture.cancel(true);
         }
 
         // 4. AI-анализ
         AIPriceAdvisor.AIRecommendation ai = aiAdvisor.analyze(
                 myListing, myPrice, cityPrices, siberiaPrices, isOldListing);
 
-        // 5. Статистика
-        PriceStats stats = !cityPrices.isEmpty() ? computePriceStats(cityPrices)
-                : !siberiaPrices.isEmpty() ? computePriceStats(siberiaPrices) : null;
+        // 5. Статистика по объединённому рынку (оба региона)
+        List<PartPrice> combined = new java.util.ArrayList<>(cityPrices);
+        combined.addAll(siberiaPrices);
+        PriceStats stats = combined.isEmpty() ? null : computePriceStats(combined);
         BigDecimal minPrice    = stats != null ? stats.min()    : BigDecimal.ZERO;
         BigDecimal maxPrice    = stats != null ? stats.max()    : BigDecimal.ZERO;
         BigDecimal avgPrice    = stats != null ? stats.avg()    : BigDecimal.ZERO;
         BigDecimal medianPrice = stats != null ? stats.median() : BigDecimal.ZERO;
 
-        String marketNote = buildMarketNote(isOldListing, cityPrices.size(), siberiaPrices.size(), needFallback);
+        String marketNote = buildMarketNote(isOldListing, cityPrices.size(), siberiaPrices.size(), searchedNsk);
 
         return AggregationResult.builder()
                 .oemNumber(oemNumber)
                 .totalFound(cityPrices.size() + siberiaPrices.size())
                 .cityCompetitorCount(cityPrices.size())
                 .siberiaCompetitorCount(siberiaPrices.size())
-                .searchedSiberia(needFallback)
+                .searchedSiberia(searchedNsk)
                 .minPrice(minPrice)
                 .maxPrice(maxPrice)
                 .avgPrice(avgPrice)
@@ -223,10 +220,10 @@ public class PriceAnalyzer {
 
         log.info("Найдено объявление {}: {}", myCompany, myListingUrl);
 
-        // 2. Спекулятивно запускаем НСК параллельно (если включено), затем парсим город
+        // 2. Спекулятивно запускаем НСК параллельно (если включено), затем парсим 5 дешёвых в городе
         Future<List<PartPrice>> nskFuture = startNskIfParallel(oemNumber, region);
         Set<String> myUrls = Set.of(myListingUrl);
-        List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region, 10, myUrls);
+        List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region, TOP_N, myUrls);
         List<PartPrice> cityPrices = filterAssemblies(cityRaw, oemNumber);
 
         // 3. Полная информация о нашем объявлении
@@ -239,27 +236,26 @@ public class PriceAnalyzer {
 
         log.info("Цена: {}₽", myPrice);
 
+        // 4. Всегда добавляем 5 дешёвых из Новосибирска — работаем по двум регионам
         boolean isOldListing = isOlderThan6Months(myListingInfo.getPublishedDate());
-        boolean fewCityCompetitors = cityPrices.size() < CITY_ANALOG_THRESHOLD;
-        boolean needFallback = isOldListing || fewCityCompetitors;
-        log.info("Старое: {} | Город: {} | Фоллбэк: {}", isOldListing, cityPrices.size(), needFallback);
-
+        boolean searchedNsk = !region.equals(FALLBACK_REGION);
         List<PartPrice> siberiaPrices = Collections.emptyList();
-        if (needFallback && !region.equals(FALLBACK_REGION)) {
+        if (searchedNsk) {
             List<PartPrice> fallbackRaw = fetchSiberiaRaw(oemNumber, nskFuture);
             siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
             log.info("{} после фильтра: {}", FALLBACK_REGION, siberiaPrices.size());
         } else if (nskFuture != null) {
-            nskFuture.cancel(true);   // город достаточен → спекулятивный НСК не нужен
+            nskFuture.cancel(true);
         }
 
-        // 7. AI-анализ
+        // 5. AI-анализ
         AIPriceAdvisor.AIRecommendation ai = aiAdvisor.analyze(
                 myListingInfo, myPrice, cityPrices, siberiaPrices, isOldListing);
 
-        // 8. Статистика
-        List<PartPrice> statSource = !cityPrices.isEmpty() ? cityPrices : siberiaPrices;
-        PriceStats catalogStats = statSource.isEmpty() ? null : computePriceStats(statSource);
+        // 6. Статистика по объединённому рынку (оба региона)
+        List<PartPrice> combined = new java.util.ArrayList<>(cityPrices);
+        combined.addAll(siberiaPrices);
+        PriceStats catalogStats = combined.isEmpty() ? null : computePriceStats(combined);
         BigDecimal minPrice    = catalogStats != null ? catalogStats.min()    : BigDecimal.ZERO;
         BigDecimal maxPrice    = catalogStats != null ? catalogStats.max()    : BigDecimal.ZERO;
         BigDecimal avgPrice    = catalogStats != null ? catalogStats.avg()    : BigDecimal.ZERO;
@@ -270,14 +266,14 @@ public class PriceAnalyzer {
                 .totalFound(cityPrices.size() + siberiaPrices.size())
                 .cityCompetitorCount(cityPrices.size())
                 .siberiaCompetitorCount(siberiaPrices.size())
-                .searchedSiberia(needFallback)
+                .searchedSiberia(searchedNsk)
                 .minPrice(minPrice).maxPrice(maxPrice).avgPrice(avgPrice).medianPrice(medianPrice)
                 .recommendedPrice(ai.recommendedPrice())
                 .aiConfidence(ai.confidence())
                 .aiReason(ai.reason())
                 .myPhotoAssessment(ai.photoNote())
                 .myListingDate(myListingInfo.getPublishedDate())
-                .marketNote(buildMarketNote(isOldListing, cityPrices.size(), siberiaPrices.size(), needFallback))
+                .marketNote(buildMarketNote(isOldListing, cityPrices.size(), siberiaPrices.size(), searchedNsk))
                 .items(cityPrices)
                 .siberiaItems(siberiaPrices)
                 .collectedAt(java.time.Instant.now())
