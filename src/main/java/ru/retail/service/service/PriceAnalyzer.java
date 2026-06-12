@@ -216,10 +216,13 @@ public class PriceAnalyzer {
 
         log.info("=== Каталог OEM: {} | Регион: {} | Компания: {} ===", oemNumber, region, myCompany);
 
-        // 1. Быстро ищем URL нашего объявления по имени компании прямо на странице поиска
-        String myListingUrl = dromParser.findMyListingUrl(oemNumber, region, myCompany);
+        // 1. За ОДНУ загрузку страницы поиска: URL нашего объявления (по компании) + конкуренты города.
+        Future<List<PartPrice>> nskFuture = startNskIfParallel(oemNumber, region);
+        DromParser.CityParseResult city = dromParser.parseCityWithMyListing(oemNumber, region, TOP_N, myCompany);
+        String myListingUrl = city.myListingUrl();
 
         if (myListingUrl == null) {
+            if (nskFuture != null) nskFuture.cancel(true);
             log.info("Объявлений «{}» для OEM {} не найдено в [{}]", myCompany, oemNumber, region);
             return AggregationResult.builder()
                     .oemNumber(oemNumber)
@@ -234,12 +237,7 @@ public class PriceAnalyzer {
         }
 
         log.info("Найдено объявление {}: {}", myCompany, myListingUrl);
-
-        // 2. Спекулятивно запускаем НСК параллельно (если включено), затем парсим 5 дешёвых в городе
-        Future<List<PartPrice>> nskFuture = startNskIfParallel(oemNumber, region);
-        Set<String> myUrls = Set.of(myListingUrl);
-        List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region, TOP_N, myUrls);
-        List<PartPrice> cityPrices = filterAssemblies(cityRaw, oemNumber);
+        List<PartPrice> cityPrices = filterAssemblies(city.competitors(), oemNumber);
 
         // 3. Полная информация о нашем объявлении
         MyListingInfo myListingInfo = dromParser.parseMyListing(myListingUrl);

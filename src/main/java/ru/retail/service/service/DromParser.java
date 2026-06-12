@@ -357,6 +357,9 @@ public class DromParser {
         return parsePartsImpl(oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, Set.of(), nskBrowser(), NSK_SESSION_FILE);
     }
 
+    /** Результат комбинированного парсинга города: URL моего объявления + конкуренты (за одну загрузку поиска). */
+    public record CityParseResult(String myListingUrl, List<PartPrice> competitors) {}
+
     private List<PartPrice> parsePartsImpl(String oemNumber, String region, int limit, int detailLimit,
                                            Set<String> excludeUrls, Browser b, Path sessionFile) {
         if (apifyDromService.isEnabled()) {
@@ -375,156 +378,11 @@ public class DromParser {
 
         BrowserContext ctx = newContext(b, sessionFile);
         Page page = newPage(ctx);
-
         try {
-            // ── Шаг 1: загружаем страницу поиска ──
-            navigateWithRetry(page, searchUrl, null);
-            Thread.sleep(1500);
-
-            if (hasCaptcha(page)) {
-                boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
-                if (!solved) solved = waitForManualCaptcha(page);
-                if (!solved) {
-                    noteCaptchaBlocked();
-                    log.error("Капча на поиске [{}] не решена — пустой результат.", region);
-                    return List.of();
-                }
-                saveSession(ctx, sessionFile);
-                page.waitForLoadState(LoadState.DOMCONTENTLOADED);
-            }
-
-            page.waitForLoadState(LoadState.DOMCONTENTLOADED);
-            Thread.sleep(1000);
-
-            // ── Шаг 2: собираем объявления прямо со страницы поиска (цена/заголовок/дата уже здесь) ──
-            List<SearchEntry> entries = collectSearchEntries(page);
-            proxyOk();   // страница поиска загрузилась — прокси жив
-
-            // Сигнал о поломке скрейпера: объявления есть, но ни у одного не извлеклась цена → селектор сломан
-            if (!entries.isEmpty() && entries.stream().noneMatch(e -> e.price() != null)) {
-                log.error("СЕЛЕКТОР ЦЕНЫ СЛОМАН [{}]: {} объявлений, но 0 цен — проверьте DOM baza.drom.ru (collectSearchEntries)",
-                        region, entries.size());
-            }
-
-            Set<String> normalizedExcludes = excludeUrls.stream()
-                    .map(u -> u.toLowerCase().replaceAll("/+$", ""))
-                    .collect(Collectors.toSet());
-            String regionSlug = "/" + region + "/";
-            String normalizedOem = oemNumber.replaceAll("\\s+", "").toUpperCase();
-
-            // Исключаем свои URL + фильтр по региону (с фолбэком на все, если /регион/ нет в пути)
-            List<SearchEntry> regional = entries.stream()
-                    .filter(e -> normalizedExcludes.isEmpty()
-                            || !normalizedExcludes.contains(e.url().toLowerCase().replaceAll("/+$", "")))
-                    .filter(e -> e.url().contains(regionSlug))
-                    .collect(Collectors.toList());
-            if (regional.isEmpty()) {
-                regional = entries.stream()
-                        .filter(e -> normalizedExcludes.isEmpty()
-                                || !normalizedExcludes.contains(e.url().toLowerCase().replaceAll("/+$", "")))
-                        .collect(Collectors.toList());
-            }
-
-            // Пре-фильтр по OEM со страницы поиска
-            List<SearchEntry> oemFiltered = regional.stream()
-                    .filter(e -> {
-                        String pageOem = (e.oem() == null || e.oem().isBlank()) ? null : e.oem().toUpperCase();
-                        return pageOem == null || pageOem.equals(normalizedOem)
-                                || pageOem.contains(normalizedOem) || normalizedOem.contains(pageOem);
-                    })
-                    .collect(Collectors.toList());
-            if (oemFiltered.isEmpty()) oemFiltered = regional;
-
-            // Пред-фильтр по заголовку — ремкомплекты/компоненты не открываем
-            List<SearchEntry> candidates = oemFiltered.stream()
-                    .filter(e -> {
-                        String t = e.title() == null ? "" : e.title().toLowerCase();
-                        return SKIP_TITLE_KEYWORDS.stream().noneMatch(t::contains);
-                    })
-                    .collect(Collectors.toList());
-
-            // Дедуп по URL с сохранением порядка
-            LinkedHashMap<String, SearchEntry> uniq = new LinkedHashMap<>();
-            for (SearchEntry e : candidates) uniq.putIfAbsent(e.url(), e);
-            List<SearchEntry> deduped = new ArrayList<>(uniq.values());
-
-            // Сортировка по цене (с ценой — дешёвые первыми; без цены — в конец)
-            deduped.sort(Comparator.comparing(e -> e.price() == null
-                    ? BigDecimal.valueOf(Long.MAX_VALUE) : e.price()));
-
-            int skippedByTitle = oemFiltered.size() - candidates.size();
-            log.info("Ссылок всего: {} | региональных: {} | после OEM-фильтра: {} | пред-фильтр: −{} | исключено: {}",
-                    entries.size(), regional.size(), oemFiltered.size(), skippedByTitle, excludeUrls.size());
-
-            // Рабочий набор — дешёвые `limit`. Детально открываем только первые `detailLimit`.
-            List<SearchEntry> working = deduped.size() > limit ? deduped.subList(0, limit) : deduped;
-            int toVisit = Math.min(detailLimit, working.size());
-
-            List<PartPrice> results = new ArrayList<>();
-            int visited = 0;
-            int attempt = 0;
-
-            for (int i = 0; i < working.size(); i++) {
-                SearchEntry e = working.get(i);
-
-                // Кэш детальных данных (соседние OEM выдают тех же конкурентов)
-                CachedPart cached = detailCache.get(e.url());
-                if (cached != null && System.currentTimeMillis() - cached.ts() < CACHE_TTL_MS) {
-                    results.add(cached.part());
-                    continue;
-                }
-
-                // За пределами detailLimit — лёгкая запись со страницы поиска (без захода)
-                if (i >= toVisit) {
-                    if (e.price() != null) results.add(lightweightPart(e, region));
-                    continue;
-                }
-
-                if (attempt > 0) {
-                    try { Thread.sleep(500 + (long) (Math.random() * 500)); }
-                    catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
-                }
-                attempt++;
-                log.info("[деталь {}/{}] {}", visited + 1, toVisit, e.url());
-
-                try {
-                    navigateWithRetry(page, e.url(), searchUrl);
-                    page.waitForLoadState(LoadState.DOMCONTENTLOADED);
-                    Thread.sleep(500);
-
-                    if (hasCaptcha(page)) {
-                        log.info("Капча на детальной странице: {}", e.url());
-                        boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
-                        if (!solved) solved = waitForManualCaptcha(page);
-                        if (!solved) {
-                            noteCaptchaBlocked();
-                            log.warn("Капча не решена; используем данные со страницы поиска: {}", e.url());
-                            if (e.price() != null) results.add(lightweightPart(e, region));
-                            continue;
-                        }
-                        saveSession(ctx, sessionFile);
-                        page.waitForLoadState(LoadState.DOMCONTENTLOADED);
-                        Thread.sleep(500);
-                    }
-
-                    PartPrice part = extractPartFromPage(page, e.url());
-                    if (part != null) {
-                        results.add(part);
-                        detailCache.put(e.url(), new CachedPart(part, System.currentTimeMillis()));
-                        visited++;
-                    } else if (e.price() != null) {
-                        results.add(lightweightPart(e, region));   // детально не вышло, но цена со страницы поиска есть
-                    }
-                } catch (Exception ex) {
-                    log.warn("Ошибка [{}]: {}", e.url(), ex.getMessage());
-                    if (e.price() != null) results.add(lightweightPart(e, region));   // фолбэк на данные поиска
-                }
-            }
-
-            results.sort((a, b2) -> a.getPrice().compareTo(b2.getPrice()));
-            log.info("Собрано в [{}]: {} предложений (детально: {})", region, results.size(), visited);
-            return results;
-
+            List<SearchEntry> entries = loadSearchEntries(page, ctx, sessionFile, searchUrl, region);
+            if (entries == null) return List.of();   // капча не пройдена
+            return processSearchEntries(page, ctx, sessionFile, searchUrl, entries,
+                    oemNumber, region, limit, detailLimit, excludeUrls);
         } catch (Exception e) {
             noteError(e);
             log.error("Ошибка парсинга [{}]: {}", region, e.getMessage());
@@ -533,6 +391,205 @@ public class DromParser {
             page.close();
             ctx.close();
         }
+    }
+
+    /**
+     * За ОДНУ загрузку страницы поиска: находит URL моего объявления (по имени компании) и парсит конкурентов.
+     * Раньше {@code findMyListingUrl} + {@code parseParts} грузили эту страницу дважды на каждый OEM.
+     */
+    public CityParseResult parseCityWithMyListing(String oemNumber, String region, int limit, String myCompany) {
+        // Apify-режим: комбинированную загрузку не делаем (по умолчанию apify выключен)
+        if (apifyDromService.isEnabled()) {
+            String myUrl = findMyListingUrl(oemNumber, region, myCompany);
+            if (myUrl == null) return new CityParseResult(null, List.of());
+            return new CityParseResult(myUrl, parseParts(oemNumber, region, limit, Set.of(myUrl)));
+        }
+
+        String searchUrl = buildSearchUrl(oemNumber, region);
+        log.info("Поиск моего объявления + конкурентов [{}]: {}", region, searchUrl);
+
+        BrowserContext ctx = newContext(browser, SESSION_FILE);
+        Page page = newPage(ctx);
+        try {
+            List<SearchEntry> entries = loadSearchEntries(page, ctx, SESSION_FILE, searchUrl, region);
+            if (entries == null) return new CityParseResult(null, List.of());
+
+            String companyLower = myCompany.toLowerCase();
+            String myUrl = entries.stream()
+                    .filter(e -> e.dealer() != null && e.dealer().toLowerCase().contains(companyLower))
+                    .map(SearchEntry::url)
+                    .findFirst()
+                    .orElse(null);
+            // Моего объявления нет — детали не открываем (как и раньше при пустом findMyListingUrl)
+            if (myUrl == null) return new CityParseResult(null, List.of());
+
+            List<PartPrice> competitors = processSearchEntries(page, ctx, SESSION_FILE, searchUrl, entries,
+                    oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, Set.of(myUrl));
+            return new CityParseResult(myUrl, competitors);
+        } catch (Exception e) {
+            noteError(e);
+            log.error("Ошибка поиска объявления/конкурентов [{}]: {}", region, e.getMessage());
+            return new CityParseResult(null, List.of());
+        } finally {
+            page.close();
+            ctx.close();
+        }
+    }
+
+    /** Загружает страницу поиска (с обработкой капчи) и возвращает сырые объявления; null — капча не пройдена. */
+    private List<SearchEntry> loadSearchEntries(Page page, BrowserContext ctx, Path sessionFile,
+                                                String searchUrl, String region) throws InterruptedException {
+        navigateWithRetry(page, searchUrl, null);
+        Thread.sleep(1500);
+
+        if (hasCaptcha(page)) {
+            boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
+            if (!solved) solved = waitForManualCaptcha(page);
+            if (!solved) {
+                noteCaptchaBlocked();
+                log.error("Капча на поиске [{}] не решена — пустой результат.", region);
+                return null;
+            }
+            saveSession(ctx, sessionFile);
+            page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+        }
+
+        page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+        Thread.sleep(1000);
+
+        List<SearchEntry> entries = collectSearchEntries(page);
+        proxyOk();   // страница поиска загрузилась — прокси жив
+
+        // Сигнал о поломке скрейпера: объявления есть, но ни у одного не извлеклась цена → селектор сломан
+        if (!entries.isEmpty() && entries.stream().noneMatch(e -> e.price() != null)) {
+            log.error("СЕЛЕКТОР ЦЕНЫ СЛОМАН [{}]: {} объявлений, но 0 цен — проверьте DOM baza.drom.ru (collectSearchEntries)",
+                    region, entries.size());
+        }
+        return entries;
+    }
+
+    /** Из сырых объявлений страницы поиска делает список конкурентов: фильтры, дедуп, сортировка, заход на детали. */
+    private List<PartPrice> processSearchEntries(Page page, BrowserContext ctx, Path sessionFile, String searchUrl,
+                                                 List<SearchEntry> entries, String oemNumber, String region,
+                                                 int limit, int detailLimit, Set<String> excludeUrls) {
+        Set<String> normalizedExcludes = excludeUrls.stream()
+                .map(u -> u.toLowerCase().replaceAll("/+$", ""))
+                .collect(Collectors.toSet());
+        String regionSlug = "/" + region + "/";
+        String normalizedOem = oemNumber.replaceAll("\\s+", "").toUpperCase();
+
+        // Исключаем свои URL + фильтр по региону (с фолбэком на все, если /регион/ нет в пути)
+        List<SearchEntry> regional = entries.stream()
+                .filter(e -> normalizedExcludes.isEmpty()
+                        || !normalizedExcludes.contains(e.url().toLowerCase().replaceAll("/+$", "")))
+                .filter(e -> e.url().contains(regionSlug))
+                .collect(Collectors.toList());
+        if (regional.isEmpty()) {
+            regional = entries.stream()
+                    .filter(e -> normalizedExcludes.isEmpty()
+                            || !normalizedExcludes.contains(e.url().toLowerCase().replaceAll("/+$", "")))
+                    .collect(Collectors.toList());
+        }
+
+        // Пре-фильтр по OEM со страницы поиска
+        List<SearchEntry> oemFiltered = regional.stream()
+                .filter(e -> {
+                    String pageOem = (e.oem() == null || e.oem().isBlank()) ? null : e.oem().toUpperCase();
+                    return pageOem == null || pageOem.equals(normalizedOem)
+                            || pageOem.contains(normalizedOem) || normalizedOem.contains(pageOem);
+                })
+                .collect(Collectors.toList());
+        if (oemFiltered.isEmpty()) oemFiltered = regional;
+
+        // Пред-фильтр по заголовку — ремкомплекты/компоненты не открываем
+        List<SearchEntry> candidates = oemFiltered.stream()
+                .filter(e -> {
+                    String t = e.title() == null ? "" : e.title().toLowerCase();
+                    return SKIP_TITLE_KEYWORDS.stream().noneMatch(t::contains);
+                })
+                .collect(Collectors.toList());
+
+        // Дедуп по URL с сохранением порядка
+        LinkedHashMap<String, SearchEntry> uniq = new LinkedHashMap<>();
+        for (SearchEntry e : candidates) uniq.putIfAbsent(e.url(), e);
+        List<SearchEntry> deduped = new ArrayList<>(uniq.values());
+
+        // Сортировка по цене (с ценой — дешёвые первыми; без цены — в конец)
+        deduped.sort(Comparator.comparing(e -> e.price() == null
+                ? BigDecimal.valueOf(Long.MAX_VALUE) : e.price()));
+
+        int skippedByTitle = oemFiltered.size() - candidates.size();
+        log.info("Ссылок всего: {} | региональных: {} | после OEM-фильтра: {} | пред-фильтр: −{} | исключено: {}",
+                entries.size(), regional.size(), oemFiltered.size(), skippedByTitle, excludeUrls.size());
+
+        // Рабочий набор — дешёвые `limit`. Детально открываем только первые `detailLimit`.
+        List<SearchEntry> working = deduped.size() > limit ? deduped.subList(0, limit) : deduped;
+        int toVisit = Math.min(detailLimit, working.size());
+
+        List<PartPrice> results = new ArrayList<>();
+        int visited = 0;
+        int attempt = 0;
+
+        for (int i = 0; i < working.size(); i++) {
+            SearchEntry e = working.get(i);
+
+            // Кэш детальных данных (соседние OEM выдают тех же конкурентов)
+            CachedPart cached = detailCache.get(e.url());
+            if (cached != null && System.currentTimeMillis() - cached.ts() < CACHE_TTL_MS) {
+                results.add(cached.part());
+                continue;
+            }
+
+            // За пределами detailLimit — лёгкая запись со страницы поиска (без захода)
+            if (i >= toVisit) {
+                if (e.price() != null) results.add(lightweightPart(e, region));
+                continue;
+            }
+
+            if (attempt > 0) {
+                try { Thread.sleep(500 + (long) (Math.random() * 500)); }
+                catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            }
+            attempt++;
+            log.info("[деталь {}/{}] {}", visited + 1, toVisit, e.url());
+
+            try {
+                navigateWithRetry(page, e.url(), searchUrl);
+                page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+                Thread.sleep(500);
+
+                if (hasCaptcha(page)) {
+                    log.info("Капча на детальной странице: {}", e.url());
+                    boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
+                    if (!solved) solved = waitForManualCaptcha(page);
+                    if (!solved) {
+                        noteCaptchaBlocked();
+                        log.warn("Капча не решена; используем данные со страницы поиска: {}", e.url());
+                        if (e.price() != null) results.add(lightweightPart(e, region));
+                        continue;
+                    }
+                    saveSession(ctx, sessionFile);
+                    page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+                    Thread.sleep(500);
+                }
+
+                PartPrice part = extractPartFromPage(page, e.url());
+                if (part != null) {
+                    results.add(part);
+                    detailCache.put(e.url(), new CachedPart(part, System.currentTimeMillis()));
+                    visited++;
+                } else if (e.price() != null) {
+                    results.add(lightweightPart(e, region));   // детально не вышло, но цена со страницы поиска есть
+                }
+            } catch (Exception ex) {
+                log.warn("Ошибка [{}]: {}", e.url(), ex.getMessage());
+                if (e.price() != null) results.add(lightweightPart(e, region));   // фолбэк на данные поиска
+            }
+        }
+
+        results.sort((a, b2) -> a.getPrice().compareTo(b2.getPrice()));
+        log.info("Собрано в [{}]: {} предложений (детально: {})", region, results.size(), visited);
+        return results;
     }
 
     /** Лёгкая запись конкурента из данных страницы поиска (без захода на детальную). */
@@ -991,7 +1048,18 @@ public class DromParser {
             opts.setStorageStatePath(sessionFile);
             log.debug("Загружена сохранённая сессия из {}", sessionFile);
         }
-        return b.newContext(opts);
+        BrowserContext ctx = b.newContext(opts);
+        // Ускорение: не качаем картинки/медиа/шрифты/CSS — фото берём из HTML-атрибутов (data-image-info),
+        // а DOM-селекторы не зависят от визуального рендера. Через медленный мобильный прокси это +2–3× к скорости.
+        ctx.route("**/*", route -> {
+            String type = route.request().resourceType();
+            if (type.equals("image") || type.equals("media") || type.equals("font") || type.equals("stylesheet")) {
+                route.abort();
+            } else {
+                route.resume();
+            }
+        });
+        return ctx;
     }
 
     private void saveSession(BrowserContext ctx) {

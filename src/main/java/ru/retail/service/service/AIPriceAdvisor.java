@@ -87,21 +87,26 @@ public class AIPriceAdvisor {
             PhotoAssessment myPhoto = evaluatePhotosAsync(myListing.getPhotoUrls(), myListing.getTitle()).join();
             log.info("Мои фото: {} (коэф. {})", myPhoto.condition(), myPhoto.coefficient());
 
-            // ШАГ 2: Vision только для городских конкурентов ≤ моей цены × 1.10
-            // Необоценённые конкуренты получают коэффициент = мой, чтобы не вызывать ложный "better"
+            // ШАГ 2: классификации города и НСК идут ПАРАЛЛЕЛЬНО (две независимые LLM-задачи).
+            // НСК (без vision) запускаем сразу — пусть его текстовый запрос перекрывает vision города.
+            CompletableFuture<CompetitorClassification> siberiaFut;
+            if (!siberiaPrices.isEmpty()) {
+                log.info("Шаг 2b/3: Попарное сравнение {} новосибирских конкурентов (без vision, параллельно)...", siberiaPrices.size());
+                List<PhotoAssessment> neutralPhotos = Collections.nCopies(
+                        siberiaPrices.size(), new PhotoAssessment("неизвестно", "", myPhoto.coefficient()));
+                siberiaFut = CompletableFuture.supplyAsync(
+                        () -> classifyCompetitors(siberiaPrices, neutralPhotos, myListing, myPhoto, false), photoExecutor);
+            } else {
+                siberiaFut = CompletableFuture.completedFuture(CompetitorClassification.empty());
+            }
+
+            // Город: vision только для конкурентов ≤ моей цены × 1.10; необоценённым — коэф. = мой (без ложного "better")
             log.info("Шаг 2/3: Попарное сравнение {} городских конкурентов...", cityPrices.size());
             List<PhotoAssessment> cityPhotos = evaluatePhotosSelective(cityPrices, myCurrentPrice, myPhoto.coefficient());
             CompetitorClassification cityClassification = classifyCompetitors(
                     cityPrices, cityPhotos, myListing, myPhoto, isVisionActive());
 
-            // НСК: без vision — нейтральный коэффициент = мой, чтобы избежать ложной классификации
-            CompetitorClassification siberiaClassification = CompetitorClassification.empty();
-            if (!siberiaPrices.isEmpty()) {
-                log.info("Шаг 2b/3: Попарное сравнение {} новосибирских конкурентов (без vision)...", siberiaPrices.size());
-                List<PhotoAssessment> neutralPhotos = Collections.nCopies(
-                        siberiaPrices.size(), new PhotoAssessment("неизвестно", "", myPhoto.coefficient()));
-                siberiaClassification = classifyCompetitors(siberiaPrices, neutralPhotos, myListing, myPhoto, false);
-            }
+            CompetitorClassification siberiaClassification = siberiaFut.join();
 
             // ШАГ 3: Стратегия ценообразования
             log.info("Шаг 3/3: Расчёт конкурентной цены...");

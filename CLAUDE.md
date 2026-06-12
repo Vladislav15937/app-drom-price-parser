@@ -34,6 +34,8 @@ PriceAnalyzer              (оркестрация + статистика)
 - `parseMyListing(url)` → `MyListingInfo` (моё объявление: описание, дата, фото, цена)
 - `parseParts(oem, region)` → до 10 объявлений конкурентов в регионе
 - `findMyListingUrl(oem, region, company)` → URL моего объявления по имени компании на странице поиска (без захода на детальные страницы)
+- `parseCityWithMyListing(oem, region, limit, company)` → `CityParseResult(myListingUrl, competitors)` за ОДНУ загрузку страницы поиска (используется в `analyzeFromCatalog` вместо `findMyListingUrl`+`parseParts`). Общие шаги вынесены в `loadSearchEntries`/`processSearchEntries`.
+- Ускорение: контекст блокирует загрузку картинок/CSS/шрифтов/медиа (`ctx.route`); фото берём из HTML-атрибутов
 - Извлечение фото: `data-image-info` JSON атрибут → `static.baza.drom.ru` img → og:image. Фото на baza.drom.ru **без расширений** в URL — не фильтровать по `*.jpg`.
 - Дата публикации: селектор `.viewbull-actual-date`
 - При CAPTCHA в headless-режиме возвращает пустой список; в GUI-режиме ждёт ручного решения 120 с
