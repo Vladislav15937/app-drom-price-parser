@@ -46,6 +46,7 @@ public class DromParser {
 
     private static final int DEFAULT_DETAIL_LIMIT = 6;   // сколько детальных страниц реально открываем
     private static final long CACHE_TTL_MS = 30 * 60 * 1000L;
+    private static final int NAV_TIMEOUT_MS = 30_000;    // тайм-аут навигации: быстрый фейл + ретрай вместо 90с зависаний
 
     private static final List<String> SKIP_TITLE_KEYWORDS = List.of(
             "ремкомплект", "ремонтный", "поршень", "направляющ",
@@ -63,6 +64,15 @@ public class DromParser {
     // Кэш детально разобранных объявлений по URL — соседние OEM выдают тех же конкурентов
     private record CachedPart(PartPrice part, long ts) {}
     private final ConcurrentHashMap<String, CachedPart> detailCache = new ConcurrentHashMap<>();
+
+    // Предохранитель прокси: сколько запросов подряд упали с ошибкой соединения через прокси
+    private static final int PROXY_DOWN_THRESHOLD = 5;
+    private volatile int consecutiveProxyErrors = 0;
+
+    // Предохранитель капчи: сколько нерешаемых капч подряд (drom помечает IP после интенсивного парсинга).
+    // Любая успешная загрузка страницы сбрасывает счётчик (см. proxyOk()).
+    private static final int CAPTCHA_BLOCK_THRESHOLD = 3;
+    private volatile int consecutiveCaptchaFails = 0;
 
     @Value("${drom.headless:true}")
     private boolean headless;
@@ -266,23 +276,19 @@ public class DromParser {
         BrowserContext ctx = newContext();
         Page page = newPage(ctx);
         try {
-            page.navigate(url, new Page.NavigateOptions().setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
+            navigateWithRetry(page, url, null);
             page.waitForLoadState(LoadState.DOMCONTENTLOADED);
             Thread.sleep(1500);
 
             if (hasCaptcha(page)) {
                 boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
+                if (!solved) solved = waitForManualCaptcha(page);
                 if (!solved) {
-                    if (!headless) {
-                        log.info("Капча на объявлении — жду ручного решения 120 сек...");
-                        page.waitForFunction("() => { try { return !document.body.innerText.includes('Вы не робот'); } catch(e) { return false; } }",
-                                null, new Page.WaitForFunctionOptions().setTimeout(120_000));
-                    } else {
-                        log.warn("Капча на моём объявлении, автоматическое решение не помогло. Данные недоступны.");
-                        return MyListingInfo.builder()
-                                .description("").condition("не указано").manufacturer("не указано")
-                                .photoUrls(List.of()).price(BigDecimal.ZERO).build();
-                    }
+                    noteCaptchaBlocked();
+                    log.warn("Капча на моём объявлении не решена. Данные недоступны.");
+                    return MyListingInfo.builder()
+                            .description("").condition("не указано").manufacturer("не указано")
+                            .photoUrls(List.of()).price(BigDecimal.ZERO).build();
                 }
                 page.waitForLoadState(LoadState.DOMCONTENTLOADED);
                 Thread.sleep(1000);
@@ -307,6 +313,7 @@ public class DromParser {
             log.info("Моё объявление: {} — {}₽, дата: {}, фото: {}",
                     title.length() > 50 ? title.substring(0, 50) : title, price, publishedDate, photos.size());
 
+            proxyOk();   // объявление загрузилось — прокси жив
             return MyListingInfo.builder()
                     .title(title)
                     .description(description != null ? description : "")
@@ -320,6 +327,7 @@ public class DromParser {
                     .build();
 
         } catch (Exception e) {
+            noteError(e);
             log.error("Ошибка парсинга моего объявления: {}", e.getMessage());
             return MyListingInfo.builder()
                     .description("").condition("").manufacturer("").photoUrls(List.of())
@@ -370,22 +378,18 @@ public class DromParser {
 
         try {
             // ── Шаг 1: загружаем страницу поиска ──
-            page.navigate(searchUrl, new Page.NavigateOptions().setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
+            navigateWithRetry(page, searchUrl, null);
             Thread.sleep(1500);
 
             if (hasCaptcha(page)) {
                 boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
-                if (solved) saveSession(ctx, sessionFile);
+                if (!solved) solved = waitForManualCaptcha(page);
                 if (!solved) {
-                    if (!headless) {
-                        log.info("Капча на поиске [{}] — жду ручного решения 120 сек...", region);
-                        page.waitForURL(searchUrl, new Page.WaitForURLOptions().setTimeout(120_000));
-                        saveSession(ctx, sessionFile);
-                    } else {
-                        log.error("Капча не решена автоматически, возвращаем пустой результат для [{}].", region);
-                        return List.of();
-                    }
+                    noteCaptchaBlocked();
+                    log.error("Капча на поиске [{}] не решена — пустой результат.", region);
+                    return List.of();
                 }
+                saveSession(ctx, sessionFile);
                 page.waitForLoadState(LoadState.DOMCONTENTLOADED);
             }
 
@@ -394,6 +398,14 @@ public class DromParser {
 
             // ── Шаг 2: собираем объявления прямо со страницы поиска (цена/заголовок/дата уже здесь) ──
             List<SearchEntry> entries = collectSearchEntries(page);
+            proxyOk();   // страница поиска загрузилась — прокси жив
+
+            // Сигнал о поломке скрейпера: объявления есть, но ни у одного не извлеклась цена → селектор сломан
+            if (!entries.isEmpty() && entries.stream().noneMatch(e -> e.price() != null)) {
+                log.error("СЕЛЕКТОР ЦЕНЫ СЛОМАН [{}]: {} объявлений, но 0 цен — проверьте DOM baza.drom.ru (collectSearchEntries)",
+                        region, entries.size());
+            }
+
             Set<String> normalizedExcludes = excludeUrls.stream()
                     .map(u -> u.toLowerCase().replaceAll("/+$", ""))
                     .collect(Collectors.toSet());
@@ -476,28 +488,21 @@ public class DromParser {
                 log.info("[деталь {}/{}] {}", visited + 1, toVisit, e.url());
 
                 try {
-                    page.navigate(e.url(), new Page.NavigateOptions()
-                            .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED)
-                            .setReferer(searchUrl));
+                    navigateWithRetry(page, e.url(), searchUrl);
                     page.waitForLoadState(LoadState.DOMCONTENTLOADED);
                     Thread.sleep(500);
 
                     if (hasCaptcha(page)) {
                         log.info("Капча на детальной странице: {}", e.url());
                         boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
-                        if (solved) saveSession(ctx, sessionFile);
+                        if (!solved) solved = waitForManualCaptcha(page);
                         if (!solved) {
-                            if (!headless) {
-                                log.info("Капча — жду ручного решения 120 сек...");
-                                page.waitForFunction("() => { try { return !document.body.innerText.includes('Вы не робот'); } catch(e) { return false; } }",
-                                        null, new Page.WaitForFunctionOptions().setTimeout(120_000));
-                                saveSession(ctx, sessionFile);
-                            } else {
-                                log.warn("Капча не решена; используем данные со страницы поиска: {}", e.url());
-                                if (e.price() != null) results.add(lightweightPart(e, region));
-                                continue;
-                            }
+                            noteCaptchaBlocked();
+                            log.warn("Капча не решена; используем данные со страницы поиска: {}", e.url());
+                            if (e.price() != null) results.add(lightweightPart(e, region));
+                            continue;
                         }
+                        saveSession(ctx, sessionFile);
                         page.waitForLoadState(LoadState.DOMCONTENTLOADED);
                         Thread.sleep(500);
                     }
@@ -521,6 +526,7 @@ public class DromParser {
             return results;
 
         } catch (Exception e) {
+            noteError(e);
             log.error("Ошибка парсинга [{}]: {}", region, e.getMessage());
             return List.of();
         } finally {
@@ -682,19 +688,17 @@ public class DromParser {
         BrowserContext ctx = newContext();
         Page page = newPage(ctx);
         try {
-            page.navigate(searchUrl, new Page.NavigateOptions()
-                    .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
+            navigateWithRetry(page, searchUrl, null);
             Thread.sleep(3000);
             if (hasCaptcha(page)) {
                 boolean solved = tryClickDromCheckbox(page) || captchaSolver.solve(page);
-                if (solved) saveSession(ctx);
-                if (!solved && !headless) {
-                    page.waitForURL(searchUrl, new Page.WaitForURLOptions().setTimeout(120_000));
-                    saveSession(ctx);
-                } else if (!solved) return null;
+                if (!solved) solved = waitForManualCaptcha(page);
+                if (!solved) { noteCaptchaBlocked(); return null; }
+                saveSession(ctx);
                 page.waitForLoadState(LoadState.DOMCONTENTLOADED);
             }
             Thread.sleep(1500);
+            proxyOk();   // страница загрузилась — прокси жив
             String companyLower = myCompany.toLowerCase();
             return collectSearchEntries(page).stream()
                     .filter(e -> e.dealer().toLowerCase().contains(companyLower))
@@ -702,6 +706,7 @@ public class DromParser {
                     .findFirst()
                     .orElse(null);
         } catch (Exception e) {
+            noteError(e);
             log.warn("findMyListingUrl error: {}", e.getMessage());
             return null;
         } finally {
@@ -1004,8 +1009,8 @@ public class DromParser {
 
     private Page newPage(BrowserContext ctx) {
         Page page = ctx.newPage();
-        page.setDefaultNavigationTimeout(90_000);
-        page.setDefaultTimeout(90_000);
+        page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+        page.setDefaultTimeout(NAV_TIMEOUT_MS);
         page.addInitScript("""
                 // Скрываем признаки headless/automation
                 Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -1051,5 +1056,105 @@ public class DromParser {
 
     private String buildSearchUrl(String oem, String region) {
         return String.format("https://baza.drom.ru/%s/sell_spare_parts/?query=%s", region, oem);
+    }
+
+    /**
+     * Единый фолбэк после неудачного авто-решения капчи.
+     * В режиме видимого браузера даёт человеку шанс решить капчу вручную (до 120 сек).
+     * В headless решать некому → false. Если капча уже признана блокирующей — не ждём впустую.
+     * @return true, если после ожидания капчи на странице больше нет.
+     */
+    private boolean waitForManualCaptcha(Page page) {
+        if (headless || isCaptchaBlocked()) return false;
+        try {
+            log.info("Капча — жду ручного решения 120 сек...");
+            page.waitForFunction(
+                    "() => { try { return !document.body.innerText.includes('Вы не робот') && !location.href.includes('/verify'); } catch(e) { return false; } }",
+                    null, new Page.WaitForFunctionOptions().setTimeout(120_000));
+            return !hasCaptcha(page);
+        } catch (Exception e) {
+            log.warn("Ручное решение капчи не выполнено за 120 сек: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Навигация с коротким тайм-аутом ({@link #NAV_TIMEOUT_MS}) и повтором.
+     * Раньше единичное «зависание» страницы держало поток все 90 с и портило данные
+     * (страница не загрузилась → конкурент уходил «без фото» → ложный worse → завышенная цена).
+     * <p>
+     * {@code ERR_TUNNEL_CONNECTION_FAILED} мобильного прокси «мигает» (падает быстро и восстанавливается),
+     * поэтому туннельные ошибки повторяем до 3 раз с нарастающей паузой — это поглощает кратковременные
+     * провалы IP без ручной ротации. Дорогие тайм-ауты (по 30 с) повторяем лишь 1 раз, чтобы не вернуть
+     * 90-секундные зависания. Если прокси лёг надолго — серия неудач взведёт предохранитель (см. noteError).
+     */
+    private void navigateWithRetry(Page page, String url, String referer) {
+        RuntimeException last = null;
+        int attempt = 0;
+        while (true) {
+            attempt++;
+            try {
+                Page.NavigateOptions opt = new Page.NavigateOptions()
+                        .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED);
+                if (referer != null) opt.setReferer(referer);
+                page.navigate(url, opt);
+                return;
+            } catch (RuntimeException e) {
+                last = e;
+                boolean tunnel = isProxyConnectionError(e);
+                int maxAttempts = tunnel ? 3 : 2;   // туннель падает быстро → больше попыток; тайм-аут дорогой → меньше
+                log.warn("Навигация не удалась (попытка {}/{}, {}) {}: {}",
+                        attempt, maxAttempts, tunnel ? "ERR_TUNNEL" : "прочее", url, e.getMessage());
+                if (attempt >= maxAttempts) throw last;
+                long backoff = tunnel ? 1500L * attempt : 1000L;   // ERR_TUNNEL: 1.5с, 3с — дать IP восстановиться
+                try { Thread.sleep(backoff); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            }
+        }
+    }
+
+    // ==================== ПРЕДОХРАНИТЕЛЬ ПРОКСИ ====================
+
+    /** Прокси «упал»: подряд PROXY_DOWN_THRESHOLD+ ошибок соединения — пора остановить батч. */
+    public boolean isProxyDown() {
+        return consecutiveProxyErrors >= PROXY_DOWN_THRESHOLD;
+    }
+
+    /** drom блокирует капчей: подряд CAPTCHA_BLOCK_THRESHOLD+ нерешённых капч — пора остановить батч. */
+    public boolean isCaptchaBlocked() {
+        return consecutiveCaptchaFails >= CAPTCHA_BLOCK_THRESHOLD;
+    }
+
+    /** Сброс предохранителей перед новым прогоном (после починки прокси/смены IP). */
+    public void resetBreakers() {
+        consecutiveProxyErrors = 0;
+        consecutiveCaptchaFails = 0;
+    }
+
+    /** Капча не решена (ни авто-клик, ни 2captcha, ни ручное в GUI) — фиксируем потенциальный блок. */
+    private void noteCaptchaBlocked() {
+        int n = ++consecutiveCaptchaFails;
+        log.warn("Нерешаемая капча ({} подряд){}", n,
+                n >= CAPTCHA_BLOCK_THRESHOLD ? " — drom БЛОКИРУЕТ IP, батч будет остановлен" : "");
+    }
+
+    /** Страница успешно загрузилась — значит ни прокси, ни капча сейчас не блокируют. */
+    private void proxyOk() {
+        consecutiveProxyErrors = 0;
+        consecutiveCaptchaFails = 0;
+    }
+
+    private void noteError(Exception e) {
+        if (isProxyConnectionError(e)) {
+            int n = ++consecutiveProxyErrors;
+            log.warn("Ошибка соединения через прокси ({} подряд){}", n,
+                    n >= PROXY_DOWN_THRESHOLD ? " — ПРОКСИ НЕДОСТУПЕН, батч будет остановлен" : "");
+        }
+    }
+
+    private boolean isProxyConnectionError(Exception e) {
+        String m = e == null ? null : e.getMessage();
+        return m != null && (m.contains("ERR_TUNNEL_CONNECTION_FAILED")
+                || m.contains("ERR_PROXY_CONNECTION_FAILED")
+                || m.contains("ERR_ABORTED"));
     }
 }

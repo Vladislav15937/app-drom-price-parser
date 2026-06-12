@@ -687,13 +687,28 @@ public class MainWindow extends JFrame {
         try { limitVal = Integer.parseInt(batchLimitField.getText().trim()); } catch (Exception ignored) {}
         int total = (limitVal > 0 && limitVal < batchModel.getRowCount()) ? limitVal : batchModel.getRowCount();
 
+        priceAnalyzer.resetBreakers();   // новый прогон — снимаем взвод предохранителей (прокси/капча) с прошлого раза
+
         executor.submit(() -> {
             int tableRow = 0;
+            java.util.Set<String> seenOems = new java.util.HashSet<>();
             for (String[] csvRow : catalogRows) {
                 if (batchStopped || tableRow >= total) break;
 
                 String oem = col(csvRow, 4);
                 if (oem.isEmpty()) continue;
+
+                // Предохранители: прокси лёг или drom блокирует капчей — продолжать бессмысленно
+                if (priceAnalyzer.isProxyDown() || priceAnalyzer.isCaptchaBlocked()) {
+                    final String msg = priceAnalyzer.isProxyDown()
+                            ? "Прокси недоступен — анализ остановлен. Смените IP/прокси и запустите заново."
+                            : "drom блокирует капчей (IP помечен) — анализ остановлен. Смените IP/прокси и запустите заново.";
+                    SwingUtilities.invokeLater(() -> {
+                        batchStatusLabel.setText(msg);
+                        batchStatusLabel.setForeground(RED);
+                    });
+                    break;
+                }
 
                 BigDecimal catalogPrice = BigDecimal.ZERO;
                 try { catalogPrice = new BigDecimal(col(csvRow, 5).replaceAll("[^\\d.]", "")); }
@@ -702,6 +717,13 @@ public class MainWindow extends JFrame {
                 final int row = tableRow++;
                 final int done = row + 1;
                 final BigDecimal price = catalogPrice;
+
+                // Дедуп: тот же OEM в этом прогоне уже считали — не гоняем повторно
+                String oemKey = oem.replaceAll("[^A-Za-z0-9]", "").toUpperCase();
+                if (!oemKey.isEmpty() && !seenOems.add(oemKey)) {
+                    SwingUtilities.invokeLater(() -> batchModel.setValueAt("Дубликат", row, 6));
+                    continue;
+                }
 
                 SwingUtilities.invokeLater(() -> {
                     batchModel.setValueAt("Анализируется...", row, 6);

@@ -46,6 +46,21 @@ public class PriceAnalyzer {
         nskExecutor.shutdownNow();
     }
 
+    /** Прокси недоступен (подряд много ошибок соединения) — пора остановить пакетную обработку. */
+    public boolean isProxyDown() {
+        return dromParser.isProxyDown();
+    }
+
+    /** drom блокирует нерешаемой капчей (IP помечен) — пора остановить пакетную обработку. */
+    public boolean isCaptchaBlocked() {
+        return dromParser.isCaptchaBlocked();
+    }
+
+    /** Сброс предохранителей (прокси/капча) перед новым пакетным прогоном. */
+    public void resetBreakers() {
+        dromParser.resetBreakers();
+    }
+
     /** Спекулятивно запускает НСК-парсинг в отдельном потоке/браузере, если включено. */
     private Future<List<PartPrice>> startNskIfParallel(String oemNumber, String region) {
         if (parallelNsk && !region.equals(FALLBACK_REGION)) {
@@ -233,6 +248,16 @@ public class PriceAnalyzer {
                 : myListingInfo.getPrice().compareTo(BigDecimal.ZERO) > 0
                         ? myListingInfo.getPrice()
                         : BigDecimal.ZERO;
+
+        // Сигнал о расхождении: цена каталога заметно отличается от живого объявления (уценка/устаревшие данные).
+        BigDecimal livePrice = myListingInfo.getPrice();
+        if (catalogPrice != null && catalogPrice.compareTo(BigDecimal.ZERO) > 0
+                && livePrice != null && livePrice.compareTo(BigDecimal.ZERO) > 0) {
+            double diff = Math.abs(catalogPrice.doubleValue() - livePrice.doubleValue()) / catalogPrice.doubleValue();
+            if (diff > 0.15)
+                log.warn("Цена каталога {}₽ расходится с ценой объявления {}₽ (~{}%) — используем каталог. Проверьте данные (возможна уценка).",
+                        catalogPrice, livePrice, Math.round(diff * 100));
+        }
 
         log.info("Цена: {}₽", myPrice);
 

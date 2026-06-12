@@ -122,7 +122,22 @@
       "Bash(pkill -f \"ru.retail.service.Main\")",
       "Bash(pkill -f \"spring-boot:run\")",
       "Bash(awk '{print $2}')",
-      "Bash(break)"
+      "Bash(break)",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" -q -o compile)",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" -o compile)",
+      "Bash(iconv -f WINDOWS-1251 -t UTF-8 catalog_25-05-26_19-13.csv)",
+      "Bash(awk -F';' '{print NR\": [\"$5\"] цена=[\"$6\"]\"}')",
+      "Bash(nohup \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" -o spring-boot:run)",
+      "Bash(echo \"PID=$!  запущено в фоне\")",
+      "Bash(pkill -f run_compare.sh)",
+      "Bash(pkill -f \"grep -q .ГОТОВО\")",
+      "Bash(pkill -f \"until grep\")",
+      "Bash(echo \"перезапуск, PID=$!\")",
+      "Bash(:)",
+      "Bash(disown)",
+      "Bash(echo \"драйвер запущен, PID=$!\")",
+      "Bash(echo \"перезапуск PID=$!\")",
+      "Bash(awk '/Каталог OEM: 45018SS0A00/{f=1} f&&/Конкурент [0-9]+₽ →|Собрано в|после фильтра|Рекомендация/{print} /Каталог OEM: 26692AE030/{f=0}' /tmp/drom-app.log)"
     ]
   }
 }

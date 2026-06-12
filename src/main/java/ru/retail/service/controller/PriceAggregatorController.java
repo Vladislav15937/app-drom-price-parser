@@ -205,13 +205,37 @@ public class PriceAggregatorController {
 
         executor.submit(() -> {
             try {
-                List<String[]> rows = parseCsv(csvBytes);
+                List<String[]> allRows = parseCsv(csvBytes);
+                // Дедуп по OEM: один и тот же номер в каталоге не обрабатываем повторно
+                // (повторы ели время и давали противоречивые цены при сетевых сбоях).
+                List<String[]> rows = new ArrayList<>();
+                java.util.Set<String> seenOems = new java.util.HashSet<>();
+                int duplicates = 0;
+                for (String[] r : allRows) {
+                    String oemKey = col(r, 4).replaceAll("[^A-Za-z0-9]", "").toUpperCase();
+                    if (oemKey.isBlank()) { rows.add(r); continue; }     // пустой OEM отсеется в цикле
+                    if (seenOems.add(oemKey)) rows.add(r);
+                    else duplicates++;
+                }
+                if (duplicates > 0) log.info("Дедуп каталога: пропущено {} повторных OEM", duplicates);
                 int total = (limit > 0 && limit < rows.size()) ? limit : rows.size();
                 send(emitter, "total", String.valueOf(total));
+
+                priceAnalyzer.resetBreakers();   // новый прогон — снимаем взвод предохранителей с прошлого раза
 
                 int processed = 0;
                 for (int i = 0; i < rows.size() && processed < total; i++) {
                     if (stopped.get()) break;
+                    if (priceAnalyzer.isProxyDown()) {
+                        log.error("Прокси недоступен — останавливаем батч на позиции {}/{}", processed, total);
+                        send(emitter, "error", "Прокси недоступен: батч остановлен. Смените IP/прокси и запустите заново.");
+                        break;
+                    }
+                    if (priceAnalyzer.isCaptchaBlocked()) {
+                        log.error("drom блокирует капчей — останавливаем батч на позиции {}/{}", processed, total);
+                        send(emitter, "error", "drom показывает нерешаемую капчу (IP заблокирован после интенсивного парсинга). Смените IP/прокси или подождите и запустите заново.");
+                        break;
+                    }
                     String[] row = rows.get(i);
                     String oem = col(row, 4);
                     if (oem.isBlank()) continue;

@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
@@ -39,6 +40,12 @@ public class AIPriceAdvisor {
     private final String geminiBaseUrl;
     private final String geminiVisionModel;
     private final ExecutorService photoExecutor = Executors.newFixedThreadPool(3);
+
+    // Кэш классификации по набору конкурентов: один и тот же набор (+ моё объявление + режим vision)
+    // → один и тот же вердикт → одна и та же цена. Убирает остаточный недетерминизм LLM при temperature=0.
+    private static final long CLASSIFICATION_CACHE_TTL_MS = 30 * 60 * 1000L;
+    private record CachedClassification(CompetitorClassification cls, long ts) {}
+    private final ConcurrentHashMap<String, CachedClassification> classificationCache = new ConcurrentHashMap<>();
 
     public AIPriceAdvisor(
             @Value("${deepseek.api.token}") String apiKey,
@@ -125,13 +132,21 @@ public class AIPriceAdvisor {
     private List<PhotoAssessment> evaluatePhotosSelective(List<PartPrice> competitors, BigDecimal myPrice, double neutralCoef) {
         double threshold = myPrice.doubleValue() * 1.10;
         long visionCount = competitors.stream()
-                .filter(p -> p.getPrice().doubleValue() <= threshold).count();
-        log.info("Vision: {} из {} городских конкурентов (цена ≤ {}₽)",
+                .filter(p -> p.getPrice().doubleValue() <= threshold)
+                .filter(p -> p.getPhotoUrls() != null && !p.getPhotoUrls().isEmpty())
+                .count();
+        log.info("Vision: {} из {} городских конкурентов (цена ≤ {}₽, с фото)",
                 visionCount, competitors.size(), String.format("%.0f", threshold));
         List<CompletableFuture<PhotoAssessment>> futures = competitors.stream()
-                .map(p -> p.getPrice().doubleValue() <= threshold
-                        ? evaluatePhotosAsync(p.getPhotoUrls(), p.getTitle())
-                        : CompletableFuture.completedFuture(new PhotoAssessment("неизвестно", "", neutralCoef)))
+                .map(p -> {
+                    boolean hasPhotos = p.getPhotoUrls() != null && !p.getPhotoUrls().isEmpty();
+                    // Пустые фото = деталь не загрузилась (тайм-аут / лёгкая запись со страницы поиска),
+                    // а НЕ «продавец без фото». Не штрафуем как 0.65 → нейтральный коэф. = мой.
+                    if (!hasPhotos || p.getPrice().doubleValue() > threshold) {
+                        return CompletableFuture.completedFuture(new PhotoAssessment("неизвестно", "", neutralCoef));
+                    }
+                    return evaluatePhotosAsync(p.getPhotoUrls(), p.getTitle());
+                })
                 .collect(Collectors.toList());
         return futures.stream().map(CompletableFuture::join).collect(Collectors.toList());
     }
@@ -178,58 +193,70 @@ public class AIPriceAdvisor {
                 coefficient: 0.95-1.0=отличное, 0.80-0.94=хорошее, 0.65-0.79=удовлетворительное, ниже 0.65=плохое
                 """));
 
-        String responseBody = null;
-        try {
-            Map<String, Object> body = new HashMap<>();
-            body.put("model", geminiVisionModel);
-            body.put("messages", List.of(Map.of("role", "user", "content", content)));
-            body.put("temperature", 0.1);
-            body.put("max_tokens", 1500);
+        // 2 попытки: Gemini изредка «уходит в размышления» и возвращает null content (finish_reason=length).
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            String responseBody = null;
+            try {
+                Map<String, Object> body = new HashMap<>();
+                body.put("model", geminiVisionModel);
+                body.put("messages", List.of(Map.of("role", "user", "content", content)));
+                body.put("temperature", 0);   // воспроизводимость оценки
+                body.put("max_tokens", 2500);  // запас, чтобы reasoning не съел весь лимит до JSON
 
-            String json = objectMapper.writeValueAsString(body);
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(geminiBaseUrl))
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", "Bearer " + geminiApiKey)
-                    .POST(HttpRequest.BodyPublishers.ofString(json))
-                    .timeout(Duration.ofSeconds(25))
-                    .build();
+                String json = objectMapper.writeValueAsString(body);
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(geminiBaseUrl))
+                        .header("Content-Type", "application/json")
+                        .header("Authorization", "Bearer " + geminiApiKey)
+                        .POST(HttpRequest.BodyPublishers.ofString(json))
+                        .timeout(Duration.ofSeconds(25))
+                        .build();
 
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            responseBody = resp.body();
-            log.debug("Gemini [{}] HTTP {}: {}", context, resp.statusCode(),
-                    responseBody.substring(0, Math.min(500, responseBody.length())));
+                HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+                responseBody = resp.body();
+                log.debug("Gemini [{}] HTTP {}: {}", context, resp.statusCode(),
+                        responseBody.substring(0, Math.min(500, responseBody.length())));
 
-            if (resp.statusCode() == 429) {
-                log.info("Gemini vision: квота исчерпана (429) для '{}'", context);
-                return new PhotoAssessment("неизвестно", "квота Gemini исчерпана", 0.80);
+                if (resp.statusCode() == 429) {
+                    log.info("Gemini vision: квота исчерпана (429) для '{}'", context);
+                    return new PhotoAssessment("неизвестно", "квота Gemini исчерпана", 0.80);
+                }
+                if (resp.statusCode() != 200) {
+                    log.warn("Gemini vision HTTP {} для '{}' (попытка {}/2): {}", resp.statusCode(), context, attempt,
+                            responseBody.substring(0, Math.min(300, responseBody.length())));
+                    if (attempt < 2) continue;
+                    return new PhotoAssessment("неизвестно", "ошибка Gemini", 0.80);
+                }
+
+                String normalized = responseBody.trim();
+                if (normalized.startsWith("[")) {
+                    normalized = normalized.substring(1, normalized.lastIndexOf(']')).trim();
+                }
+
+                Map<String, Object> map = objectMapper.readValue(normalized, Map.class);
+                List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
+                if (choices == null || choices.isEmpty()) {
+                    throw new IllegalStateException("choices отсутствует: "
+                            + normalized.substring(0, Math.min(300, normalized.length())));
+                }
+                String raw = (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
+                if (raw == null || raw.isBlank()) {
+                    log.warn("Gemini vision: пустой content для '{}' (finish_reason=length, попытка {}/2)", context, attempt);
+                    if (attempt < 2) continue;
+                    return new PhotoAssessment("неизвестно", "пустой ответ Gemini", 0.80);
+                }
+                PhotoAssessment result = parsePhotoAssessment(raw);
+                log.info("Vision [{}]: {} (коэф. {})", context, result.condition(), result.coefficient());
+                return result;
+
+            } catch (Exception e) {
+                log.warn("Vision недоступен для '{}' (попытка {}/2): {}", context, attempt, e.getMessage());
+                if (attempt < 2) {
+                    try { Thread.sleep(600); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                }
             }
-            if (resp.statusCode() != 200) {
-                log.warn("Gemini vision HTTP {} для '{}': {}", resp.statusCode(), context,
-                        responseBody.substring(0, Math.min(300, responseBody.length())));
-                return new PhotoAssessment("неизвестно", "ошибка Gemini", 0.80);
-            }
-
-            String normalized = responseBody.trim();
-            if (normalized.startsWith("[")) {
-                normalized = normalized.substring(1, normalized.lastIndexOf(']')).trim();
-            }
-
-            Map<String, Object> map = objectMapper.readValue(normalized, Map.class);
-            List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
-            if (choices == null || choices.isEmpty()) {
-                throw new IllegalStateException("choices отсутствует: "
-                        + normalized.substring(0, Math.min(300, normalized.length())));
-            }
-            String raw = (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
-            PhotoAssessment result = parsePhotoAssessment(raw);
-            log.info("Vision [{}]: {} (коэф. {})", context, result.condition(), result.coefficient());
-            return result;
-
-        } catch (Exception e) {
-            log.warn("Vision недоступен для '{}': {}. Нейтральный коэф.", context, e.getMessage());
-            return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
         }
+        return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
     }
 
     // ==================== АГЕНТ 2: Попарный классификатор конкурентов ====================
@@ -248,7 +275,20 @@ public class AIPriceAdvisor {
         String myTitle = myListing.getTitle() != null ? myListing.getTitle().toLowerCase() : "";
         String mySide     = extractSide(myTitle);
         String myPosition = extractPosition(myTitle);
-        boolean visionOn  = useVision;
+        // Если МОЁ фото не оценилось (тайм-аут vision → "неизвестно"), нельзя судить конкурентов
+        // по разнице коэффициентов: база ненадёжна. Переходим на текстовое сравнение.
+        boolean myPhotoReliable = !"неизвестно".equals(myPhoto.condition());
+        boolean visionOn  = useVision && myPhotoReliable;
+        if (useVision && !myPhotoReliable)
+            log.info("Моё фото не оценено — сравнение конкурентов по тексту (без коэф. фото)");
+
+        // Кэш по набору конкурентов: тот же набор → тот же вердикт (детерминизм цены)
+        String cacheKey = classificationCacheKey(competitors, myListing, visionOn);
+        CachedClassification cached = classificationCache.get(cacheKey);
+        if (cached != null && System.currentTimeMillis() - cached.ts() < CLASSIFICATION_CACHE_TTL_MS) {
+            log.info("Классификация из кэша: {} конкурентов (vision={})", competitors.size(), visionOn);
+            return cached.cls();
+        }
 
         // --- Моё объявление ---
         StringBuilder sb = new StringBuilder();
@@ -320,7 +360,32 @@ public class AIPriceAdvisor {
 
         String systemPrompt = buildClassifierSystemPrompt(visionOn);
         String response = callTextAI(systemPrompt, sb.toString());
-        return parseCompetitorClassification(response);
+        CompetitorClassification result = parseCompetitorClassification(response);
+
+        // Кэшируем только непустой результат (пустой = сбой LLM, его кэшировать нельзя)
+        boolean nonEmpty = !result.similar().isEmpty() || !result.better().isEmpty() || !result.worse().isEmpty();
+        if (nonEmpty) classificationCache.put(cacheKey, new CachedClassification(result, System.currentTimeMillis()));
+        return result;
+    }
+
+    /**
+     * Ключ кэша классификации: моё объявление (OEM/название/состояние) + отсортированный набор
+     * идентификаторов конкурентов (URL, иначе цена+название) + режим vision. Сортировка делает ключ
+     * независимым от порядка конкурентов.
+     */
+    private String classificationCacheKey(List<PartPrice> competitors, MyListingInfo my, boolean visionOn) {
+        String mine = norm(my.getOem()) + "|" + norm(my.getTitle()) + "|" + norm(my.getCondition());
+        String comps = competitors.stream()
+                .map(p -> (p.getUrl() != null && !p.getUrl().isBlank())
+                        ? p.getUrl().toLowerCase().replaceAll("/+$", "")
+                        : p.getPrice() + "#" + norm(p.getTitle()))
+                .sorted()
+                .collect(Collectors.joining(","));
+        return (visionOn ? "V|" : "T|") + mine + "||" + comps;
+    }
+
+    private static String norm(String s) {
+        return s == null ? "" : s.trim().toLowerCase().replaceAll("\\s+", " ");
     }
 
     private String buildClassifierSystemPrompt(boolean visionOn) {
@@ -415,6 +480,7 @@ public class AIPriceAdvisor {
         BigDecimal target;
         String confidence;
         String reason;
+        int priceBasisCount;   // сколько объявлений реально определили цену — база доверия
 
         if (!similar.isEmpty()) {
             // Анкер — медиана аналогов (конкурентный уровень, а не демпинг под минимум).
@@ -424,14 +490,15 @@ public class AIPriceAdvisor {
             int betterCnt = better.size();   // конкуренты ЛУЧШЕ нас
             int worseCnt  = worse.size();    // конкуренты ХУЖЕ нас
             int total     = betterCnt + worseCnt + similar.size();
+            priceBasisCount = similar.size();   // цену анкерим на медиану аналогов — она и есть база
 
             if (worseCnt > betterCnt) {
-                // Мы превосходим большинство → премия над медианой аналогов (до +15%)
-                double premium = 1.0 + Math.min(0.15, 0.05 * (worseCnt - betterCnt));
-                target     = BigDecimal.valueOf(medSimilar * premium).setScale(0, RoundingMode.HALF_UP);
+                // Мы лучше большинства → стоим НА медиане рынка, БЕЗ надбавки.
+                // Цель — попасть в рынок и продать, а не максимизировать маржу; качество = продаём быстрее при той же цене.
+                target     = BigDecimal.valueOf(medSimilar).setScale(0, RoundingMode.HALF_UP);
                 confidence = total >= 4 ? "высокая" : "средняя";
-                reason     = String.format("%s наш товар лучше %d из %d конкурентов. Медиана аналогов %.0f₽ +%.0f%% → %.0f₽.",
-                        scope, worseCnt, total, medSimilar, (premium - 1) * 100, target.doubleValue());
+                reason     = String.format("%s наш товар лучше %d из %d конкурентов → цена по медиане рынка (без надбавки): %.0f₽.",
+                        scope, worseCnt, total, target.doubleValue());
 
             } else {
                 // Справедливая цена с уклоном в быструю продажу: медиана аналогов −5%,
@@ -447,6 +514,7 @@ public class AIPriceAdvisor {
             double minWorse = worse.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
             target     = BigDecimal.valueOf(minWorse * 1.20).setScale(0, RoundingMode.HALF_UP);
             confidence = "средняя";
+            priceBasisCount = worse.size();
             reason     = String.format("%s наш товар лучше всех конкурентов. Премия +20%% к минимуму (%.0f₽).",
                     scope, minWorse);
 
@@ -454,6 +522,7 @@ public class AIPriceAdvisor {
             double minBetter = better.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
             target     = BigDecimal.valueOf(minBetter * 0.80).setScale(0, RoundingMode.DOWN);
             confidence = "средняя";
+            priceBasisCount = better.size();
             reason     = String.format("%s наш товар хуже конкурентов. Скидка −20%% от минимума (%.0f₽).",
                     scope, minBetter);
 
@@ -461,11 +530,13 @@ public class AIPriceAdvisor {
             target     = myCurrentPrice;
             confidence = "высокая";
             reason     = scope + " аналогов нет. Цена не меняется.";
+            priceBasisCount = stats.count();
 
         } else {
             // Смешанный рынок (есть и better, и worse, нет similar) — позиционируем по балансу
             int betterCnt = better.size();
             int worseCnt  = worse.size();
+            priceBasisCount = betterCnt + worseCnt;
             double net    = (worseCnt - betterCnt) / (double) (betterCnt + worseCnt); // −1..+1
             double factor = 1.0 + 0.15 * net;                                          // ±15% от медианы
             target     = stats.median().multiply(BigDecimal.valueOf(factor)).setScale(0, RoundingMode.HALF_UP);
@@ -481,19 +552,22 @@ public class AIPriceAdvisor {
             target = bounded;
         }
 
-        // Тонкие данные (<3 конкурентов) → ненадёжно. Не двигаем цену резко: не более ±10% от текущей.
-        if (stats.count() < MIN_RELIABLE_COMPETITORS) {
+        // Тонкие данные → ненадёжно. Считаем по числу СОПОСТАВИМЫХ объявлений, определивших цену,
+        // а не по всему рынку: 6 конкурентов, из которых 2 аналога, — это всё ещё тонкие данные.
+        // Не двигаем цену резко: не более ±10% от текущей.
+        int reliableCount = Math.min(stats.count(), priceBasisCount);
+        if (reliableCount < MIN_RELIABLE_COMPETITORS) {
             confidence = "низкая";
             if (myCurrentPrice.compareTo(BigDecimal.ZERO) > 0) {
                 BigDecimal lo = myCurrentPrice.multiply(BigDecimal.valueOf(1 - THIN_DATA_MAX_MOVE)).setScale(0, RoundingMode.DOWN);
                 BigDecimal hi = myCurrentPrice.multiply(BigDecimal.valueOf(1 + THIN_DATA_MAX_MOVE)).setScale(0, RoundingMode.HALF_UP);
                 BigDecimal clamped = target.compareTo(hi) > 0 ? hi : (target.compareTo(lo) < 0 ? lo : target);
                 if (clamped.compareTo(target) != 0) {
-                    reason += String.format(" [мало данных (%d конк.): движение ограничено ±10%% → %.0f₽]",
-                            stats.count(), clamped.doubleValue());
+                    reason += String.format(" [мало сопоставимых данных (%d): движение ограничено ±10%% → %.0f₽]",
+                            reliableCount, clamped.doubleValue());
                     target = clamped;
                 } else {
-                    reason += String.format(" [мало данных (%d конк.): низкая уверенность]", stats.count());
+                    reason += String.format(" [мало сопоставимых данных (%d): низкая уверенность]", reliableCount);
                 }
             }
         }
@@ -588,42 +662,51 @@ public class AIPriceAdvisor {
     // ==================== HTTP ====================
 
     private String callTextAI(String system, String user) {
-        try {
-            Map<String, Object> body = Map.of(
-                    "model", textModel,
-                    "messages", List.of(
-                            Map.of("role", "system", "content", system),
-                            Map.of("role", "user", "content", user)
-                    ),
-                    "temperature", 0.1,
-                    "max_tokens", 2000
-            );
-            String json = objectMapper.writeValueAsString(body);
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(baseUrl))
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", "Bearer " + apiKey)
-                    .POST(HttpRequest.BodyPublishers.ofString(json))
-                    .timeout(Duration.ofSeconds(90))
-                    .build();
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            Object parsed = objectMapper.readValue(resp.body(), Object.class);
-            Map<String, Object> map;
-            if (parsed instanceof List<?> list && !list.isEmpty()) {
-                map = (Map<String, Object>) list.get(0);
-            } else {
-                map = (Map<String, Object>) parsed;
+        // 2 попытки: шлюз изредка отдаёт битый ответ (ERROR_TRUNCATED_HEADERS / нет choices).
+        // Без ретрая теряли всю классификацию региона → цену на неполных данных.
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            try {
+                Map<String, Object> body = Map.of(
+                        "model", textModel,
+                        "messages", List.of(
+                                Map.of("role", "system", "content", system),
+                                Map.of("role", "user", "content", user)
+                        ),
+                        "temperature", 0,   // детерминированная классификация → воспроизводимая цена
+                        "max_tokens", 2000
+                );
+                String json = objectMapper.writeValueAsString(body);
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(baseUrl))
+                        .header("Content-Type", "application/json")
+                        .header("Authorization", "Bearer " + apiKey)
+                        .POST(HttpRequest.BodyPublishers.ofString(json))
+                        .timeout(Duration.ofSeconds(90))
+                        .build();
+                HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+                Object parsed = objectMapper.readValue(resp.body(), Object.class);
+                Map<String, Object> map;
+                if (parsed instanceof List<?> list && !list.isEmpty()) {
+                    map = (Map<String, Object>) list.get(0);
+                } else {
+                    map = (Map<String, Object>) parsed;
+                }
+                List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
+                if (choices == null || choices.isEmpty()) {
+                    String preview = resp.body().substring(0, Math.min(300, resp.body().length()));
+                    throw new IllegalStateException("choices отсутствует в ответе: " + preview);
+                }
+                String content = (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
+                if (content == null || content.isBlank()) throw new IllegalStateException("пустой content в ответе модели");
+                return content;
+            } catch (Exception e) {
+                log.error("Text AI error (попытка {}/2): {}", attempt, e.getMessage());
+                if (attempt < 2) {
+                    try { Thread.sleep(800); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                }
             }
-            List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
-            if (choices == null || choices.isEmpty()) {
-                String preview = resp.body().substring(0, Math.min(300, resp.body().length()));
-                throw new IllegalStateException("choices отсутствует в ответе: " + preview);
-            }
-            return (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
-        } catch (Exception e) {
-            log.error("Text AI error: {}", e.getMessage());
-            return null;
         }
+        return null;
     }
 
     // ==================== ПАРСЕРЫ ОТВЕТОВ ====================
