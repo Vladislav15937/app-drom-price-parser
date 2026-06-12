@@ -61,6 +61,15 @@ PriceAnalyzer              (оркестрация + статистика)
 - Фото-дисконт: если коэф. моего фото < 0.70 → масштабируем цену пропорционально
 - Кэш классификации по набору конкурентов (TTL 30 мин) → один и тот же набор даёт одну цену (детерминизм)
 
+### Параллельный пул (батч на нескольких IP)
+`DromParserPool` (@Service) поднимает N «дорожек» по списку `drom.proxies` (через запятую; пусто → 1 дорожка из `drom.proxy.url`). Дорожка = свой `DromParser` (свой Playwright+браузер + свой прокси/IP + своя сессия `drom-session-{i}.json` + свои предохранители). `DromParser` — два конструктора: Spring-бин (одиночная дорожка, для веб/одиночного анализа) и ручной (для пула). `detailCache` — общий (static) на все дорожки.
+`PriceAnalyzer.analyzeCatalogLane(...,lane)` гоняет OEM на конкретной дорожке; `laneCount()`, `isProxyDown(lane)`, `isCaptchaBlocked(lane)`. `MainWindow.runBatchAnalysis` запускает пул из `laneCount()` воркеров (1 IP на воркера), очередь OEM раздаётся через общий курсор; предохранитель на каждый IP отдельно; Excel-запись потокобезопасна. ИИ-анализ/ценообразование не меняются.
+
+### Excel-отчёт (десктоп-батч)
+`MainWindow.runBatchAnalysis()` после анализа КАЖДОЙ детали дописывает строку в `.xlsx` (`ExcelReport`, Apache POI) и пересохраняет файл (данные не теряются при обрыве). Файл `price-report_<дата>.xlsx` в рабочей папке. Логику анализа/парсинга не трогает.
+Колонки: №, OEM, Запчасть, Авто, **Цена на сайте** (живая цена объявления с drom), **Рекоменд.**, Δ к рынку %, Состояние, Уверенность, Город, НСК, **Ссылка на объявление** (кликабельная гиперссылка), **Причина** (пояснение ИИ).
+«Цена на сайте» и URL берутся из `AggregationResult.myListingPrice/myListingUrl` (заполняются в `PriceAnalyzer`). Цвет строки = цена на сайте vs рекомендованная: **зелёный** — совпадает (±2%), **красный** — ВЫШЕ рынка, **синий** — НИЖЕ рынка, серый — нет данных. Допуск в `createReport()` (0.02).
+
 ### Ключевые DTO
 - `MyListingInfo` — моё объявление (title, description, condition, manufacturer, oem, city, publishedDate, photoUrls, price)
 - `PartPrice` — объявление конкурента (price, url, location, dealer, publishedDate, photoUrls, description)
@@ -84,7 +93,8 @@ PriceAnalyzer              (оркестрация + статистика)
 | `gemini.api.key` | Ключ Gemini для vision-оценки фото (если пусто — vision отключён) |
 | `gemini.api.base-url` | URL Gemini API |
 | `gemini.vision.model` | Модель для vision (default: `gemini-2.0-flash`) |
-| `drom.proxy.url` | Прокси для парсера (опционально, `http://` или `socks5://`) |
+| `drom.proxy.url` | Прокси одиночной дорожки (веб/одиночный анализ), `http://` или `socks5://` |
+| `drom.proxies` | Список прокси пула через запятую (каждый = свой IP = воркер); пусто → 1 дорожка |
 | `twocaptcha.api-key` | Ключ 2captcha для автоматического решения капчи |
 | `twocaptcha.enabled` | Включить автоматическое решение капчи |
 | `apify.enabled` | Использовать Apify вместо Playwright (default: `false`) |

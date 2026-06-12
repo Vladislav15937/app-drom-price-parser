@@ -137,7 +137,17 @@
       "Bash(disown)",
       "Bash(echo \"драйвер запущен, PID=$!\")",
       "Bash(echo \"перезапуск PID=$!\")",
-      "Bash(awk '/Каталог OEM: 45018SS0A00/{f=1} f&&/Конкурент [0-9]+₽ →|Собрано в|после фильтра|Рекомендация/{print} /Каталог OEM: 26692AE030/{f=0}' /tmp/drom-app.log)"
+      "Bash(awk '/Каталог OEM: 45018SS0A00/{f=1} f&&/Конкурент [0-9]+₽ →|Собрано в|после фильтра|Рекомендация/{print} /Каталог OEM: 26692AE030/{f=0}' /tmp/drom-app.log)",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" -o compile -q)",
+      "Bash(unzip -p /tmp/smoke/test.xlsx xl/styles.xml)",
+      "Bash(unzip -p /tmp/smoke/test.xlsx xl/sharedStrings.xml)",
+      "Bash(ps -eo pid,etime,command)",
+      "Bash(pkill -f control_run.sh)",
+      "Bash(ps -o etime= -p 55023)",
+      "Bash(/tmp/control_run.sh *)",
+      "Bash(grep -nA3 'gemini:' src/main/resources/application.yml)",
+      "Bash(pkill -9 -f 'ru.retail.service.Main')",
+      "Bash(/tmp/control10.sh *)"
     ]
   }
 }

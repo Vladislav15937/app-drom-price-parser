@@ -17,6 +17,10 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.math.BigDecimal;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -664,6 +668,19 @@ public class MainWindow extends JFrame {
         }
     }
 
+    /** Создаёт .xlsx-отчёт на текущий прогон (файл с отметкой времени в рабочей папке). */
+    private ExcelReport createReport() {
+        try {
+            String name = "price-report_"
+                    + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")) + ".xlsx";
+            Path path = Paths.get(name).toAbsolutePath();
+            return new ExcelReport(path, 0.02);   // допуск «совпадает» = ±2%
+        } catch (Exception e) {
+            System.err.println("Не удалось создать Excel-отчёт: " + e.getMessage());
+            return null;
+        }
+    }
+
     private void runBatchAnalysis() {
         if (catalogRows.isEmpty()) return;
 
@@ -689,78 +706,112 @@ public class MainWindow extends JFrame {
 
         priceAnalyzer.resetBreakers();   // новый прогон — снимаем взвод предохранителей (прокси/капча) с прошлого раза
 
-        executor.submit(() -> {
-            int tableRow = 0;
-            java.util.Set<String> seenOems = new java.util.HashSet<>();
-            for (String[] csvRow : catalogRows) {
-                if (batchStopped || tableRow >= total) break;
+        final String regionF = region;
+        final String companyF = company;
+        final int totalF = total;
+        final int lanes = Math.max(1, priceAnalyzer.laneCount());
 
-                String oem = col(csvRow, 4);
-                if (oem.isEmpty()) continue;
-
-                // Предохранители: прокси лёг или drom блокирует капчей — продолжать бессмысленно
-                if (priceAnalyzer.isProxyDown() || priceAnalyzer.isCaptchaBlocked()) {
-                    final String msg = priceAnalyzer.isProxyDown()
-                            ? "Прокси недоступен — анализ остановлен. Смените IP/прокси и запустите заново."
-                            : "drom блокирует капчей (IP помечен) — анализ остановлен. Смените IP/прокси и запустите заново.";
-                    SwingUtilities.invokeLater(() -> {
-                        batchStatusLabel.setText(msg);
-                        batchStatusLabel.setForeground(RED);
-                    });
-                    break;
-                }
-
-                BigDecimal catalogPrice = BigDecimal.ZERO;
-                try { catalogPrice = new BigDecimal(col(csvRow, 5).replaceAll("[^\\d.]", "")); }
-                catch (Exception ignored) {}
-
-                final int row = tableRow++;
-                final int done = row + 1;
-                final BigDecimal price = catalogPrice;
-
-                // Дедуп: тот же OEM в этом прогоне уже считали — не гоняем повторно
-                String oemKey = oem.replaceAll("[^A-Za-z0-9]", "").toUpperCase();
-                if (!oemKey.isEmpty() && !seenOems.add(oemKey)) {
-                    SwingUtilities.invokeLater(() -> batchModel.setValueAt("Дубликат", row, 6));
-                    continue;
-                }
-
-                SwingUtilities.invokeLater(() -> {
-                    batchModel.setValueAt("Анализируется...", row, 6);
-                    batchStatusLabel.setText("Анализируется " + done + " / " + total + "...");
-                    batchStatusLabel.setForeground(BLUE);
-                });
-
-                try {
-                    AggregationResult result = priceAnalyzer.analyzeFromCatalog(oem, price, region, company);
-
-                    SwingUtilities.invokeLater(() -> {
-                        batchResults.set(row, result);
-                        boolean found = result.getRecommendedPrice() != null
-                                && result.getRecommendedPrice().compareTo(BigDecimal.ZERO) > 0;
-                        if (found) {
-                            batchModel.setValueAt(formatPrice(result.getRecommendedPrice()) + " ₽", row, 4);
-                            batchModel.setValueAt(
-                                    result.getCityCompetitorCount() + result.getSiberiaCompetitorCount(), row, 5);
-                            batchModel.setValueAt("Готово", row, 6);
-                        } else {
-                            batchModel.setValueAt("—", row, 4);
-                            batchModel.setValueAt(0, row, 5);
-                            batchModel.setValueAt("Не найдено", row, 6);
-                        }
-                        // Если эта строка выбрана — обновить детали
-                        if (batchTable.getSelectedRow() == row) showBatchDetail(result);
-                    });
-                } catch (Exception ex) {
-                    SwingUtilities.invokeLater(() -> batchModel.setValueAt("Ошибка", row, 6));
-                }
+        // ── Готовим задания: дедуп OEM, пропуск пустых; дубликаты сразу помечаем в таблице ──
+        final java.util.List<String[]> taskRows = new java.util.ArrayList<>();
+        final java.util.List<Integer> taskTableRows = new java.util.ArrayList<>();
+        java.util.Set<String> seenOems = new java.util.HashSet<>();
+        int tableRow = 0;
+        for (String[] csvRow : catalogRows) {
+            if (tableRow >= totalF) break;
+            String oem = col(csvRow, 4);
+            if (oem.isEmpty()) continue;
+            final int rowIdx = tableRow++;
+            String oemKey = oem.replaceAll("[^A-Za-z0-9]", "").toUpperCase();
+            if (!oemKey.isEmpty() && !seenOems.add(oemKey)) {
+                SwingUtilities.invokeLater(() -> batchModel.setValueAt("Дубликат", rowIdx, 6));
+                continue;
             }
+            taskRows.add(csvRow);
+            taskTableRows.add(rowIdx);
+        }
+        final int totalTasks = taskRows.size();
+
+        // Диспетчер запускается в фоновом потоке, а внутри поднимает пул из `lanes` воркеров (1 IP на воркера)
+        executor.submit(() -> {
+            final ExcelReport report = createReport();
+            final java.util.concurrent.atomic.AtomicInteger cursor = new java.util.concurrent.atomic.AtomicInteger(0);
+            final java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
+
+            ExecutorService lanePool = Executors.newFixedThreadPool(lanes, r -> {
+                Thread t = new Thread(r, "lane-worker");
+                t.setDaemon(true);
+                return t;
+            });
+
+            for (int L = 0; L < lanes; L++) {
+                final int laneId = L;
+                lanePool.submit(() -> {
+                    while (!batchStopped) {
+                        // Предохранитель на КАЖДЫЙ IP отдельно: сбойная дорожка останавливается, остальные работают
+                        if (priceAnalyzer.isProxyDown(laneId) || priceAnalyzer.isCaptchaBlocked(laneId)) {
+                            SwingUtilities.invokeLater(() -> {
+                                batchStatusLabel.setText("Дорожка " + laneId + ": прокси/капча — остановлена. Смените IP.");
+                                batchStatusLabel.setForeground(RED);
+                            });
+                            break;
+                        }
+                        int idx = cursor.getAndIncrement();
+                        if (idx >= totalTasks) break;
+
+                        final String[] csvRow = taskRows.get(idx);
+                        final int rowIdx = taskTableRows.get(idx);
+                        final String oem = col(csvRow, 4);
+                        final String partName = col(csvRow, 3);
+                        final String car = col(csvRow, 8) + (col(csvRow, 9).isEmpty() ? "" : " " + col(csvRow, 9));
+                        BigDecimal cp = BigDecimal.ZERO;
+                        try { cp = new BigDecimal(col(csvRow, 5).replaceAll("[^\\d.]", "")); } catch (Exception ignored) {}
+                        final BigDecimal price = cp;
+
+                        SwingUtilities.invokeLater(() -> batchModel.setValueAt("Анализ (L" + laneId + ")...", rowIdx, 6));
+
+                        try {
+                            AggregationResult result = priceAnalyzer.analyzeCatalogLane(oem, price, regionF, companyF, laneId);
+                            if (report != null) report.append(oem, partName, car, price, result);
+                            final int d = done.incrementAndGet();
+                            SwingUtilities.invokeLater(() -> {
+                                batchResults.set(rowIdx, result);
+                                boolean found = result.getRecommendedPrice() != null
+                                        && result.getRecommendedPrice().compareTo(BigDecimal.ZERO) > 0;
+                                if (found) {
+                                    batchModel.setValueAt(formatPrice(result.getRecommendedPrice()) + " ₽", rowIdx, 4);
+                                    batchModel.setValueAt(
+                                            result.getCityCompetitorCount() + result.getSiberiaCompetitorCount(), rowIdx, 5);
+                                    batchModel.setValueAt("Готово", rowIdx, 6);
+                                } else {
+                                    batchModel.setValueAt("—", rowIdx, 4);
+                                    batchModel.setValueAt(0, rowIdx, 5);
+                                    batchModel.setValueAt("Не найдено", rowIdx, 6);
+                                }
+                                batchStatusLabel.setText("Готово " + d + " / " + totalTasks + " (дорожек: " + lanes + ")");
+                                batchStatusLabel.setForeground(BLUE);
+                                if (batchTable.getSelectedRow() == rowIdx) showBatchDetail(result);
+                            });
+                        } catch (Exception ex) {
+                            if (report != null) report.append(oem, partName, car, price, null);
+                            SwingUtilities.invokeLater(() -> batchModel.setValueAt("Ошибка", rowIdx, 6));
+                        }
+                    }
+                });
+            }
+
+            lanePool.shutdown();
+            try { lanePool.awaitTermination(24, java.util.concurrent.TimeUnit.HOURS); }
+            catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+
+            if (report != null) report.close();
+            final String reportInfo = report == null ? ""
+                    : "  •  Excel: " + report.path().getFileName() + " (" + report.rows() + " строк)";
 
             SwingUtilities.invokeLater(() -> {
                 batchAnalyzeBtn.setEnabled(true);
                 batchStopBtn.setEnabled(false);
                 analyzeBtn.setEnabled(true);
-                batchStatusLabel.setText(batchStopped ? "Остановлено" : "Анализ завершён");
+                batchStatusLabel.setText((batchStopped ? "Остановлено" : "Анализ завершён") + reportInfo);
                 batchStatusLabel.setForeground(batchStopped ? YELLOW : GREEN);
             });
         });

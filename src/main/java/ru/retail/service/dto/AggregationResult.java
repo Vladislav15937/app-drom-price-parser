@@ -56,6 +56,12 @@ public class AggregationResult {
     @Schema(description = "Дата публикации моего объявления")
     private String myListingDate;
 
+    @Schema(description = "URL моего объявления на drom")
+    private String myListingUrl;
+
+    @Schema(description = "Цена моего объявления на сайте (живая, спарсенная с drom)")
+    private BigDecimal myListingPrice;
+
     @Schema(description = "Краткий вывод по рыночной ситуации")
     private String marketNote;
 

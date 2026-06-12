@@ -41,7 +41,7 @@ public class DromParser {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
     };
 
-    private static final Path SESSION_FILE = Paths.get("drom-session.json");
+    private static final Path DEFAULT_SESSION_FILE = Paths.get("drom-session.json");
     private static final Path NSK_SESSION_FILE = Paths.get("drom-session-nsk.json");
 
     private static final int DEFAULT_DETAIL_LIMIT = 6;   // сколько детальных страниц реально открываем
@@ -61,9 +61,9 @@ public class DromParser {
     private Playwright nskPlaywright;
     private volatile Browser nskBrowser;
 
-    // Кэш детально разобранных объявлений по URL — соседние OEM выдают тех же конкурентов
+    // Кэш детально разобранных объявлений по URL — ОБЩИЙ для всех дорожек (соседние OEM делят конкурентов)
     private record CachedPart(PartPrice part, long ts) {}
-    private final ConcurrentHashMap<String, CachedPart> detailCache = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, CachedPart> detailCache = new ConcurrentHashMap<>();
 
     // Предохранитель прокси: сколько запросов подряд упали с ошибкой соединения через прокси
     private static final int PROXY_DOWN_THRESHOLD = 5;
@@ -74,11 +74,10 @@ public class DromParser {
     private static final int CAPTCHA_BLOCK_THRESHOLD = 3;
     private volatile int consecutiveCaptchaFails = 0;
 
-    @Value("${drom.headless:true}")
-    private boolean headless;
-
-    @Value("${drom.proxy.url:}")
-    private String proxyUrl;
+    private final boolean headless;
+    private final String proxyUrl;
+    private final Path sessionFile;       // своя сессия на дорожку (cookies/капча не пересекаются между IP)
+    private final String laneName;
 
     private final CaptchaSolverService captchaSolver;
     private final ApifyDromService apifyDromService;
@@ -86,11 +85,26 @@ public class DromParser {
     // Фиксированный UA на весь сеанс — смена UA между запросами инвалидирует сессию Drom.ru
     private final String fixedUserAgent = USER_AGENTS[(int) (Math.random() * USER_AGENTS.length)];
 
+    // Spring-бин: одиночная дорожка (drom.proxy.url, drom.headless) — для веб/одиночного анализа
+    @org.springframework.beans.factory.annotation.Autowired
     public DromParser(CaptchaSolverService captchaSolver, ApifyDromService apifyDromService,
-                      LocalSocksProxy localSocksProxy) {
+                      LocalSocksProxy localSocksProxy,
+                      @Value("${drom.proxy.url:}") String proxyUrl,
+                      @Value("${drom.headless:true}") boolean headless) {
+        this(captchaSolver, apifyDromService, localSocksProxy, proxyUrl, DEFAULT_SESSION_FILE, headless, "L0");
+    }
+
+    // Дорожка пула: свой прокси + своя сессия (создаётся вручную из DromParserPool)
+    public DromParser(CaptchaSolverService captchaSolver, ApifyDromService apifyDromService,
+                      LocalSocksProxy localSocksProxy,
+                      String proxyUrl, Path sessionFile, boolean headless, String laneName) {
         this.captchaSolver = captchaSolver;
         this.apifyDromService = apifyDromService;
         this.localSocksProxy = localSocksProxy;
+        this.proxyUrl = proxyUrl;
+        this.sessionFile = sessionFile;
+        this.headless = headless;
+        this.laneName = laneName;
     }
 
     @PostConstruct
@@ -111,13 +125,15 @@ public class DromParser {
                         "--lang=ru-RU",
                         "--window-size=1366,768"
                 ));
-        String localProxyUrl = localSocksProxy.getLocalProxyUrl();
-        if (localProxyUrl != null) {
-            // SOCKS5 с авторизацией: Chromium не поддерживает, используем локальный HTTP-мост
-            launchOptions.setProxy(new Proxy(localProxyUrl));
-            log.info("Прокси: через локальный SOCKS5-мост → {}", localProxyUrl);
-        } else if (proxyUrl != null && !proxyUrl.isBlank()) {
-            launchOptions.setProxy(buildProxy(proxyUrl));
+        if (proxyUrl != null && !proxyUrl.isBlank()) {
+            launchOptions.setProxy(buildProxy(proxyUrl));   // HTTP-прокси дорожки (с авторизацией) — приоритет
+        } else {
+            String localProxyUrl = localSocksProxy.getLocalProxyUrl();
+            if (localProxyUrl != null) {
+                // SOCKS5 с авторизацией: Chromium не поддерживает, используем локальный HTTP-мост
+                launchOptions.setProxy(new Proxy(localProxyUrl));
+                log.info("Прокси: через локальный SOCKS5-мост → {}", localProxyUrl);
+            }
         }
         return launchOptions;
     }
@@ -341,15 +357,15 @@ public class DromParser {
     // ==================== ПАРСИНГ КОНКУРЕНТОВ В ГОРОДЕ ====================
 
     public List<PartPrice> parseParts(String oemNumber, String region) {
-        return parsePartsImpl(oemNumber, region, 10, DEFAULT_DETAIL_LIMIT, Set.of(), browser, SESSION_FILE);
+        return parsePartsImpl(oemNumber, region, 10, DEFAULT_DETAIL_LIMIT, Set.of(), browser, sessionFile);
     }
 
     public List<PartPrice> parseParts(String oemNumber, String region, int limit) {
-        return parsePartsImpl(oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, Set.of(), browser, SESSION_FILE);
+        return parsePartsImpl(oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, Set.of(), browser, sessionFile);
     }
 
     public List<PartPrice> parseParts(String oemNumber, String region, int limit, Set<String> excludeUrls) {
-        return parsePartsImpl(oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, excludeUrls, browser, SESSION_FILE);
+        return parsePartsImpl(oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, excludeUrls, browser, sessionFile);
     }
 
     /** Параллельный парсинг НСК — отдельный браузер/сессия, вызывается из выделенного потока. */
@@ -408,10 +424,10 @@ public class DromParser {
         String searchUrl = buildSearchUrl(oemNumber, region);
         log.info("Поиск моего объявления + конкурентов [{}]: {}", region, searchUrl);
 
-        BrowserContext ctx = newContext(browser, SESSION_FILE);
+        BrowserContext ctx = newContext(browser, sessionFile);
         Page page = newPage(ctx);
         try {
-            List<SearchEntry> entries = loadSearchEntries(page, ctx, SESSION_FILE, searchUrl, region);
+            List<SearchEntry> entries = loadSearchEntries(page, ctx, sessionFile, searchUrl, region);
             if (entries == null) return new CityParseResult(null, List.of());
 
             String companyLower = myCompany.toLowerCase();
@@ -423,7 +439,7 @@ public class DromParser {
             // Моего объявления нет — детали не открываем (как и раньше при пустом findMyListingUrl)
             if (myUrl == null) return new CityParseResult(null, List.of());
 
-            List<PartPrice> competitors = processSearchEntries(page, ctx, SESSION_FILE, searchUrl, entries,
+            List<PartPrice> competitors = processSearchEntries(page, ctx, sessionFile, searchUrl, entries,
                     oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, Set.of(myUrl));
             return new CityParseResult(myUrl, competitors);
         } catch (Exception e) {
@@ -1028,7 +1044,7 @@ public class DromParser {
     }
 
     private BrowserContext newContext() {
-        return newContext(browser, SESSION_FILE);
+        return newContext(browser, sessionFile);
     }
 
     private BrowserContext newContext(Browser b, Path sessionFile) {
@@ -1063,7 +1079,7 @@ public class DromParser {
     }
 
     private void saveSession(BrowserContext ctx) {
-        saveSession(ctx, SESSION_FILE);
+        saveSession(ctx, sessionFile);
     }
 
     private void saveSession(BrowserContext ctx, Path sessionFile) {

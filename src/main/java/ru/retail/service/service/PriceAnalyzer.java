@@ -29,56 +29,27 @@ public class PriceAnalyzer {
     private static final int TOP_N = 5;                    // сколько дешёвых конкурентов берём в каждом регионе
     private static final String FALLBACK_REGION = "novosibirsk";
 
-    private final DromParser dromParser;
+    private final DromParser dromParser;          // одиночная дорожка (веб / одиночный анализ)
+    private final DromParserPool pool;            // пул дорожек (IP) для параллельного батча
     private final AIPriceAdvisor aiAdvisor;
 
-    @Value("${drom.parallel-nsk:false}")
-    private boolean parallelNsk;
+    /** Сколько параллельных дорожек (IP) доступно для батча. */
+    public int laneCount() { return pool.size(); }
 
-    private final ExecutorService nskExecutor = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "nsk-parser");
-        t.setDaemon(true);
-        return t;
-    });
+    /** Предохранитель прокси конкретной дорожки пула. */
+    public boolean isProxyDown(int lane) { return pool.lane(lane).isProxyDown(); }
+    /** Предохранитель капчи конкретной дорожки пула. */
+    public boolean isCaptchaBlocked(int lane) { return pool.lane(lane).isCaptchaBlocked(); }
 
-    @PreDestroy
-    public void shutdown() {
-        nskExecutor.shutdownNow();
-    }
+    /** Прокси недоступен (одиночная дорожка) — для веб-батча/одиночного анализа. */
+    public boolean isProxyDown() { return dromParser.isProxyDown(); }
+    /** drom блокирует капчей (одиночная дорожка). */
+    public boolean isCaptchaBlocked() { return dromParser.isCaptchaBlocked(); }
 
-    /** Прокси недоступен (подряд много ошибок соединения) — пора остановить пакетную обработку. */
-    public boolean isProxyDown() {
-        return dromParser.isProxyDown();
-    }
-
-    /** drom блокирует нерешаемой капчей (IP помечен) — пора остановить пакетную обработку. */
-    public boolean isCaptchaBlocked() {
-        return dromParser.isCaptchaBlocked();
-    }
-
-    /** Сброс предохранителей (прокси/капча) перед новым пакетным прогоном. */
+    /** Сброс предохранителей перед новым прогоном — одиночная дорожка и все дорожки пула. */
     public void resetBreakers() {
         dromParser.resetBreakers();
-    }
-
-    /** Спекулятивно запускает НСК-парсинг в отдельном потоке/браузере, если включено. */
-    private Future<List<PartPrice>> startNskIfParallel(String oemNumber, String region) {
-        if (parallelNsk && !region.equals(FALLBACK_REGION)) {
-            return nskExecutor.submit(() -> dromParser.parsePartsBackground(oemNumber, FALLBACK_REGION, TOP_N));
-        }
-        return null;
-    }
-
-    /** Забирает результат параллельного НСК; при сбое — последовательный фолбэк. */
-    private List<PartPrice> fetchSiberiaRaw(String oemNumber, Future<List<PartPrice>> nskFuture) {
-        if (nskFuture != null) {
-            try {
-                return nskFuture.get();
-            } catch (Exception e) {
-                log.warn("Параллельный НСК упал ({}) — последовательный фолбэк", e.getMessage());
-            }
-        }
-        return dromParser.parseParts(oemNumber, FALLBACK_REGION, TOP_N);
+        for (int i = 0; i < pool.size(); i++) pool.lane(i).resetBreakers();
     }
 
     /**
@@ -94,7 +65,6 @@ public class PriceAnalyzer {
 
         // 1. Парсим моё объявление
         log.info("=== Анализ OEM: {} | Регион: {} ===", oemNumber, region);
-        Future<List<PartPrice>> nskFuture = startNskIfParallel(oemNumber, region);
         MyListingInfo myListing = dromParser.parseMyListing(myListingUrl);
         BigDecimal myPrice = (myPriceOverride != null && myPriceOverride.compareTo(BigDecimal.ZERO) > 0)
                 ? myPriceOverride
@@ -115,11 +85,9 @@ public class PriceAnalyzer {
         boolean searchedNsk = !region.equals(FALLBACK_REGION);
         List<PartPrice> siberiaPrices = Collections.emptyList();
         if (searchedNsk) {
-            List<PartPrice> fallbackRaw = fetchSiberiaRaw(oemNumber, nskFuture);
+            List<PartPrice> fallbackRaw = dromParser.parseParts(oemNumber, FALLBACK_REGION, TOP_N);
             siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
             log.info("{} после фильтра: {} (до фильтра: {})", FALLBACK_REGION, siberiaPrices.size(), fallbackRaw.size());
-        } else if (nskFuture != null) {
-            nskFuture.cancel(true);
         }
 
         // 4. AI-анализ
@@ -152,6 +120,8 @@ public class PriceAnalyzer {
                 .aiReason(ai.reason())
                 .myPhotoAssessment(ai.photoNote())
                 .myListingDate(myListing.getPublishedDate())
+                .myListingUrl(myListingUrl)
+                .myListingPrice(myListing.getPrice())
                 .marketNote(marketNote)
                 .items(cityPrices)
                 .siberiaItems(siberiaPrices)
@@ -211,18 +181,28 @@ public class PriceAnalyzer {
      * Анализирует цену по OEM из каталога.
      * Автоматически находит объявление myCompany на Drom.ru и запускает анализ конкурентов.
      */
+    /** Веб/одиночный путь — одиночная дорожка. */
     public AggregationResult analyzeFromCatalog(
             String oemNumber, BigDecimal catalogPrice, String region, String myCompany) {
+        return analyzeFromCatalog(oemNumber, catalogPrice, region, myCompany, dromParser);
+    }
+
+    /** Параллельный батч — конкретная дорожка пула (свой IP). */
+    public AggregationResult analyzeCatalogLane(
+            String oemNumber, BigDecimal catalogPrice, String region, String myCompany, int lane) {
+        return analyzeFromCatalog(oemNumber, catalogPrice, region, myCompany, pool.lane(lane));
+    }
+
+    private AggregationResult analyzeFromCatalog(
+            String oemNumber, BigDecimal catalogPrice, String region, String myCompany, DromParser p) {
 
         log.info("=== Каталог OEM: {} | Регион: {} | Компания: {} ===", oemNumber, region, myCompany);
 
         // 1. За ОДНУ загрузку страницы поиска: URL нашего объявления (по компании) + конкуренты города.
-        Future<List<PartPrice>> nskFuture = startNskIfParallel(oemNumber, region);
-        DromParser.CityParseResult city = dromParser.parseCityWithMyListing(oemNumber, region, TOP_N, myCompany);
+        DromParser.CityParseResult city = p.parseCityWithMyListing(oemNumber, region, TOP_N, myCompany);
         String myListingUrl = city.myListingUrl();
 
         if (myListingUrl == null) {
-            if (nskFuture != null) nskFuture.cancel(true);
             log.info("Объявлений «{}» для OEM {} не найдено в [{}]", myCompany, oemNumber, region);
             return AggregationResult.builder()
                     .oemNumber(oemNumber)
@@ -240,7 +220,7 @@ public class PriceAnalyzer {
         List<PartPrice> cityPrices = filterAssemblies(city.competitors(), oemNumber);
 
         // 3. Полная информация о нашем объявлении
-        MyListingInfo myListingInfo = dromParser.parseMyListing(myListingUrl);
+        MyListingInfo myListingInfo = p.parseMyListing(myListingUrl);
         BigDecimal myPrice = (catalogPrice != null && catalogPrice.compareTo(BigDecimal.ZERO) > 0)
                 ? catalogPrice
                 : myListingInfo.getPrice().compareTo(BigDecimal.ZERO) > 0
@@ -264,11 +244,9 @@ public class PriceAnalyzer {
         boolean searchedNsk = !region.equals(FALLBACK_REGION);
         List<PartPrice> siberiaPrices = Collections.emptyList();
         if (searchedNsk) {
-            List<PartPrice> fallbackRaw = fetchSiberiaRaw(oemNumber, nskFuture);
+            List<PartPrice> fallbackRaw = p.parseParts(oemNumber, FALLBACK_REGION, TOP_N);
             siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
             log.info("{} после фильтра: {}", FALLBACK_REGION, siberiaPrices.size());
-        } else if (nskFuture != null) {
-            nskFuture.cancel(true);
         }
 
         // 5. AI-анализ
@@ -296,6 +274,8 @@ public class PriceAnalyzer {
                 .aiReason(ai.reason())
                 .myPhotoAssessment(ai.photoNote())
                 .myListingDate(myListingInfo.getPublishedDate())
+                .myListingUrl(myListingUrl)
+                .myListingPrice(myListingInfo.getPrice())
                 .marketNote(buildMarketNote(isOldListing, cityPrices.size(), siberiaPrices.size(), searchedNsk))
                 .items(cityPrices)
                 .siberiaItems(siberiaPrices)

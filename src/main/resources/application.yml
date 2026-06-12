@@ -39,10 +39,11 @@ apify:
     drom-scraper-id: Lz2PWiyvRnFjoINKV
 
 drom:
-  headless: false  # false для отладки, true для продакшена
-  parallel-nsk: false  # true — парсить Новосибирск параллельно городу (отдельный браузер); требует устойчивого прокси
+  headless: true   # пул воркеров работает в headless (4 браузера без окон)
+  # Пул прокси: каждый порт = свой мобильный IP = отдельный параллельный воркер (через запятую, без пробелов)
+  proxies: http://vUfpEz:VeCyFGaP3Ah9@mproxy.site:21115,http://deY5uh:Tye5eh9abzUC@mproxy.site:18656,http://ZYpZyS:UsnAC1BAwhYC@mproxy.site:18007,http://eGPUVe:ZuqreCeB6Up6@mproxy.site:18649
   proxy:
-    url: http://vUfpEz:VeCyFGaP3Ah9@mproxy.site:21115
+    url: http://vUfpEz:VeCyFGaP3Ah9@mproxy.site:21115   # одиночная дорожка (веб/одиночный анализ)
 
 twocaptcha:
   enabled: true   # true для автоматического решения капчи
@@ -50,10 +51,10 @@ twocaptcha:
 
 gemini:
   api:
-    key: sk-8F54DRY3xVtgEQnTdgxGRg
+    key: sk-nEZGI8KIJKM3iwbvFCiVNw
     base-url: https://open.blackroute.space/v1/chat/completions
   vision:
-    model: gemini-3.5-flash
+    model: gemini-2.5-flash-lite   # лёгкая мультимодальная без reasoning (дёшево/быстро); было gemini-3.5-flash
 
 deepseek:
   api:
