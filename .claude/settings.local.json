@@ -147,7 +147,9 @@
       "Bash(/tmp/control_run.sh *)",
       "Bash(grep -nA3 'gemini:' src/main/resources/application.yml)",
       "Bash(pkill -9 -f 'ru.retail.service.Main')",
-      "Bash(/tmp/control10.sh *)"
+      "Bash(/tmp/control10.sh *)",
+      "Bash(pkill -f 'ru.retail.service.Main')",
+      "Bash(pkill -f 'spring-boot:run')"
     ]
   }
 }
