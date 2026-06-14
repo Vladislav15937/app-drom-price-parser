@@ -17,6 +17,10 @@ import ru.retail.service.dto.MyListingInfo;
 import ru.retail.service.dto.PartPrice;
 
 import java.math.BigDecimal;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -27,6 +31,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -74,8 +80,20 @@ public class DromParser {
     private static final int CAPTCHA_BLOCK_THRESHOLD = 3;
     private volatile int consecutiveCaptchaFails = 0;
 
+    // Реактивная ротация IP: при капче дорожка с мобильным прокси крутит IP (mobileproxy.space change-IP ссылка)
+    // вместо остановки батча. Жёсткий стоп — только если ротация не лечит MAX_ROTATIONS_NO_PROGRESS раз подряд
+    // (ни одной успешной страницы между ротациями → прокси мёртв или drom блокирует всю подсеть).
+    private static final int MAX_ROTATIONS_NO_PROGRESS = 4;
+    private static final long ROTATE_APPLY_WAIT_MS = 8000;   // пауза, пока новый IP встаёт на модеме (rt ≈ 3–5 с)
+    private static final HttpClient ROTATE_HTTP = HttpClient.newBuilder()
+            .connectTimeout(java.time.Duration.ofSeconds(15)).build();
+    private volatile int rotationsSinceProgress = 0;
+    private volatile boolean captchaHardBlocked = false;
+    private volatile long totalRotations = 0;   // монотонный счётчик удачных смен IP (для повтора OEM на свежем IP)
+
     private final boolean headless;
     private final String proxyUrl;
+    private final String changeIpUrl;     // change-IP ссылка mobileproxy для этой дорожки (null → ротация выключена)
     private final Path sessionFile;       // своя сессия на дорожку (cookies/капча не пересекаются между IP)
     private final String laneName;
 
@@ -91,13 +109,13 @@ public class DromParser {
                       LocalSocksProxy localSocksProxy,
                       @Value("${drom.proxy.url:}") String proxyUrl,
                       @Value("${drom.headless:true}") boolean headless) {
-        this(captchaSolver, apifyDromService, localSocksProxy, proxyUrl, DEFAULT_SESSION_FILE, headless, "L0");
+        this(captchaSolver, apifyDromService, localSocksProxy, proxyUrl, DEFAULT_SESSION_FILE, headless, "L0", null);
     }
 
-    // Дорожка пула: свой прокси + своя сессия (создаётся вручную из DromParserPool)
+    // Дорожка пула: свой прокси + своя сессия + своя change-IP ссылка (создаётся вручную из DromParserPool)
     public DromParser(CaptchaSolverService captchaSolver, ApifyDromService apifyDromService,
                       LocalSocksProxy localSocksProxy,
-                      String proxyUrl, Path sessionFile, boolean headless, String laneName) {
+                      String proxyUrl, Path sessionFile, boolean headless, String laneName, String changeIpUrl) {
         this.captchaSolver = captchaSolver;
         this.apifyDromService = apifyDromService;
         this.localSocksProxy = localSocksProxy;
@@ -105,6 +123,7 @@ public class DromParser {
         this.sessionFile = sessionFile;
         this.headless = headless;
         this.laneName = laneName;
+        this.changeIpUrl = changeIpUrl;
     }
 
     @PostConstruct
@@ -1203,8 +1222,12 @@ public class DromParser {
         return consecutiveProxyErrors >= PROXY_DOWN_THRESHOLD;
     }
 
-    /** drom блокирует капчей: подряд CAPTCHA_BLOCK_THRESHOLD+ нерешённых капч — пора остановить батч. */
+    /**
+     * drom блокирует капчей. Если ротация IP доступна — стоп наступает лишь когда смена IP не лечит
+     * (captchaHardBlocked). Без ротации — старое поведение: CAPTCHA_BLOCK_THRESHOLD+ капч подряд.
+     */
     public boolean isCaptchaBlocked() {
+        if (canRotate()) return captchaHardBlocked;
         return consecutiveCaptchaFails >= CAPTCHA_BLOCK_THRESHOLD;
     }
 
@@ -1212,19 +1235,97 @@ public class DromParser {
     public void resetBreakers() {
         consecutiveProxyErrors = 0;
         consecutiveCaptchaFails = 0;
+        rotationsSinceProgress = 0;
+        captchaHardBlocked = false;
     }
 
-    /** Капча не решена (ни авто-клик, ни 2captcha, ни ручное в GUI) — фиксируем потенциальный блок. */
+    private boolean canRotate() {
+        return changeIpUrl != null && !changeIpUrl.isBlank();
+    }
+
+    /** Сколько раз дорожка успешно сменила IP (монотонно). Рост во время прогона OEM = была капча → стоит повторить. */
+    public long rotationCount() {
+        return totalRotations;
+    }
+
+    /**
+     * Капча не решена (ни авто-клик, ни 2captcha, ни ручное в GUI).
+     * Если есть change-IP ссылка — реактивно крутим IP и продолжаем (счётчик капч сбрасываем).
+     * Жёсткий стоп — только после MAX_ROTATIONS_NO_PROGRESS ротаций без единой успешной страницы.
+     */
     private void noteCaptchaBlocked() {
         int n = ++consecutiveCaptchaFails;
+        if (canRotate()) {
+            if (rotationsSinceProgress >= MAX_ROTATIONS_NO_PROGRESS) {
+                captchaHardBlocked = true;
+                log.warn("Дорожка {}: капча держится после {} смен IP — прокси/подсеть заблокированы, стоп.",
+                        laneName, rotationsSinceProgress);
+                return;
+            }
+            log.warn("Дорожка {}: нерешаемая капча — меняю IP (ротация {}/{})...",
+                    laneName, rotationsSinceProgress + 1, MAX_ROTATIONS_NO_PROGRESS);
+            if (rotateIp()) {
+                consecutiveCaptchaFails = 0;   // свежий IP — дорожка снова рабочая, следующий OEM пойдёт с него
+            }
+            return;
+        }
         log.warn("Нерешаемая капча ({} подряд){}", n,
                 n >= CAPTCHA_BLOCK_THRESHOLD ? " — drom БЛОКИРУЕТ IP, батч будет остановлен" : "");
+    }
+
+    /**
+     * Меняет внешний IP мобильного прокси через change-IP ссылку mobileproxy.space.
+     * Чистит сессию (куки привязаны к старому IP), ждёт применения IP. Возвращает true при успехе.
+     */
+    private boolean rotateIp() {
+        if (!canRotate()) return false;
+        String newIp = callRotate(changeIpUrl);
+        // Резервные хосты на случай недоступности основного (см. кабинет mobileproxy)
+        if (newIp == null) newIp = callRotate(changeIpUrl.replace("changeip.mobileproxy.space", "aproxy.site"));
+        if (newIp == null) newIp = callRotate(changeIpUrl.replace("changeip.mobileproxy.space", "81.200.155.214")
+                .replace("https://", "http://"));
+        rotationsSinceProgress++;
+        if (newIp == null) {
+            log.warn("Дорожка {}: смена IP не удалась (ни основная, ни резервные ссылки).", laneName);
+            return false;
+        }
+        try { Files.deleteIfExists(sessionFile); } catch (Exception ignored) {}   // куки старого IP → выбросить
+        try { Thread.sleep(ROTATE_APPLY_WAIT_MS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        totalRotations++;
+        log.info("Дорожка {}: IP сменён → {} (ротаций без успеха: {})", laneName, newIp, rotationsSinceProgress);
+        return true;
+    }
+
+    /** GET по change-IP ссылке; в ответ JSON {"status":"OK","new_ip":...}. Возвращает new_ip или null. */
+    private String callRotate(String url) {
+        try {
+            String full = url + (url.contains("?") ? "&" : "?") + "format=json";
+            HttpResponse<String> resp = ROTATE_HTTP.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(full))
+                            .header("User-Agent", fixedUserAgent)   // программный вызов требует UA браузера
+                            .timeout(java.time.Duration.ofSeconds(30))
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            String body = resp.body();
+            if (body == null) return null;
+            Matcher m = Pattern.compile("\"new_ip\"\\s*:\\s*\"([^\"]+)\"").matcher(body);
+            if (m.find()) return m.group(1);
+            log.debug("Дорожка {}: ротация без new_ip в ответе: {}", laneName,
+                    body.substring(0, Math.min(160, body.length())));
+            return null;
+        } catch (Exception e) {
+            log.debug("Дорожка {}: ошибка вызова change-IP {}: {}", laneName, url, e.getMessage());
+            return null;
+        }
     }
 
     /** Страница успешно загрузилась — значит ни прокси, ни капча сейчас не блокируют. */
     private void proxyOk() {
         consecutiveProxyErrors = 0;
         consecutiveCaptchaFails = 0;
+        rotationsSinceProgress = 0;   // есть прогресс на текущем IP — счётчик «ротаций без толку» обнуляем
+        captchaHardBlocked = false;
     }
 
     private void noteError(Exception e) {

@@ -149,7 +149,14 @@
       "Bash(pkill -9 -f 'ru.retail.service.Main')",
       "Bash(/tmp/control10.sh *)",
       "Bash(pkill -f 'ru.retail.service.Main')",
-      "Bash(pkill -f 'spring-boot:run')"
+      "Bash(pkill -f 'spring-boot:run')",
+      "WebFetch(domain:mobileproxy.space)",
+      "Bash(lsof -nP -iTCP:8081 -sTCP:LISTEN)",
+      "Bash(pkill -9 -f 'spring-boot:run')",
+      "Bash(pkill -9 -f 'ru.retail.service')",
+      "Bash(/usr/libexec/java_home -v 22)",
+      "Bash(JAVA_HOME=$\\(/usr/libexec/java_home -v 22\\) \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" -o -q compile)",
+      "Bash(echo \"EXIT=$?\")"
     ]
   }
 }

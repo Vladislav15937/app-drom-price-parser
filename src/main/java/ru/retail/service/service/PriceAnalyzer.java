@@ -193,7 +193,32 @@ public class PriceAnalyzer {
         return analyzeFromCatalog(oemNumber, catalogPrice, region, myCompany, pool.lane(lane));
     }
 
+    // Сколько раз гонять один OEM, если во время прогона случилась капча со сменой IP (повтор на свежем IP).
+    private static final int MAX_OEM_ATTEMPTS = 3;
+
+    /**
+     * Прогон OEM с повтором при капче: если за время прогона дорожка сменила IP (была нерешаемая капча),
+     * OEM прогоняется заново на свежем IP. Стоп — успех без ротации, жёсткий блок капчи или лимит попыток.
+     */
     private AggregationResult analyzeFromCatalog(
+            String oemNumber, BigDecimal catalogPrice, String region, String myCompany, DromParser p) {
+        AggregationResult res = null;
+        for (int attempt = 1; attempt <= MAX_OEM_ATTEMPTS; attempt++) {
+            long rotBefore = p.rotationCount();
+            res = analyzeFromCatalogOnce(oemNumber, catalogPrice, region, myCompany, p);
+            boolean rotatedDuringRun = p.rotationCount() > rotBefore;
+            if (!rotatedDuringRun || p.isCaptchaBlocked() || attempt >= MAX_OEM_ATTEMPTS) {
+                if (rotatedDuringRun && attempt > 1)
+                    log.info("OEM {}: завершён после смены IP (попыток: {})", oemNumber, attempt);
+                return res;
+            }
+            log.warn("OEM {}: во время прогона сменился IP из-за капчи — повтор на свежем IP (попытка {}/{})",
+                    oemNumber, attempt + 1, MAX_OEM_ATTEMPTS);
+        }
+        return res;
+    }
+
+    private AggregationResult analyzeFromCatalogOnce(
             String oemNumber, BigDecimal catalogPrice, String region, String myCompany, DromParser p) {
 
         log.info("=== Каталог OEM: {} | Регион: {} | Компания: {} ===", oemNumber, region, myCompany);

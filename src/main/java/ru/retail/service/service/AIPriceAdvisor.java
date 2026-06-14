@@ -25,6 +25,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -666,10 +667,14 @@ public class AIPriceAdvisor {
 
     // ==================== HTTP ====================
 
+    /** Сколько раз пробуем текстовый вызов. Троттл шлюза («too many concurrent requests») лечится только ожиданием. */
+    private static final int TEXT_MAX_ATTEMPTS = 5;
+
     private String callTextAI(String system, String user) {
-        // 2 попытки: шлюз изредка отдаёт битый ответ (ERROR_TRUNCATED_HEADERS / нет choices).
-        // Без ретрая теряли всю классификацию региона → цену на неполных данных.
-        for (int attempt = 1; attempt <= 2; attempt++) {
+        // Ретрай с экспоненциальным backoff: шлюз при параллельном батче отдаёт 200 с {"error":"...throttled..."}
+        // (нет choices) — без долгого ожидания обе попытки падали и классификация терялась → ложное «аналогов нет».
+        for (int attempt = 1; attempt <= TEXT_MAX_ATTEMPTS; attempt++) {
+            boolean throttled = false;
             try {
                 Map<String, Object> body = Map.of(
                         "model", textModel,
@@ -689,7 +694,12 @@ public class AIPriceAdvisor {
                         .timeout(Duration.ofSeconds(90))
                         .build();
                 HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-                Object parsed = objectMapper.readValue(resp.body(), Object.class);
+                String bodyStr = resp.body();
+                throttled = resp.statusCode() == 429 || isThrottled(bodyStr);
+                if (throttled) {
+                    throw new IllegalStateException("троттл шлюза: " + preview(bodyStr));
+                }
+                Object parsed = objectMapper.readValue(bodyStr, Object.class);
                 Map<String, Object> map;
                 if (parsed instanceof List<?> list && !list.isEmpty()) {
                     map = (Map<String, Object>) list.get(0);
@@ -698,20 +708,42 @@ public class AIPriceAdvisor {
                 }
                 List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
                 if (choices == null || choices.isEmpty()) {
-                    String preview = resp.body().substring(0, Math.min(300, resp.body().length()));
-                    throw new IllegalStateException("choices отсутствует в ответе: " + preview);
+                    throw new IllegalStateException("choices отсутствует в ответе: " + preview(bodyStr));
                 }
                 String content = (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
                 if (content == null || content.isBlank()) throw new IllegalStateException("пустой content в ответе модели");
                 return content;
             } catch (Exception e) {
-                log.error("Text AI error (попытка {}/2): {}", attempt, e.getMessage());
-                if (attempt < 2) {
-                    try { Thread.sleep(800); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                log.warn("Text AI error (попытка {}/{}{}): {}", attempt, TEXT_MAX_ATTEMPTS,
+                        throttled ? ", троттл" : "", e.getMessage());
+                if (attempt < TEXT_MAX_ATTEMPTS) {
+                    try { Thread.sleep(textBackoffMs(attempt, throttled)); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); return null; }
                 }
             }
         }
+        log.error("Text AI: исчерпаны {} попыток — классификация пропущена", TEXT_MAX_ATTEMPTS);
         return null;
+    }
+
+    /** Ответ-троттл: шлюз отдаёт его с HTTP 200, поэтому ловим по тексту тела. */
+    private static boolean isThrottled(String body) {
+        if (body == null) return false;
+        String b = body.toLowerCase();
+        return b.contains("throttl") || b.contains("too many") || b.contains("rate limit")
+                || b.contains("concurrent request");
+    }
+
+    /** Экспоненциальный backoff + джиттер. Для троттла ждём дольше (виноват параллелизм, а не битый ответ). */
+    private static long textBackoffMs(int attempt, boolean throttled) {
+        long base = throttled ? 1200L : 600L;
+        long cap = throttled ? 15000L : 4000L;
+        long exp = Math.min(cap, base * (1L << (attempt - 1)));   // 1200,2400,4800,9600,15000 (троттл)
+        return exp + ThreadLocalRandom.current().nextLong(0, 500);   // джиттер — рассинхрон параллельных дорожек
+    }
+
+    private static String preview(String body) {
+        return body == null ? "" : body.substring(0, Math.min(300, body.length()));
     }
 
     // ==================== ПАРСЕРЫ ОТВЕТОВ ====================

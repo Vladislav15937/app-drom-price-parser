@@ -41,13 +41,21 @@ apify:
 drom:
   headless: true   # пул воркеров работает в headless (4 браузера без окон)
   # Пул прокси: каждый порт = свой мобильный IP = отдельный параллельный воркер (через запятую, без пробелов)
-  proxies: http://vUfpEz:VeCyFGaP3Ah9@mproxy.site:21115,http://deY5uh:Tye5eh9abzUC@mproxy.site:18656,http://ZYpZyS:UsnAC1BAwhYC@mproxy.site:18007,http://eGPUVe:ZuqreCeB6Up6@mproxy.site:18649
+  # 11992/12051/13078 — до 14-07-2026; 21115 — до 16-06-2026 (истекает первым)
+  proxies: http://ad3DES:Yv5aV4Ek1zac@mproxy.site:11992,http://BYpyD9:cyW6nyj7APpe@mproxy.site:12051,http://ur8uH8:RYSen1yMet4y@mproxy.site:13078,http://vUfpEz:VeCyFGaP3Ah9@mproxy.site:21115
   proxy:
-    url: http://vUfpEz:VeCyFGaP3Ah9@mproxy.site:21115   # одиночная дорожка (веб/одиночный анализ)
+    url: http://ad3DES:Yv5aV4Ek1zac@mproxy.site:11992   # одиночная дорожка (веб/одиночный анализ)
 
 twocaptcha:
-  enabled: true   # true для автоматического решения капчи
+  enabled: false  # капча drom — свой чекбокс /verify (без sitekey), 2captcha тут не работает; решает tryClickDromCheckbox + ротация IP
   api-key: 682948916e47240f5ce9a73ec7c1f4a4 # Ключ с 2captcha.com
+
+# Мобильные прокси mobileproxy.space (mproxy.site): account-токен для авто-дискавери change-IP ссылок.
+# По нему пул на старте тянет proxy_change_ip_url по каждому порту → дорожки реактивно крутят IP при капче.
+mobileproxy:
+  api:
+    url: https://mobileproxy.space/api.html
+    token: 72034cf122d5303fd8d1af82e667b78b
 
 gemini:
   api:
@@ -58,7 +66,7 @@ gemini:
 
 deepseek:
   api:
-    token: sk-v0VUKD3dAXgYlikrioAGwQ
+    token: sk-PpuDMrQhruXT1EffEdde7Q   # ds32-$10 (старый ds32-$1 исчерпан); /v1/chat/completions — полный путь, шлюзу нужен он
     base-url: https://open.blackroute.space/v1/chat/completions
   text:
     model: deepseek-chat
