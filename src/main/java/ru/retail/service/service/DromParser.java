@@ -393,7 +393,9 @@ public class DromParser {
     }
 
     /** Результат комбинированного парсинга города: URL моего объявления + конкуренты (за одну загрузку поиска). */
-    public record CityParseResult(String myListingUrl, List<PartPrice> competitors) {}
+    public record CityParseResult(String myListingUrl, List<PartPrice> competitors, List<MyListingCandidate> myCandidates) {}
+    /** Кандидат «моего объявления» на странице поиска: URL + цена. Нужен для выбора по цене и кэша конкурентов на батч. */
+    public record MyListingCandidate(String url, BigDecimal price) {}
 
     private List<PartPrice> parsePartsImpl(String oemNumber, String region, int limit, int detailLimit,
                                            Set<String> excludeUrls, Browser b, Path sessionFile) {
@@ -432,12 +434,12 @@ public class DromParser {
      * За ОДНУ загрузку страницы поиска: находит URL моего объявления (по имени компании) и парсит конкурентов.
      * Раньше {@code findMyListingUrl} + {@code parseParts} грузили эту страницу дважды на каждый OEM.
      */
-    public CityParseResult parseCityWithMyListing(String oemNumber, String region, int limit, String myCompany) {
+    public CityParseResult parseCityWithMyListing(String oemNumber, String region, int limit, String myCompany, BigDecimal myPrice) {
         // Apify-режим: комбинированную загрузку не делаем (по умолчанию apify выключен)
         if (apifyDromService.isEnabled()) {
             String myUrl = findMyListingUrl(oemNumber, region, myCompany);
-            if (myUrl == null) return new CityParseResult(null, List.of());
-            return new CityParseResult(myUrl, parseParts(oemNumber, region, limit, Set.of(myUrl)));
+            if (myUrl == null) return new CityParseResult(null, List.of(), List.of());
+            return new CityParseResult(myUrl, parseParts(oemNumber, region, limit, Set.of(myUrl)), List.of());
         }
 
         String searchUrl = buildSearchUrl(oemNumber, region);
@@ -447,28 +449,55 @@ public class DromParser {
         Page page = newPage(ctx);
         try {
             List<SearchEntry> entries = loadSearchEntries(page, ctx, sessionFile, searchUrl, region);
-            if (entries == null) return new CityParseResult(null, List.of());
+            if (entries == null) return new CityParseResult(null, List.of(), List.of());
 
+            // Деталь определяется тройкой компания + OEM + ЦЕНА: один OEM может быть у нас несколькими
+            // объявлениями (разное качество/цена). Среди объявлений компании берём то, чья цена ближе
+            // к каталожной (точное совпадение приоритетно). Без цены — первое (старое поведение).
             String companyLower = myCompany.toLowerCase();
-            String myUrl = entries.stream()
+            List<SearchEntry> mine = entries.stream()
                     .filter(e -> e.dealer() != null && e.dealer().toLowerCase().contains(companyLower))
-                    .map(SearchEntry::url)
-                    .findFirst()
-                    .orElse(null);
+                    .collect(Collectors.toList());
+            List<MyListingCandidate> candidates = mine.stream()
+                    .map(e -> new MyListingCandidate(e.url(), e.price()))
+                    .collect(Collectors.toList());
+            SearchEntry chosen = pickMyListingByPrice(mine, myPrice);
+            String myUrl = chosen != null ? chosen.url() : null;
             // Моего объявления нет — детали не открываем (как и раньше при пустом findMyListingUrl)
-            if (myUrl == null) return new CityParseResult(null, List.of());
+            if (myUrl == null) return new CityParseResult(null, List.of(), List.of());
+            if (myPrice != null && myPrice.signum() > 0 && chosen.price() != null)
+                log.info("Моё объявление выбрано по цене: каталог {}₽ → объявление {}₽ ({} вариантов компании)",
+                        myPrice, chosen.price(), mine.size());
 
             List<PartPrice> competitors = processSearchEntries(page, ctx, sessionFile, searchUrl, entries,
                     oemNumber, region, limit, DEFAULT_DETAIL_LIMIT, Set.of(myUrl));
-            return new CityParseResult(myUrl, competitors);
+            return new CityParseResult(myUrl, competitors, candidates);
         } catch (Exception e) {
             noteError(e);
             log.error("Ошибка поиска объявления/конкурентов [{}]: {}", region, e.getMessage());
-            return new CityParseResult(null, List.of());
+            return new CityParseResult(null, List.of(), List.of());
         } finally {
             page.close();
             ctx.close();
         }
+    }
+
+    /**
+     * Выбирает наше объявление среди вариантов компании по близости цены к каталожной.
+     * Точное совпадение выигрывает; при равенстве дистанций — первое по порядку поиска.
+     * Нет цены в каталоге / ни у одного варианта нет цены → первое (прежнее поведение по компании).
+     */
+    private SearchEntry pickMyListingByPrice(List<SearchEntry> mine, BigDecimal targetPrice) {
+        if (mine.isEmpty()) return null;
+        if (targetPrice == null || targetPrice.signum() <= 0) return mine.get(0);
+        SearchEntry best = null;
+        double bestDiff = Double.MAX_VALUE;
+        for (SearchEntry e : mine) {
+            if (e.price() == null) continue;
+            double diff = Math.abs(e.price().doubleValue() - targetPrice.doubleValue());
+            if (diff < bestDiff) { bestDiff = diff; best = e; }
+        }
+        return best != null ? best : mine.get(0);
     }
 
     /** Загружает страницу поиска (с обработкой капчи) и возвращает сырые объявления; null — капча не пройдена. */

@@ -73,6 +73,13 @@ public class MainWindow extends JFrame {
     private DefaultTableModel batchModel;
     private JTable batchTable;
     private List<String[]> catalogRows = new ArrayList<>();
+
+    // CSV-каталог (Windows-1251, ; , кавычки). Колонки (0-idx) нового формата 14-06-26:
+    // 0 Номер товара | 1 Запчасть | 2 Цена | 3 Номер производителя (OEM) | 4 Ткацкая(своб) | 5..6 Ткацкая | 7..9 54 YARD
+    private static final int COL_PART  = 1;   // имя детали («суппорт», «Ремкомплект суппорта», …)
+    private static final int COL_PRICE = 2;   // цена каталога
+    private static final int COL_OEM   = 3;   // номер производителя = OEM для поиска на drom
+    private static final int COL_STOCK = 4;   // Ткацкая (свободно) — остаток на основном складе
     private List<AggregationResult> batchResults = new ArrayList<>();
     private volatile boolean batchStopped = false;
 
@@ -639,26 +646,32 @@ public class MainWindow extends JFrame {
 
     private void loadCsvFile(File file) {
         try {
-            catalogRows = parseCsvFile(file);
+            List<String[]> all = parseCsvFile(file);
+            // Фильтруем catalogRows ОДИН раз: только суппорты в сборе и только с остатком на «Ткацкая».
+            // Так таблица и catalogRows остаются 1:1 — индексы строк в runBatchAnalysis не разъезжаются.
+            catalogRows = new ArrayList<>();
+            int skippedPart = 0, skippedStock = 0;
+            for (String[] row : all) {
+                if (col(row, COL_OEM).isEmpty()) continue;
+                if (!isAssemblyRow(row)) { skippedPart++; continue; }   // ремкомплект/поршень/направляющая
+                if (!inStock(row))       { skippedStock++; continue; }  // нет на складе «Ткацкая»
+                catalogRows.add(row);
+            }
             batchModel.setRowCount(0);
             for (String[] row : catalogRows) {
-                String oem      = col(row, 4);
-                String partName = col(row, 3);
-                String brand    = col(row, 8);
-                String model    = col(row, 9);
-                String price    = col(row, 5);
-                if (oem.isEmpty()) continue;
+                String price = col(row, COL_PRICE);
                 batchModel.addRow(new Object[]{
-                        oem,
-                        partName,
-                        brand + (model.isEmpty() ? "" : " " + model),
+                        col(row, COL_OEM),
+                        col(row, COL_PART),
+                        "—",   // марка/модель авто в новом формате отсутствуют
                         price.isEmpty() ? "—" : price,
                         "—", "—", "Ожидает"
                 });
             }
             int count = batchModel.getRowCount();
             batchResults = new ArrayList<>(Collections.nCopies(count, null));
-            batchStatusLabel.setText("Загружено строк: " + count);
+            batchStatusLabel.setText(String.format(
+                    "Загружено: %d (пропущено не-суппортов: %d, нет на складе: %d)", count, skippedPart, skippedStock));
             batchStatusLabel.setForeground(GREEN);
             batchAnalyzeBtn.setEnabled(count > 0);
             clearBatchDetail();
@@ -666,6 +679,20 @@ public class MainWindow extends JFrame {
             batchStatusLabel.setText("Ошибка чтения файла: " + ex.getMessage());
             batchStatusLabel.setForeground(RED);
         }
+    }
+
+    /** Берём только суппорты в сборе (вкл. «Уценка!»). Ремкомплект/поршень/направляющая — другой товар:
+     *  их цены несравнимы с суппортами в сборе на drom (классификатор отсеивает такие у конкурентов). */
+    private boolean isAssemblyRow(String[] row) {
+        String p = col(row, COL_PART).toLowerCase();
+        if (!p.contains("суппорт")) return false;
+        return !(p.contains("ремкомплект") || p.contains("поршень") || p.contains("направля"));
+    }
+
+    /** Только то, что реально на складе: «Ткацкая (свободно) > 0». */
+    private boolean inStock(String[] row) {
+        try { return Integer.parseInt(col(row, COL_STOCK).replaceAll("[^\\d-]", "")) > 0; }
+        catch (Exception e) { return false; }
     }
 
     /** Создаёт .xlsx-отчёт на текущий прогон (файл с отметкой времени в рабочей папке). */
@@ -711,21 +738,17 @@ public class MainWindow extends JFrame {
         final int totalF = total;
         final int lanes = Math.max(1, priceAnalyzer.laneCount());
 
-        // ── Готовим задания: дедуп OEM, пропуск пустых; дубликаты сразу помечаем в таблице ──
+        // ── Готовим задания: анализируем КАЖДУЮ строку. Дубли OEM — это РАЗНЫЕ наши объявления
+        // (один OEM, но разное качество/цена), поэтому НЕ дедупим: деталь определяется тройкой
+        // компания (YARD86) + OEM + цена. Конкретное объявление на drom выбирается по цене в PriceAnalyzer.
         final java.util.List<String[]> taskRows = new java.util.ArrayList<>();
         final java.util.List<Integer> taskTableRows = new java.util.ArrayList<>();
-        java.util.Set<String> seenOems = new java.util.HashSet<>();
         int tableRow = 0;
         for (String[] csvRow : catalogRows) {
             if (tableRow >= totalF) break;
-            String oem = col(csvRow, 4);
+            String oem = col(csvRow, COL_OEM);
             if (oem.isEmpty()) continue;
             final int rowIdx = tableRow++;
-            String oemKey = oem.replaceAll("[^A-Za-z0-9]", "").toUpperCase();
-            if (!oemKey.isEmpty() && !seenOems.add(oemKey)) {
-                SwingUtilities.invokeLater(() -> batchModel.setValueAt("Дубликат", rowIdx, 6));
-                continue;
-            }
             taskRows.add(csvRow);
             taskTableRows.add(rowIdx);
         }
@@ -760,11 +783,11 @@ public class MainWindow extends JFrame {
 
                         final String[] csvRow = taskRows.get(idx);
                         final int rowIdx = taskTableRows.get(idx);
-                        final String oem = col(csvRow, 4);
-                        final String partName = col(csvRow, 3);
-                        final String car = col(csvRow, 8) + (col(csvRow, 9).isEmpty() ? "" : " " + col(csvRow, 9));
+                        final String oem = col(csvRow, COL_OEM);
+                        final String partName = col(csvRow, COL_PART);
+                        final String car = "";   // марка/модель авто в новом формате отсутствуют
                         BigDecimal cp = BigDecimal.ZERO;
-                        try { cp = new BigDecimal(col(csvRow, 5).replaceAll("[^\\d.]", "")); } catch (Exception ignored) {}
+                        try { cp = new BigDecimal(col(csvRow, COL_PRICE).replaceAll("[^\\d.]", "")); } catch (Exception ignored) {}
                         final BigDecimal price = cp;
 
                         SwingUtilities.invokeLater(() -> batchModel.setValueAt("Анализ (L" + laneId + ")...", rowIdx, 6));

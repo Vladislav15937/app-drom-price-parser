@@ -25,6 +25,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
@@ -41,6 +42,14 @@ public class AIPriceAdvisor {
     private final String geminiBaseUrl;
     private final String geminiVisionModel;
     private final ExecutorService photoExecutor = Executors.newFixedThreadPool(3);
+
+    // Один шлюз open.blackroute.space обслуживает И текст (deepseek), И vision (gemini), и режет именно
+    // КОНКУРЕНТНЫЕ запросы ("too many concurrent requests" / Vertex 429). 4 дорожки × (vision-пул из 3 +
+    // классификация) дают всплеск до ~7 одновременных вызовов → массовый троттл. Общий семафор держит
+    // число одновременных обращений к шлюзу по ОБОИМ маршрутам в узде. Бин один на все дорожки → лимит глобальный.
+    // Подбирается опытно: шлюз очень чувствителен, 2 — безопасный старт (быстрее ≠ важнее корректности ИИ-анализа).
+    private static final int GATEWAY_MAX_CONCURRENT = 2;
+    private final Semaphore gatewayLimiter = new Semaphore(GATEWAY_MAX_CONCURRENT, true);
 
     // Кэш классификации по набору конкурентов: один и тот же набор (+ моё объявление + режим vision)
     // → один и тот же вердикт → одна и та же цена. Убирает остаточный недетерминизм LLM при temperature=0.
@@ -199,16 +208,18 @@ public class AIPriceAdvisor {
                 coefficient: 0.95-1.0=отличное, 0.80-0.94=хорошее, 0.65-0.79=удовлетворительное, ниже 0.65=плохое
                 """));
 
-        // 2 попытки: Gemini изредка «уходит в размышления» и возвращает null content (finish_reason=length).
-        for (int attempt = 1; attempt <= 2; attempt++) {
-            String responseBody = null;
+        // Троттл шлюза (429 / "concurrent requests") НЕ сдаём — крутим до вменяемого ответа (как и текст).
+        // Прочие сбои (пустой content при finish_reason=length, битый JSON, не-200) — ограниченно, затем нейтрально.
+        int contentErrors = 0;
+        int throttleWait = 0;
+        while (true) {
+            boolean throttled = false;
             try {
                 Map<String, Object> body = new HashMap<>();
                 body.put("model", geminiVisionModel);
                 body.put("messages", List.of(Map.of("role", "user", "content", content)));
                 body.put("temperature", 0);   // воспроизводимость оценки
                 body.put("max_tokens", 2500);  // запас, чтобы reasoning не съел весь лимит до JSON
-
                 String json = objectMapper.writeValueAsString(body);
                 HttpRequest req = HttpRequest.newBuilder()
                         .uri(URI.create(geminiBaseUrl))
@@ -218,27 +229,35 @@ public class AIPriceAdvisor {
                         .timeout(Duration.ofSeconds(25))
                         .build();
 
-                HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-                responseBody = resp.body();
-                log.debug("Gemini [{}] HTTP {}: {}", context, resp.statusCode(),
+                String responseBody;
+                int status;
+                gatewayLimiter.acquire();   // общий лимит на шлюз (текст+vision)
+                try {
+                    HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+                    responseBody = resp.body();
+                    status = resp.statusCode();
+                } finally {
+                    gatewayLimiter.release();
+                }
+                log.debug("Gemini [{}] HTTP {}: {}", context, status,
                         responseBody.substring(0, Math.min(500, responseBody.length())));
 
-                if (resp.statusCode() == 429) {
-                    log.info("Gemini vision: квота исчерпана (429) для '{}'", context);
-                    return new PhotoAssessment("неизвестно", "квота Gemini исчерпана", 0.80);
-                }
-                if (resp.statusCode() != 200) {
-                    log.warn("Gemini vision HTTP {} для '{}' (попытка {}/2): {}", resp.statusCode(), context, attempt,
-                            responseBody.substring(0, Math.min(300, responseBody.length())));
-                    if (attempt < 2) continue;
-                    return new PhotoAssessment("неизвестно", "ошибка Gemini", 0.80);
+                throttled = status == 429 || isThrottled(responseBody);
+                if (throttled) throw new IllegalStateException("троттл Gemini: " + preview(responseBody));
+
+                if (status != 200) {
+                    if (++contentErrors >= VISION_MAX_CONTENT_ERRORS)
+                        return new PhotoAssessment("неизвестно", "ошибка Gemini", 0.80);
+                    log.warn("Gemini vision HTTP {} для '{}' (ошибка {}/{}): {}", status, context,
+                            contentErrors, VISION_MAX_CONTENT_ERRORS, preview(responseBody));
+                    if (!sleepMs(600)) return new PhotoAssessment("неизвестно", "прервано", 0.80);
+                    continue;
                 }
 
                 String normalized = responseBody.trim();
                 if (normalized.startsWith("[")) {
                     normalized = normalized.substring(1, normalized.lastIndexOf(']')).trim();
                 }
-
                 Map<String, Object> map = objectMapper.readValue(normalized, Map.class);
                 List<Map<String, Object>> choices = (List<Map<String, Object>>) map.get("choices");
                 if (choices == null || choices.isEmpty()) {
@@ -247,22 +266,37 @@ public class AIPriceAdvisor {
                 }
                 String raw = (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
                 if (raw == null || raw.isBlank()) {
-                    log.warn("Gemini vision: пустой content для '{}' (finish_reason=length, попытка {}/2)", context, attempt);
-                    if (attempt < 2) continue;
-                    return new PhotoAssessment("неизвестно", "пустой ответ Gemini", 0.80);
+                    if (++contentErrors >= VISION_MAX_CONTENT_ERRORS)
+                        return new PhotoAssessment("неизвестно", "пустой ответ Gemini", 0.80);
+                    log.warn("Gemini vision: пустой content для '{}' (finish_reason=length, ошибка {}/{})",
+                            context, contentErrors, VISION_MAX_CONTENT_ERRORS);
+                    if (!sleepMs(600)) return new PhotoAssessment("неизвестно", "прервано", 0.80);
+                    continue;
                 }
                 PhotoAssessment result = parsePhotoAssessment(raw);
                 log.info("Vision [{}]: {} (коэф. {})", context, result.condition(), result.coefficient());
                 return result;
 
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return new PhotoAssessment("неизвестно", "прервано", 0.80);
             } catch (Exception e) {
-                log.warn("Vision недоступен для '{}' (попытка {}/2): {}", context, attempt, e.getMessage());
-                if (attempt < 2) {
-                    try { Thread.sleep(600); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                if (throttled) {
+                    // Троттл лечится ожиданием — ждём, сколько нужно, не теряя оценку фото.
+                    log.warn("Gemini vision троттл для '{}' (ожидание {}): {}", context, ++throttleWait, e.getMessage());
+                    if (!sleepMs(throttleBackoffMs(throttleWait)))
+                        return new PhotoAssessment("неизвестно", "прервано", 0.80);
+                } else {
+                    if (++contentErrors >= VISION_MAX_CONTENT_ERRORS) {
+                        log.warn("Vision недоступен для '{}' ({} ошибок): {}", context, contentErrors, e.getMessage());
+                        return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
+                    }
+                    log.warn("Vision недоступен для '{}' (ошибка {}/{}): {}",
+                            context, contentErrors, VISION_MAX_CONTENT_ERRORS, e.getMessage());
+                    if (!sleepMs(600)) return new PhotoAssessment("неизвестно", "прервано", 0.80);
                 }
             }
         }
-        return new PhotoAssessment("неизвестно", "оценка недоступна", 0.80);
     }
 
     // ==================== АГЕНТ 2: Попарный классификатор конкурентов ====================
@@ -667,13 +701,19 @@ public class AIPriceAdvisor {
 
     // ==================== HTTP ====================
 
-    /** Сколько раз пробуем текстовый вызов. Троттл шлюза («too many concurrent requests») лечится только ожиданием. */
-    private static final int TEXT_MAX_ATTEMPTS = 5;
+    /** Реальные (НЕ троттл) ошибки текста — битый/пустой ответ, сетевой сбой. После стольки подряд сдаёмся
+     *  (защита от вечного зависания на настоящем сбое/исчерпании бюджета). Троттл этот счётчик НЕ трогает. */
+    private static final int TEXT_MAX_HARD_ERRORS = 6;
+    /** Реальные (НЕ троттл) ошибки vision до перехода на нейтральный коэф. Троттл этот счётчик НЕ трогает. */
+    private static final int VISION_MAX_CONTENT_ERRORS = 3;
 
     private String callTextAI(String system, String user) {
-        // Ретрай с экспоненциальным backoff: шлюз при параллельном батче отдаёт 200 с {"error":"...throttled..."}
-        // (нет choices) — без долгого ожидания обе попытки падали и классификация терялась → ложное «аналогов нет».
-        for (int attempt = 1; attempt <= TEXT_MAX_ATTEMPTS; attempt++) {
+        // Троттл шлюза («too many concurrent requests», 200 с {"error":...}) НЕ сдаём — это «нас слишком много
+        // одновременно», лечится ожиданием. Крутим до вменяемого ответа, чтобы не терять классификацию
+        // (иначе ложное «аналогов нет»). Конкурентность теперь придушена общим семафором gatewayLimiter.
+        int throttleWait = 0;
+        int hardErrors = 0;
+        while (true) {
             boolean throttled = false;
             try {
                 Map<String, Object> body = Map.of(
@@ -693,12 +733,20 @@ public class AIPriceAdvisor {
                         .POST(HttpRequest.BodyPublishers.ofString(json))
                         .timeout(Duration.ofSeconds(90))
                         .build();
-                HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-                String bodyStr = resp.body();
-                throttled = resp.statusCode() == 429 || isThrottled(bodyStr);
-                if (throttled) {
-                    throw new IllegalStateException("троттл шлюза: " + preview(bodyStr));
+
+                String bodyStr;
+                int status;
+                gatewayLimiter.acquire();   // общий лимит на шлюз (текст+vision)
+                try {
+                    HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+                    bodyStr = resp.body();
+                    status = resp.statusCode();
+                } finally {
+                    gatewayLimiter.release();
                 }
+                throttled = status == 429 || isThrottled(bodyStr);
+                if (throttled) throw new IllegalStateException("троттл шлюза: " + preview(bodyStr));
+
                 Object parsed = objectMapper.readValue(bodyStr, Object.class);
                 Map<String, Object> map;
                 if (parsed instanceof List<?> list && !list.isEmpty()) {
@@ -713,17 +761,24 @@ public class AIPriceAdvisor {
                 String content = (String) ((Map<String, Object>) choices.get(0).get("message")).get("content");
                 if (content == null || content.isBlank()) throw new IllegalStateException("пустой content в ответе модели");
                 return content;
+
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return null;
             } catch (Exception e) {
-                log.warn("Text AI error (попытка {}/{}{}): {}", attempt, TEXT_MAX_ATTEMPTS,
-                        throttled ? ", троттл" : "", e.getMessage());
-                if (attempt < TEXT_MAX_ATTEMPTS) {
-                    try { Thread.sleep(textBackoffMs(attempt, throttled)); }
-                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); return null; }
+                if (throttled) {
+                    log.warn("Text AI троттл (ожидание {}): {}", ++throttleWait, e.getMessage());
+                    if (!sleepMs(throttleBackoffMs(throttleWait))) return null;
+                } else {
+                    if (++hardErrors >= TEXT_MAX_HARD_ERRORS) {
+                        log.error("Text AI: {} реальных ошибок подряд — классификация пропущена", hardErrors);
+                        return null;
+                    }
+                    log.warn("Text AI ошибка ({}/{}): {}", hardErrors, TEXT_MAX_HARD_ERRORS, e.getMessage());
+                    if (!sleepMs(textErrorBackoffMs(hardErrors))) return null;
                 }
             }
         }
-        log.error("Text AI: исчерпаны {} попыток — классификация пропущена", TEXT_MAX_ATTEMPTS);
-        return null;
     }
 
     /** Ответ-троттл: шлюз отдаёт его с HTTP 200, поэтому ловим по тексту тела. */
@@ -731,15 +786,24 @@ public class AIPriceAdvisor {
         if (body == null) return false;
         String b = body.toLowerCase();
         return b.contains("throttl") || b.contains("too many") || b.contains("rate limit")
-                || b.contains("concurrent request");
+                || b.contains("concurrent request") || b.contains("error-code-429");
     }
 
-    /** Экспоненциальный backoff + джиттер. Для троттла ждём дольше (виноват параллелизм, а не битый ответ). */
-    private static long textBackoffMs(int attempt, boolean throttled) {
-        long base = throttled ? 1200L : 600L;
-        long cap = throttled ? 15000L : 4000L;
-        long exp = Math.min(cap, base * (1L << (attempt - 1)));   // 1200,2400,4800,9600,15000 (троттл)
+    private boolean sleepMs(long ms) {
+        try { Thread.sleep(ms); return true; }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return false; }
+    }
+
+    /** Троттл: эскалация ожидания 1.2→2.4→4.8→9.6→15с (далее держим 15с). Ретраи не ограничены — ждём шлюз. */
+    private static long throttleBackoffMs(int waitNo) {
+        long exp = Math.min(15000L, 1200L * (1L << Math.min(waitNo - 1, 4)));
         return exp + ThreadLocalRandom.current().nextLong(0, 500);   // джиттер — рассинхрон параллельных дорожек
+    }
+
+    /** Реальная (не троттл) ошибка: короткий экспоненциальный backoff с потолком 4с. */
+    private static long textErrorBackoffMs(int errNo) {
+        long exp = Math.min(4000L, 600L * (1L << (errNo - 1)));
+        return exp + ThreadLocalRandom.current().nextLong(0, 500);
     }
 
     private static String preview(String body) {

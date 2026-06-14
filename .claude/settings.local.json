@@ -156,7 +156,11 @@
       "Bash(pkill -9 -f 'ru.retail.service')",
       "Bash(/usr/libexec/java_home -v 22)",
       "Bash(JAVA_HOME=$\\(/usr/libexec/java_home -v 22\\) \"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" -o -q compile)",
-      "Bash(echo \"EXIT=$?\")"
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(iconv -f WINDOWS-1251 -t UTF-8 \"catalog_14-06-26_19-32.csv\")",
+      "Bash(awk '-F;' ' *)",
+      "Bash(sed -n '/public void resetBreakers/,/^    }/p' src/main/java/ru/retail/service/service/PriceAnalyzer.java)",
+      "Bash(sed -n '1,45p' src/main/java/ru/retail/service/service/PriceAnalyzer.java)"
     ]
   }
 }

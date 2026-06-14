@@ -15,7 +15,9 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -32,6 +34,14 @@ public class PriceAnalyzer {
     private final DromParser dromParser;          // одиночная дорожка (веб / одиночный анализ)
     private final DromParserPool pool;            // пул дорожек (IP) для параллельного батча
     private final AIPriceAdvisor aiAdvisor;
+
+    // Кэш конкурентов на батч (общий на все дорожки): дубли OEM — это РАЗНЫЕ наши объявления, но рынок
+    // конкурентов у них один. Ключ = OEM (как в каталоге) + регион. Кэшируем ТОЛЬКО успешные загрузки
+    // (наше объявление найдено / непустой рынок) — капчевые пустышки кэшировать нельзя, иначе сломается
+    // повтор-на-свежем-IP. Чистится в resetBreakers() в начале каждого батча.
+    private record CityMarket(List<DromParser.MyListingCandidate> candidates, List<PartPrice> competitors) {}
+    private final Map<String, CityMarket> cityCache = new ConcurrentHashMap<>();
+    private final Map<String, List<PartPrice>> nskCache = new ConcurrentHashMap<>();
 
     /** Сколько параллельных дорожек (IP) доступно для батча. */
     public int laneCount() { return pool.size(); }
@@ -50,6 +60,8 @@ public class PriceAnalyzer {
     public void resetBreakers() {
         dromParser.resetBreakers();
         for (int i = 0; i < pool.size(); i++) pool.lane(i).resetBreakers();
+        cityCache.clear();   // новый батч — старый рынок конкурентов не переиспользуем
+        nskCache.clear();
     }
 
     /**
@@ -139,6 +151,20 @@ public class PriceAnalyzer {
         return oem.replaceAll("[^A-Za-z0-9]", "").toUpperCase();
     }
 
+    /** Выбор URL нашего объявления из кэшированных кандидатов по близости цены к каталожной (точное — приоритет). */
+    private String pickUrlByPrice(List<DromParser.MyListingCandidate> candidates, BigDecimal targetPrice) {
+        if (candidates == null || candidates.isEmpty()) return null;
+        if (targetPrice == null || targetPrice.signum() <= 0) return candidates.get(0).url();
+        DromParser.MyListingCandidate best = null;
+        double bestDiff = Double.MAX_VALUE;
+        for (DromParser.MyListingCandidate c : candidates) {
+            if (c.price() == null) continue;
+            double diff = Math.abs(c.price().doubleValue() - targetPrice.doubleValue());
+            if (diff < bestDiff) { bestDiff = diff; best = c; }
+        }
+        return best != null ? best.url() : candidates.get(0).url();
+    }
+
     private List<PartPrice> filterAssemblies(List<PartPrice> parts, String targetOem) {
         String normalizedTarget = normalizeOem(targetOem);
         return parts.stream()
@@ -223,9 +249,25 @@ public class PriceAnalyzer {
 
         log.info("=== Каталог OEM: {} | Регион: {} | Компания: {} ===", oemNumber, region, myCompany);
 
-        // 1. За ОДНУ загрузку страницы поиска: URL нашего объявления (по компании) + конкуренты города.
-        DromParser.CityParseResult city = p.parseCityWithMyListing(oemNumber, region, TOP_N, myCompany);
-        String myListingUrl = city.myListingUrl();
+        // 1. Город: URL нашего объявления (по компании+цене) + конкуренты. Кэш на батч по OEM+регион —
+        //    дубли OEM (наши разные объявления) НЕ грузят страницу поиска drom повторно.
+        String cityKey = oemNumber.trim() + "|" + region;
+        CityMarket cm = cityCache.get(cityKey);
+        String myListingUrl;
+        List<PartPrice> cityPrices;
+        if (cm != null) {
+            myListingUrl = pickUrlByPrice(cm.candidates(), catalogPrice);
+            cityPrices = cm.competitors();
+            log.info("Город из кэша [{}]: конкурентов {}, вариантов «{}» {}",
+                    cityKey, cityPrices.size(), myCompany, cm.candidates().size());
+        } else {
+            DromParser.CityParseResult city = p.parseCityWithMyListing(oemNumber, region, TOP_N, myCompany, catalogPrice);
+            myListingUrl = city.myListingUrl();
+            cityPrices = filterAssemblies(city.competitors(), oemNumber);
+            // Кэшируем только успешную загрузку (наше объявление найдено → страница отрисовалась, не капча).
+            if (myListingUrl != null)
+                cityCache.put(cityKey, new CityMarket(city.myCandidates(), cityPrices));
+        }
 
         if (myListingUrl == null) {
             log.info("Объявлений «{}» для OEM {} не найдено в [{}]", myCompany, oemNumber, region);
@@ -242,7 +284,6 @@ public class PriceAnalyzer {
         }
 
         log.info("Найдено объявление {}: {}", myCompany, myListingUrl);
-        List<PartPrice> cityPrices = filterAssemblies(city.competitors(), oemNumber);
 
         // 3. Полная информация о нашем объявлении
         MyListingInfo myListingInfo = p.parseMyListing(myListingUrl);
@@ -269,9 +310,17 @@ public class PriceAnalyzer {
         boolean searchedNsk = !region.equals(FALLBACK_REGION);
         List<PartPrice> siberiaPrices = Collections.emptyList();
         if (searchedNsk) {
-            List<PartPrice> fallbackRaw = p.parseParts(oemNumber, FALLBACK_REGION, TOP_N);
-            siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
-            log.info("{} после фильтра: {}", FALLBACK_REGION, siberiaPrices.size());
+            String nskKey = oemNumber.trim() + "|" + FALLBACK_REGION;
+            List<PartPrice> cachedNsk = nskCache.get(nskKey);
+            if (cachedNsk != null) {
+                siberiaPrices = cachedNsk;
+                log.info("{} из кэша [{}]: {}", FALLBACK_REGION, nskKey, siberiaPrices.size());
+            } else {
+                List<PartPrice> fallbackRaw = p.parseParts(oemNumber, FALLBACK_REGION, TOP_N);
+                siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
+                log.info("{} после фильтра: {}", FALLBACK_REGION, siberiaPrices.size());
+                if (!siberiaPrices.isEmpty()) nskCache.put(nskKey, siberiaPrices);   // капчевую пустышку не кэшируем
+            }
         }
 
         // 5. AI-анализ
