@@ -353,6 +353,12 @@ public class AIPriceAdvisor {
         // --- Список конкурентов ---
         sb.append("\nКОНКУРЕНТЫ (попарно сравни каждого с МОЁ ОБЪЯВЛЕНИЕ выше):\n");
 
+        // Детерминированные правила: считаем в коде, не доверяем их применение LLM.
+        // forceWorse[i] перебивает вердикт модели на "worse" (см. parseCompetitorClassification).
+        String myManuf = myListing.getManufacturer() != null ? myListing.getManufacturer().toLowerCase() : "";
+        boolean mineOriginal = !isAnalog(myTitle + " " + myManuf);
+        boolean[] forceWorse = new boolean[competitors.size()];
+
         for (int i = 0; i < competitors.size(); i++) {
             PartPrice p = competitors.get(i);
             PhotoAssessment pa = i < photos.size() ? photos.get(i) : new PhotoAssessment("нет фото", "", 0.80);
@@ -381,26 +387,33 @@ public class AIPriceAdvisor {
                 if (pa.defects() != null && !pa.defects().isBlank())
                     sb.append(", дефекты: ").append(pa.defects());
                 sb.append("\n");
-                // Явная подсказка по фото для сравнения
-                double diff = pa.coefficient() - myPhoto.coefficient();
-                if (diff > 0.10)
-                    sb.append("→ фото этого конкурента ЗАМЕТНО ЛУЧШЕ моего\n");
-                else if (diff < -0.10)
-                    sb.append("→ фото этого конкурента ЗАМЕТНО ХУЖЕ моего\n");
-                else
-                    sb.append("→ фото сопоставимо с моим\n");
+                // Сравнение по КАТЕГОРИИ состояния, а не по сырому коэффициенту:
+                // 0.88 vs 0.90 — одна категория («хорошее»), это НЕ повод для better/worse.
+                // Разница коэффициента часто отражает качество съёмки, а не состояние детали.
+                int rc = conditionRank(pa.condition()), rm = conditionRank(myPhoto.condition());
+                if (rc >= 0 && rm >= 0) {
+                    if (rc > rm)      sb.append("→ состояние по фото лучше моего (категория выше)\n");
+                    else if (rc < rm) sb.append("→ состояние по фото хуже моего (категория ниже)\n");
+                    else              sb.append("→ состояние по фото сопоставимо с моим\n");
+                }
             }
 
             String compTitle = p.getTitle() != null ? p.getTitle().toLowerCase() : "";
-            if (isSideMismatch(mySide, compTitle) || isPositionMismatch(myPosition, compTitle)) {
-                sb.append("[ДРУГАЯ СТОРОНА/ПОЗИЦИЯ — вердикт строго worse]\n");
-                log.debug("Другая сторона: {}", p.getTitle());
+            String compText  = compTitle + " " + (p.getDescription() != null ? p.getDescription().toLowerCase() : "");
+            boolean sideOff   = isSideMismatch(mySide, compTitle) || isPositionMismatch(myPosition, compTitle);
+            boolean analogOff = mineOriginal && isAnalog(compText);
+            if (sideOff || analogOff) {
+                forceWorse[i] = true;
+                sb.append(sideOff
+                        ? "[ДРУГАЯ СТОРОНА/ПОЗИЦИЯ — вердикт строго worse]\n"
+                        : "[АНАЛОГ против моего ОРИГИНАЛА — вердикт строго worse]\n");
+                log.debug("forceWorse[{}]: {} ({})", i, p.getTitle(), sideOff ? "сторона/позиция" : "аналог");
             }
         }
 
         String systemPrompt = buildClassifierSystemPrompt(visionOn);
         String response = callTextAI(systemPrompt, sb.toString());
-        CompetitorClassification result = parseCompetitorClassification(response);
+        CompetitorClassification result = parseCompetitorClassification(response, forceWorse);
 
         // Кэшируем только непустой результат (пустой = сбой LLM, его кэшировать нельзя)
         boolean nonEmpty = !result.similar().isEmpty() || !result.better().isEmpty() || !result.worse().isEmpty();
@@ -430,7 +443,7 @@ public class AIPriceAdvisor {
 
     private String buildClassifierSystemPrompt(boolean visionOn) {
         String photoInstruction = visionOn
-                ? "Учитывай совокупность: описание (состояние, дефекты, производитель) и оценку фото (коэффициент, подсказка «лучше/хуже/сопоставимо»)."
+                ? "Главное — текст: состояние, дефекты, производитель (оригинал/аналог). Фото — ВТОРИЧНЫЙ сигнал: используй подсказку о КАТЕГОРИИ состояния («лучше/хуже/сопоставимо»), НЕ сам коэффициент. Мелкая разница коэффициента в одной категории — это similar, а не better/worse."
                 : "Оценка фото недоступна — учитывай только текст: состояние из описания, производитель (оригинал/аналог), упомянутые дефекты.";
 
         return """
@@ -448,9 +461,9 @@ public class AIPriceAdvisor {
                 - Конкурент оригинал а моё аналог → "better".
 
                 Вердикт (относительно МОЕГО объявления):
-                - "better"  = конкурент явно лучше: лучшее состояние, коэф. фото выше на 0.10+, новый vs б/у, оригинал vs аналог
-                - "similar" = сопоставимое качество: схожее состояние, коэф. фото в пределах ±0.10
-                - "worse"   = явно хуже: дефекты, ниже класс детали, другая сторона, коэф. фото ниже на 0.10+
+                - "better"  = конкурент явно лучше ПО ОПИСАНИЮ: лучше состояние/меньше дефектов, новый vs б/у, оригинал vs аналог. Фото — только подтверждающий сигнал (категория состояния выше), НЕ единственное основание.
+                - "similar" = сопоставимое качество: схожее состояние и набор дефектов; разница фото в пределах одной категории — это similar
+                - "worse"   = явно хуже: больше дефектов, ниже класс детали, другая сторона/позиция, аналог против оригинала, категория состояния по фото ниже
 
                 Верни СТРОГО ТОЛЬКО JSON без пояснений вне него:
                 {
@@ -468,10 +481,8 @@ public class AIPriceAdvisor {
     /** Уклон в быструю продажу: −5% от справедливой медианы (но не ниже минимума рынка). */
     private static final double FAST_SALE_FACTOR = 0.95;
 
-    /** Меньше этого числа конкурентов на рынке → данным нельзя доверять, цену резко не двигаем. */
+    /** Меньше этого числа сопоставимых конкурентов → данным нельзя доверять (низкая уверенность). */
     private static final int MIN_RELIABLE_COMPETITORS = 3;
-    /** Максимальное движение цены от текущей при тонких данных. */
-    private static final double THIN_DATA_MAX_MOVE = 0.10;
 
     /**
      * Единый рынок из двух регионов (Барнаул + Новосибирск). Считаем справедливую цену:
@@ -594,22 +605,15 @@ public class AIPriceAdvisor {
 
         // Тонкие данные → ненадёжно. Считаем по числу СОПОСТАВИМЫХ объявлений, определивших цену,
         // а не по всему рынку: 6 конкурентов, из которых 2 аналога, — это всё ещё тонкие данные.
-        // Не двигаем цену резко: не более ±10% от текущей.
+        // ВАЖНО: не подгоняем рекомендацию под ТЕКУЩУЮ цену (её и проверяем — иначе аудит порочно
+        // круговой). Оставляем оценку по рынку, но честно помечаем низкой уверенностью.
+        // applyBounds уже держит цену в коридоре рынка [0.8·min … max], так что «улёта» не будет.
         int reliableCount = Math.min(stats.count(), priceBasisCount);
-        if (reliableCount < MIN_RELIABLE_COMPETITORS) {
+        if (reliableCount > 0 && reliableCount < MIN_RELIABLE_COMPETITORS) {
             confidence = "низкая";
-            if (myCurrentPrice.compareTo(BigDecimal.ZERO) > 0) {
-                BigDecimal lo = myCurrentPrice.multiply(BigDecimal.valueOf(1 - THIN_DATA_MAX_MOVE)).setScale(0, RoundingMode.DOWN);
-                BigDecimal hi = myCurrentPrice.multiply(BigDecimal.valueOf(1 + THIN_DATA_MAX_MOVE)).setScale(0, RoundingMode.HALF_UP);
-                BigDecimal clamped = target.compareTo(hi) > 0 ? hi : (target.compareTo(lo) < 0 ? lo : target);
-                if (clamped.compareTo(target) != 0) {
-                    reason += String.format(" [мало сопоставимых данных (%d): движение ограничено ±10%% → %.0f₽]",
-                            reliableCount, clamped.doubleValue());
-                    target = clamped;
-                } else {
-                    reason += String.format(" [мало сопоставимых данных (%d): низкая уверенность]", reliableCount);
-                }
-            }
+            reason += String.format(
+                    " [мало сопоставимых данных (%d): оценка по рынку без подгонки к текущей цене, проверить вручную]",
+                    reliableCount);
         }
 
         if (cls.summary() != null && !cls.summary().isBlank()) reason += " " + cls.summary();
@@ -828,7 +832,7 @@ public class AIPriceAdvisor {
         }
     }
 
-    private CompetitorClassification parseCompetitorClassification(String content) {
+    private CompetitorClassification parseCompetitorClassification(String content, boolean[] forceWorse) {
         try {
             if (content == null) return CompetitorClassification.empty();
             String c = content.replaceAll("```json|```", "").trim();
@@ -841,12 +845,21 @@ public class AIPriceAdvisor {
                 List<Double> similar = new ArrayList<>();
                 List<Double> better  = new ArrayList<>();
                 List<Double> worse   = new ArrayList<>();
+                int idx = 0;
                 for (Map<String, Object> comp : comps) {
+                    idx++;
                     Object priceObj = comp.get("price");
                     if (priceObj == null) continue;
                     double price   = ((Number) priceObj).doubleValue();
                     String verdict = String.valueOf(comp.getOrDefault("verdict", "similar"));
                     String reason  = String.valueOf(comp.getOrDefault("reason", ""));
+                    // Номер конкурента из ответа (иначе порядковый), для override по forceWorse[]
+                    int n = (comp.get("n") instanceof Number num) ? num.intValue() : idx;
+                    if (forceWorse != null && n >= 1 && n <= forceWorse.length && forceWorse[n - 1]
+                            && !"worse".equals(verdict)) {
+                        log.debug("Конкурент {}₽: вердикт {} → worse (детерминированное правило)", (long) price, verdict);
+                        verdict = "worse";
+                    }
                     log.debug("Конкурент {}₽ → {} | {}", (long) price, verdict, reason);
                     switch (verdict) {
                         case "better"  -> better.add(price);
@@ -879,7 +892,32 @@ public class AIPriceAdvisor {
                 .collect(Collectors.toList());
     }
 
-    // ==================== ОПРЕДЕЛЕНИЕ СТОРОНЫ/ПОЗИЦИИ ====================
+    // ==================== ОПРЕДЕЛЕНИЕ АНАЛОГА / СТОРОНЫ / ПОЗИЦИИ ====================
+
+    /** Бренды/артикулы неоригинальных аналогов (lowercase-токены). */
+    private static final String[] ANALOG_TOKENS = {
+            "febest", "masterkit", "master kit", "master-kit", "lynx", "nagamochi",
+            "masuma", "narichin", "trust auto", "trustauto", "sat-st", " sat ",
+            "tabc", "tabp", "ta-tab"
+    };
+
+    /** Признак неоригинала по тексту названия/описания. */
+    private boolean isAnalog(String text) {
+        if (text == null) return false;
+        String t = text.toLowerCase();
+        for (String tok : ANALOG_TOKENS) if (t.contains(tok)) return true;
+        return false;
+    }
+
+    /** Категория состояния по фото: отличное/хорошее=2, удовлетворительное=1, плохое=0, неизвестно=-1. */
+    private int conditionRank(String condition) {
+        if (condition == null) return -1;
+        String c = condition.toLowerCase();
+        if (c.contains("отличн") || c.contains("хорош")) return 2;
+        if (c.contains("удовлетвор")) return 1;
+        if (c.contains("плох")) return 0;
+        return -1;
+    }
 
     private String extractSide(String title) {
         if (title.contains("левый") || title.contains("левой") || title.contains("левая")) return "левый";

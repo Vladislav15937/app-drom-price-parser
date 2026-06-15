@@ -1223,6 +1223,7 @@ public class DromParser {
     private void navigateWithRetry(Page page, String url, String referer) {
         RuntimeException last = null;
         int attempt = 0;
+        boolean rotatedOnTimeout = false;   // ротацию IP на тайм-аут делаем максимум один раз за навигацию
         while (true) {
             attempt++;
             try {
@@ -1237,7 +1238,17 @@ public class DromParser {
                 int maxAttempts = tunnel ? 3 : 2;   // туннель падает быстро → больше попыток; тайм-аут дорогой → меньше
                 log.warn("Навигация не удалась (попытка {}/{}, {}) {}: {}",
                         attempt, maxAttempts, tunnel ? "ERR_TUNNEL" : "прочее", url, e.getMessage());
-                if (attempt >= maxAttempts) throw last;
+                if (attempt >= maxAttempts) {
+                    // Стойкий тайм-аут (не туннель) = мобильный IP «залип». Один раз меняем IP и даём
+                    // ещё попытку — свежий IP обычно лечит зависание и спасает деталь от 0 конкурентов
+                    // (без этого она уходила в «низкую уверенность»). Туннельные ошибки лечит сам ретрай.
+                    if (!tunnel && !rotatedOnTimeout && canRotate()) {
+                        rotatedOnTimeout = true;
+                        log.warn("Навигация: стойкий тайм-аут {} — меняю IP и пробую ещё раз", url);
+                        if (rotateIp()) { attempt = maxAttempts - 1; continue; }   // ровно одна доп. попытка на свежем IP
+                    }
+                    throw last;
+                }
                 long backoff = tunnel ? 1500L * attempt : 1000L;   // ERR_TUNNEL: 1.5с, 3с — дать IP восстановиться
                 try { Thread.sleep(backoff); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
             }

@@ -160,7 +160,11 @@
       "Bash(iconv -f WINDOWS-1251 -t UTF-8 \"catalog_14-06-26_19-32.csv\")",
       "Bash(awk '-F;' ' *)",
       "Bash(sed -n '/public void resetBreakers/,/^    }/p' src/main/java/ru/retail/service/service/PriceAnalyzer.java)",
-      "Bash(sed -n '1,45p' src/main/java/ru/retail/service/service/PriceAnalyzer.java)"
+      "Bash(sed -n '1,45p' src/main/java/ru/retail/service/service/PriceAnalyzer.java)",
+      "Bash(mvn -q compile)",
+      "Bash([ -x \"$d/mvn\" ])",
+      "Bash(/usr/bin/java -version)",
+      "Bash(echo \"exit:$?\")"
     ]
   }
 }
