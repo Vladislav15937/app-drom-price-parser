@@ -65,6 +65,9 @@ public class AggregationResult {
     @Schema(description = "Краткий вывод по рыночной ситуации")
     private String marketNote;
 
+    @Schema(description = "Не проценивается: живая цена объявления < 600₽ (в отчёт не включается)")
+    private boolean belowMinPrice;
+
     @Schema(description = "Найденные предложения в городе")
     @Builder.Default
     private List<PartPrice> items = Collections.emptyList();

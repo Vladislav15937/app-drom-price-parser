@@ -24,7 +24,7 @@ public class ExcelReport {
 
     private static final String[] HEADERS = {
             "№", "OEM", "Запчасть", "Авто", "Цена на сайте", "Рекоменд.", "Δ к рынку, %",
-            "Состояние", "Уверенность", "Город", "НСК", "Ссылка на объявление", "Причина"
+            "Состояние", "Уверенность", "Барнаул, позиций", "Ссылка на объявление", "Причина"
     };
 
     private final Path file;
@@ -34,7 +34,7 @@ public class ExcelReport {
     private int rowNum = 0;
     private int dataCount = 0;
 
-    private final CellStyle headerStyle, greenStyle, redStyle, blueStyle, greyStyle;
+    private final CellStyle headerStyle, greenStyle, redStyle, blueStyle, greyStyle, purpleStyle;
 
     public ExcelReport(Path file, double tolerance) {
         this.file = file;
@@ -47,8 +47,9 @@ public class ExcelReport {
         redStyle    = base(0xFFC7CE, 0x9C0006, false);   // выше рынка
         blueStyle   = base(0xBDD7EE, 0x1F4E78, false);   // ниже рынка
         greyStyle   = base(0xF2F2F2, 0x808080, false);   // нет данных
+        purpleStyle = base(0xE9D5FF, 0x6B21A8, false);   // <5 позиций в Барнауле (мало данных)
 
-        int[] widths = {1500, 5200, 11000, 9000, 3400, 3400, 3400, 5200, 3200, 2200, 2200, 16000, 18000};
+        int[] widths = {1500, 5200, 11000, 9000, 3400, 3400, 3400, 5200, 3200, 3400, 16000, 18000};
         for (int i = 0; i < widths.length; i++) sheet.setColumnWidth(i, widths[i]);
         sheet.createFreezePane(0, 1);
 
@@ -113,6 +114,9 @@ public class ExcelReport {
             else                             { state = "ниже рынка";        style = blueStyle; }
         }
 
+        // <5 позиций по детали в Барнауле — мало данных: вся строка фиолетовая (поверх статуса выше/ниже).
+        if (found && r != null && r.getCityCompetitorCount() < 5) style = purpleStyle;
+
         Row row = sheet.createRow(rowNum++);
         int col = 0;
         set(row, col++, ++dataCount, style);
@@ -125,7 +129,6 @@ public class ExcelReport {
         set(row, col++, state, style);
         set(row, col++, r == null ? "" : nz(r.getAiConfidence()), style);
         set(row, col++, r == null ? "" : String.valueOf(r.getCityCompetitorCount()), style);
-        set(row, col++, r == null ? "" : String.valueOf(r.getSiberiaCompetitorCount()), style);
         setLink(row, col++, url, style);
         set(row, col,   r == null ? "" : nz(r.getAiReason()), style);
 

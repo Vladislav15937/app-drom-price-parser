@@ -88,10 +88,28 @@ public class AIPriceAdvisor {
 
         if (cityPrices.isEmpty() && siberiaPrices.isEmpty()) {
             return new AIRecommendation(myCurrentPrice, "нет данных",
-                    "Конкуренты не найдены ни в городе, ни по Сибири. Цена оставлена без изменений.", "");
+                    "Конкуренты в Барнауле не найдены. Цена оставлена без изменений.", "");
         }
 
         try {
+            // Контракт-сегментация рынка. Правило: если НАША деталь контрактная и есть ДРУГИЕ
+            // контрактные конкуренты — сравниваем ТОЛЬКО с контрактными (не-контрактные выкидываем
+            // из набора). Если контрактных конкурентов нет — сравниваем по всему рынку. Наценочного
+            // пола ×1.10 над не-контрактным рынком БОЛЬШЕ НЕТ: на drom «контракт» — слабый признак
+            // (почти весь б/у-импорт), пол лишь задирал цену выше реального рынка, а медиана пола ещё
+            // и засорялась аналогами/колодками из выдачи. Цена — строго по сопоставимому рынку.
+            boolean mineContract = isContract(myListing.getCondition() + " " + myListing.getTitle()
+                    + " " + (myListing.getDescription() == null ? "" : myListing.getDescription()));
+            List<PartPrice> contractCity = filterContract(cityPrices);
+            List<PartPrice> contractSiberia = filterContract(siberiaPrices);
+            boolean compareContractOnly = mineContract
+                    && (!contractCity.isEmpty() || !contractSiberia.isEmpty());
+            List<PartPrice> cityCmp    = compareContractOnly ? contractCity    : cityPrices;
+            List<PartPrice> siberiaCmp = compareContractOnly ? contractSiberia : siberiaPrices;
+            if (compareContractOnly)
+                log.info("Контракт: наша деталь контрактная — сравниваем только с контрактными (город {}, НСК {})",
+                        cityCmp.size(), siberiaCmp.size());
+
             // ШАГ 1: Оценка моих фото (один раз)
             log.info("Шаг 1/3: Оценка моих фотографий...");
             PhotoAssessment myPhoto = evaluatePhotosAsync(myListing.getPhotoUrls(), myListing.getTitle()).join();
@@ -100,28 +118,28 @@ public class AIPriceAdvisor {
             // ШАГ 2: классификации города и НСК идут ПАРАЛЛЕЛЬНО (две независимые LLM-задачи).
             // НСК (без vision) запускаем сразу — пусть его текстовый запрос перекрывает vision города.
             CompletableFuture<CompetitorClassification> siberiaFut;
-            if (!siberiaPrices.isEmpty()) {
-                log.info("Шаг 2b/3: Попарное сравнение {} новосибирских конкурентов (без vision, параллельно)...", siberiaPrices.size());
+            if (!siberiaCmp.isEmpty()) {
+                log.info("Шаг 2b/3: Попарное сравнение {} новосибирских конкурентов (без vision, параллельно)...", siberiaCmp.size());
                 List<PhotoAssessment> neutralPhotos = Collections.nCopies(
-                        siberiaPrices.size(), new PhotoAssessment("неизвестно", "", myPhoto.coefficient()));
+                        siberiaCmp.size(), new PhotoAssessment("неизвестно", "", myPhoto.coefficient()));
                 siberiaFut = CompletableFuture.supplyAsync(
-                        () -> classifyCompetitors(siberiaPrices, neutralPhotos, myListing, myPhoto, false), photoExecutor);
+                        () -> classifyCompetitors(siberiaCmp, neutralPhotos, myListing, myPhoto, false), photoExecutor);
             } else {
                 siberiaFut = CompletableFuture.completedFuture(CompetitorClassification.empty());
             }
 
             // Город: vision только для конкурентов ≤ моей цены × 1.10; необоценённым — коэф. = мой (без ложного "better")
-            log.info("Шаг 2/3: Попарное сравнение {} городских конкурентов...", cityPrices.size());
-            List<PhotoAssessment> cityPhotos = evaluatePhotosSelective(cityPrices, myCurrentPrice, myPhoto.coefficient());
+            log.info("Шаг 2/3: Попарное сравнение {} городских конкурентов...", cityCmp.size());
+            List<PhotoAssessment> cityPhotos = evaluatePhotosSelective(cityCmp, myCurrentPrice, myPhoto.coefficient());
             CompetitorClassification cityClassification = classifyCompetitors(
-                    cityPrices, cityPhotos, myListing, myPhoto, isVisionActive());
+                    cityCmp, cityPhotos, myListing, myPhoto, isVisionActive());
 
             CompetitorClassification siberiaClassification = siberiaFut.join();
 
             // ШАГ 3: Стратегия ценообразования
             log.info("Шаг 3/3: Расчёт конкурентной цены...");
             AIRecommendation result = computeCompetitivePrice(
-                    cityClassification, cityPrices, siberiaClassification, siberiaPrices,
+                    cityClassification, cityCmp, siberiaClassification, siberiaCmp,
                     myPhoto, myCurrentPrice, isOldListing);
 
             log.info("Рекомендация: {} руб. | уверенность: {} | причина: {}",
@@ -330,95 +348,175 @@ public class AIPriceAdvisor {
             return cached.cls();
         }
 
-        // --- Моё объявление ---
-        StringBuilder sb = new StringBuilder();
-        sb.append("МОЁ ОБЪЯВЛЕНИЕ:\n");
+        // --- Заголовок «МОЁ ОБЪЯВЛЕНИЕ» (общий для всех чанков) ---
+        StringBuilder hdr = new StringBuilder();
+        hdr.append("МОЁ ОБЪЯВЛЕНИЕ:\n");
         if (myListing.getTitle() != null && !myListing.getTitle().isBlank())
-            sb.append("Название: ").append(myListing.getTitle()).append("\n");
-        sb.append("Состояние: ").append(myListing.getCondition()).append("\n");
-        sb.append("Производитель: ").append(myListing.getManufacturer()).append("\n");
+            hdr.append("Название: ").append(myListing.getTitle()).append("\n");
+        hdr.append("Состояние: ").append(myListing.getCondition()).append("\n");
+        hdr.append("Производитель: ").append(myListing.getManufacturer()).append("\n");
         if (myListing.getDescription() != null && !myListing.getDescription().isBlank())
-            sb.append("Описание: ").append(myListing.getDescription(), 0,
+            hdr.append("Описание: ").append(myListing.getDescription(), 0,
                     Math.min(300, myListing.getDescription().length())).append("\n");
         if (visionOn) {
-            sb.append("Фото: ").append(myPhoto.condition())
-              .append(String.format(" (коэф. %.2f)", myPhoto.coefficient()));
+            hdr.append("Фото: ").append(myPhoto.condition())
+               .append(String.format(" (коэф. %.2f)", myPhoto.coefficient()));
             if (myPhoto.defects() != null && !myPhoto.defects().isBlank())
-                sb.append(", дефекты: ").append(myPhoto.defects());
-            sb.append("\n");
+                hdr.append(", дефекты: ").append(myPhoto.defects());
+            hdr.append("\n");
         } else {
-            sb.append("Фото: оценка недоступна — опирайся только на текст описания\n");
+            hdr.append("Фото: оценка недоступна — опирайся только на текст описания\n");
         }
+        String header = hdr.toString();
 
-        // --- Список конкурентов ---
-        sb.append("\nКОНКУРЕНТЫ (попарно сравни каждого с МОЁ ОБЪЯВЛЕНИЕ выше):\n");
-
-        // Детерминированные правила: считаем в коде, не доверяем их применение LLM.
+        // --- Детерминированные правила (forceWorse) по ВСЕМ конкурентам, считаем в коде ---
         // forceWorse[i] перебивает вердикт модели на "worse" (см. parseCompetitorClassification).
         String myManuf = myListing.getManufacturer() != null ? myListing.getManufacturer().toLowerCase() : "";
         boolean mineOriginal = !isAnalog(myTitle + " " + myManuf);
         boolean[] forceWorse = new boolean[competitors.size()];
-
         for (int i = 0; i < competitors.size(); i++) {
             PartPrice p = competitors.get(i);
-            PhotoAssessment pa = i < photos.size() ? photos.get(i) : new PhotoAssessment("нет фото", "", 0.80);
-
-            sb.append("\n--- КОНКУРЕНТ ").append(i + 1)
-              .append(" (цена: ").append(p.getPrice()).append("₽) ---\n");
-
-            if (p.getTitle() != null && !p.getTitle().isBlank())
-                sb.append("Название: ")
-                  .append(p.getTitle(), 0, Math.min(120, p.getTitle().length())).append("\n");
-
-            if (p.getDescription() != null && !p.getDescription().isBlank()) {
-                String desc = p.getDescription()
-                        .replaceAll("(?m)Продавец:.*$", "")
-                        .replaceAll("(?m)Рейтинг:.*$", "")
-                        .replaceAll("(?m)Город:.*$", "")
-                        .trim();
-                if (desc.length() > 10)
-                    sb.append("Описание: ")
-                      .append(desc, 0, Math.min(200, desc.length())).append("\n");
-            }
-
-            if (visionOn) {
-                sb.append("Фото: ").append(pa.condition())
-                  .append(String.format(" (коэф. %.2f)", pa.coefficient()));
-                if (pa.defects() != null && !pa.defects().isBlank())
-                    sb.append(", дефекты: ").append(pa.defects());
-                sb.append("\n");
-                // Сравнение по КАТЕГОРИИ состояния, а не по сырому коэффициенту:
-                // 0.88 vs 0.90 — одна категория («хорошее»), это НЕ повод для better/worse.
-                // Разница коэффициента часто отражает качество съёмки, а не состояние детали.
-                int rc = conditionRank(pa.condition()), rm = conditionRank(myPhoto.condition());
-                if (rc >= 0 && rm >= 0) {
-                    if (rc > rm)      sb.append("→ состояние по фото лучше моего (категория выше)\n");
-                    else if (rc < rm) sb.append("→ состояние по фото хуже моего (категория ниже)\n");
-                    else              sb.append("→ состояние по фото сопоставимо с моим\n");
-                }
-            }
-
             String compTitle = p.getTitle() != null ? p.getTitle().toLowerCase() : "";
             String compText  = compTitle + " " + (p.getDescription() != null ? p.getDescription().toLowerCase() : "");
             boolean sideOff   = isSideMismatch(mySide, compTitle) || isPositionMismatch(myPosition, compTitle);
             boolean analogOff = mineOriginal && isAnalog(compText);
             if (sideOff || analogOff) {
                 forceWorse[i] = true;
-                sb.append(sideOff
-                        ? "[ДРУГАЯ СТОРОНА/ПОЗИЦИЯ — вердикт строго worse]\n"
-                        : "[АНАЛОГ против моего ОРИГИНАЛА — вердикт строго worse]\n");
                 log.debug("forceWorse[{}]: {} ({})", i, p.getTitle(), sideOff ? "сторона/позиция" : "аналог");
             }
         }
 
         String systemPrompt = buildClassifierSystemPrompt(visionOn);
-        String response = callTextAI(systemPrompt, sb.toString());
-        CompetitorClassification result = parseCompetitorClassification(response, forceWorse);
 
-        // Кэшируем только непустой результат (пустой = сбой LLM, его кэшировать нельзя)
-        boolean nonEmpty = !result.similar().isEmpty() || !result.better().isEmpty() || !result.worse().isEmpty();
-        if (nonEmpty) classificationCache.put(cacheKey, new CachedClassification(result, System.currentTimeMillis()));
+        // --- Классификация ЧАНКАМИ ≤ CLASSIFY_CHUNK ---
+        // Ответ классификатора (вердикт+причина на конкурента) растёт линейно с числом конкурентов;
+        // на 34–36 он переполнял max_tokens → обрезанный JSON → не парсился. Чанки держат каждый ответ
+        // в пределах бюджета токенов, при этом ВСЕ конкуренты классифицируются (vision/причины сохранены).
+        int n = competitors.size();
+        List<Double> similar = new ArrayList<>(), better = new ArrayList<>(), worse = new ArrayList<>();
+        String summary = "";
+        boolean degraded = false;
+
+        for (int start = 0; start < n; start += CLASSIFY_CHUNK) {
+            int end = Math.min(start + CLASSIFY_CHUNK, n);
+            StringBuilder sb = new StringBuilder(header);
+            sb.append("\nКОНКУРЕНТЫ (попарно сравни каждого с МОЁ ОБЪЯВЛЕНИЕ выше):\n");
+            boolean[] chunkForce = new boolean[end - start];
+            for (int i = start; i < end; i++) {
+                int display = i - start + 1;   // нумерация 1..k ВНУТРИ чанка (parse мапит n→forceWorse[n-1])
+                PhotoAssessment pa = i < photos.size() ? photos.get(i) : new PhotoAssessment("нет фото", "", 0.80);
+                appendCompetitorBlock(sb, display, competitors.get(i), pa, visionOn, myPhoto, forceWorse[i]);
+                chunkForce[display - 1] = forceWorse[i];
+            }
+            CompetitorClassification cc = classifyChunk(systemPrompt, sb.toString(), chunkForce,
+                    competitors.subList(start, end));
+            similar.addAll(cc.similar());
+            better.addAll(cc.better());
+            worse.addAll(cc.worse());
+            if (summary.isBlank() && cc.summary() != null && !cc.summary().isBlank()) summary = cc.summary();
+            degraded |= cc.degraded();
+        }
+
+        CompetitorClassification result =
+                new CompetitorClassification(similar, better, worse, summary, degraded);
+
+        // Кэшируем только ПОЛНОЦЕННЫЙ непустой результат (деградированный фолбэк кэшировать нельзя —
+        // на следующем прогоне того же набора можно получить настоящую классификацию).
+        boolean nonEmpty = !similar.isEmpty() || !better.isEmpty() || !worse.isEmpty();
+        if (nonEmpty && !degraded)
+            classificationCache.put(cacheKey, new CachedClassification(result, System.currentTimeMillis()));
         return result;
+    }
+
+    /** Размер чанка конкурентов на один запрос классификатора (ответ влезает в max_tokens). */
+    private static final int CLASSIFY_CHUNK = 12;
+    /** Потолок попыток на чанк при обрыве/сбое (НЕ троттл): дальше — нейтральный фолбэк. */
+    private static final int CLASSIFY_MAX_ATTEMPTS = 8;
+    /** Потолок времени на чанк (мс): даже при затяжном троттле дорожка не висит. */
+    private static final long CLASSIFY_BUDGET_MS = 180_000;
+
+    /** Один конкурент в тело запроса классификатора (нумерация — внутри чанка). */
+    private void appendCompetitorBlock(StringBuilder sb, int num, PartPrice p, PhotoAssessment pa,
+                                       boolean visionOn, PhotoAssessment myPhoto, boolean force) {
+        sb.append("\n--- КОНКУРЕНТ ").append(num)
+          .append(" (цена: ").append(p.getPrice()).append("₽) ---\n");
+
+        if (p.getTitle() != null && !p.getTitle().isBlank())
+            sb.append("Название: ")
+              .append(p.getTitle(), 0, Math.min(120, p.getTitle().length())).append("\n");
+
+        if (p.getDescription() != null && !p.getDescription().isBlank()) {
+            String desc = p.getDescription()
+                    .replaceAll("(?m)Продавец:.*$", "")
+                    .replaceAll("(?m)Рейтинг:.*$", "")
+                    .replaceAll("(?m)Город:.*$", "")
+                    .trim();
+            if (desc.length() > 10)
+                sb.append("Описание: ")
+                  .append(desc, 0, Math.min(200, desc.length())).append("\n");
+        }
+
+        if (visionOn) {
+            sb.append("Фото: ").append(pa.condition())
+              .append(String.format(" (коэф. %.2f)", pa.coefficient()));
+            if (pa.defects() != null && !pa.defects().isBlank())
+                sb.append(", дефекты: ").append(pa.defects());
+            sb.append("\n");
+            // Сравнение по КАТЕГОРИИ состояния, а не по сырому коэффициенту.
+            int rc = conditionRank(pa.condition()), rm = conditionRank(myPhoto.condition());
+            if (rc >= 0 && rm >= 0) {
+                if (rc > rm)      sb.append("→ состояние по фото лучше моего (категория выше)\n");
+                else if (rc < rm) sb.append("→ состояние по фото хуже моего (категория ниже)\n");
+                else              sb.append("→ состояние по фото сопоставимо с моим\n");
+            }
+        }
+
+        if (force) sb.append("[ДРУГАЯ СТОРОНА/ПОЗИЦИЯ или АНАЛОГ против моего ОРИГИНАЛА — вердикт строго worse]\n");
+    }
+
+    /**
+     * Классификация одного чанка с разделением троттла и обрыва (п.2) и жёстким потолком (п.3):
+     *  - троттл (429/«throttled») лечится ожиданием ВНУТРИ callTextAI до общего дедлайна;
+     *  - обрыв/битый JSON — это НЕ троттл: повтор того же запроса при temperature=0 обычно бессмыслен,
+     *    поэтому ограничен (CLASSIFY_MAX_ATTEMPTS / CLASSIFY_BUDGET_MS);
+     *  - потолок исчерпан → нейтральный фолбэк (forceWorse→worse, остальные→similar, degraded=true).
+     */
+    private CompetitorClassification classifyChunk(String systemPrompt, String user,
+                                                   boolean[] forceWorse, List<PartPrice> chunk) {
+        long deadline = System.currentTimeMillis() + CLASSIFY_BUDGET_MS;
+        for (int attempt = 1; attempt <= CLASSIFY_MAX_ATTEMPTS; attempt++) {
+            if (System.currentTimeMillis() > deadline) {
+                log.error("Классификация чанка ({}): исчерпан бюджет {}с — нейтральный фолбэк",
+                        chunk.size(), CLASSIFY_BUDGET_MS / 1000);
+                break;
+            }
+            String response = callTextAI(systemPrompt, user, deadline);
+            if (response == null) {   // шлюз сдался / дедлайн / прерывание потока — повторять бессмысленно
+                log.warn("Классификация чанка ({}): шлюз не ответил (попытка {}/{}) — фолбэк",
+                        chunk.size(), attempt, CLASSIFY_MAX_ATTEMPTS);
+                break;
+            }
+            CompetitorClassification cc = parseCompetitorClassification(response, forceWorse);
+            if (!cc.similar().isEmpty() || !cc.better().isEmpty() || !cc.worse().isEmpty())
+                return cc;   // успех
+            // Распарсился пустым = обрезанный/битый ответ (НЕ троттл — troттл вернул бы исключение внутри).
+            log.warn("Классификация чанка ({}): ответ обрезан/битый (попытка {}/{}) — повтор ограничен",
+                    chunk.size(), attempt, CLASSIFY_MAX_ATTEMPTS);
+            if (attempt < CLASSIFY_MAX_ATTEMPTS && !sleepMs(textErrorBackoffMs(attempt))) break;  // поток прерван
+        }
+        return neutralFallback(chunk, forceWorse);
+    }
+
+    /** Нейтральный фолбэк чанка: код-правила (forceWorse) → worse, остальные → similar, degraded=true. */
+    private CompetitorClassification neutralFallback(List<PartPrice> chunk, boolean[] forceWorse) {
+        List<Double> similar = new ArrayList<>(), worse = new ArrayList<>();
+        for (int i = 0; i < chunk.size(); i++) {
+            BigDecimal pr = chunk.get(i).getPrice();
+            if (pr == null) continue;
+            double price = pr.doubleValue();
+            if (i < forceWorse.length && forceWorse[i]) worse.add(price); else similar.add(price);
+        }
+        return new CompetitorClassification(similar, List.of(), worse, "", true);
     }
 
     /**
@@ -506,7 +604,7 @@ public class AIPriceAdvisor {
         }
 
         CompetitorClassification merged = mergeClassifications(cityClass, siberiaClass);
-        String scope = String.format("По 2 регионам (Барнаул %d + НСК %d)", cityPrices.size(), siberiaPrices.size());
+        String scope = String.format("По Барнаулу (%d позиций)", cityPrices.size());
         return strategyForMarket(merged, market, myPhoto, myCurrentPrice, scope, photoNote);
     }
 
@@ -516,7 +614,7 @@ public class AIPriceAdvisor {
         List<Double> better  = new ArrayList<>(a.better());  better.addAll(b.better());
         List<Double> worse   = new ArrayList<>(a.worse());   worse.addAll(b.worse());
         String summary = (a.summary() != null && !a.summary().isBlank()) ? a.summary() : b.summary();
-        return new CompetitorClassification(similar, better, worse, summary);
+        return new CompetitorClassification(similar, better, worse, summary, a.degraded() || b.degraded());
     }
 
     private AIRecommendation strategyForMarket(
@@ -616,6 +714,13 @@ public class AIPriceAdvisor {
                     reliableCount);
         }
 
+        // Классификация (или её часть) получена нейтральным фолбэком, а не от LLM (исчерпан потолок
+        // на обрыве/сбое шлюза) → честно понижаем уверенность и помечаем на ручную проверку.
+        if (cls.degraded()) {
+            confidence = "низкая";
+            reason += " [классификация ИИ получена не для всех конкурентов (сбой шлюза) — нейтральная оценка по рынку, проверить вручную]";
+        }
+
         if (cls.summary() != null && !cls.summary().isBlank()) reason += " " + cls.summary();
         return new AIRecommendation(target, confidence, reason, photoNote);
     }
@@ -711,10 +816,10 @@ public class AIPriceAdvisor {
     /** Реальные (НЕ троттл) ошибки vision до перехода на нейтральный коэф. Троттл этот счётчик НЕ трогает. */
     private static final int VISION_MAX_CONTENT_ERRORS = 3;
 
-    private String callTextAI(String system, String user) {
+    private String callTextAI(String system, String user, long deadlineMs) {
         // Троттл шлюза («too many concurrent requests», 200 с {"error":...}) НЕ сдаём — это «нас слишком много
-        // одновременно», лечится ожиданием. Крутим до вменяемого ответа, чтобы не терять классификацию
-        // (иначе ложное «аналогов нет»). Конкурентность теперь придушена общим семафором gatewayLimiter.
+        // одновременно», лечится ожиданием. Крутим до вменяемого ответа ЛИБО до общего дедлайна (чтобы дорожка
+        // не висела часами при затяжном троттле). Конкурентность придушена общим семафором gatewayLimiter.
         int throttleWait = 0;
         int hardErrors = 0;
         while (true) {
@@ -727,7 +832,7 @@ public class AIPriceAdvisor {
                                 Map.of("role", "user", "content", user)
                         ),
                         "temperature", 0,   // детерминированная классификация → воспроизводимая цена
-                        "max_tokens", 2000
+                        "max_tokens", 4000  // запас на вердикт+причину по чанку; обрезка ответа исключена
                 );
                 String json = objectMapper.writeValueAsString(body);
                 HttpRequest req = HttpRequest.newBuilder()
@@ -770,6 +875,10 @@ public class AIPriceAdvisor {
                 Thread.currentThread().interrupt();
                 return null;
             } catch (Exception e) {
+                if (System.currentTimeMillis() > deadlineMs) {   // общий потолок времени на классификацию (п.3)
+                    log.warn("Text AI: дедлайн классификации исчерпан — сдаёмся (фолбэк выше)");
+                    return null;
+                }
                 if (throttled) {
                     log.warn("Text AI троттл (ожидание {}): {}", ++throttleWait, e.getMessage());
                     if (!sleepMs(throttleBackoffMs(throttleWait))) return null;
@@ -868,7 +977,7 @@ public class AIPriceAdvisor {
                     }
                 }
                 String summary = (String) m.getOrDefault("summary", "");
-                return new CompetitorClassification(similar, better, worse, summary);
+                return new CompetitorClassification(similar, better, worse, summary, false);
             }
 
             // Обратная совместимость со старым форматом {similar:[], better:[], worse:[]}
@@ -876,7 +985,8 @@ public class AIPriceAdvisor {
                     toDoubleList(m.get("similar")),
                     toDoubleList(m.get("better")),
                     toDoubleList(m.get("worse")),
-                    (String) m.getOrDefault("comment", "")
+                    (String) m.getOrDefault("comment", ""),
+                    false
             );
         } catch (Exception e) {
             log.warn("Не удалось распарсить классификацию: {}", e.getMessage());
@@ -907,6 +1017,24 @@ public class AIPriceAdvisor {
         String t = text.toLowerCase();
         for (String tok : ANALOG_TOKENS) if (t.contains(tok)) return true;
         return false;
+    }
+
+    /** Признак контрактной детали (снята с контрактного авто) по тексту состояния/названия/описания. */
+    private boolean isContract(String text) {
+        return text != null && text.toLowerCase().contains("контракт");
+    }
+
+    /** Конкурент контрактный, если в названии/описании есть «контракт» (название есть всегда — со страницы поиска). */
+    private boolean compContract(PartPrice p) {
+        return isContract((p.getTitle() == null ? "" : p.getTitle()) + " "
+                + (p.getDescription() == null ? "" : p.getDescription()));
+    }
+
+    /** Только контрактные конкуренты из списка. */
+    private List<PartPrice> filterContract(List<PartPrice> competitors) {
+        List<PartPrice> out = new ArrayList<>();
+        for (PartPrice p : competitors) if (compContract(p)) out.add(p);
+        return out;
     }
 
     /** Категория состояния по фото: отличное/хорошее=2, удовлетворительное=1, плохое=0, неизвестно=-1. */
@@ -953,9 +1081,12 @@ public class AIPriceAdvisor {
 
     public record PhotoAssessment(String condition, String defects, double coefficient) {}
 
-    private record CompetitorClassification(List<Double> similar, List<Double> better, List<Double> worse, String summary) {
+    // degraded=true — классификация (или её часть) получена нейтральным фолбэком, а не от LLM
+    // (исчерпан потолок попыток на обрыве/сбое шлюза). Понижает уверенность и ставит флаг ручной проверки.
+    private record CompetitorClassification(List<Double> similar, List<Double> better, List<Double> worse,
+                                            String summary, boolean degraded) {
         static CompetitorClassification empty() {
-            return new CompetitorClassification(List.of(), List.of(), List.of(), "");
+            return new CompetitorClassification(List.of(), List.of(), List.of(), "", false);
         }
     }
 

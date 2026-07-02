@@ -164,7 +164,15 @@
       "Bash(mvn -q compile)",
       "Bash([ -x \"$d/mvn\" ])",
       "Bash(/usr/bin/java -version)",
-      "Bash(echo \"exit:$?\")"
+      "Bash(echo \"exit:$?\")",
+      "Bash(sed -n '159,172p' ui/ExcelReport.java)",
+      "Bash(sed -n '404,462p' ui/MainWindow.java)",
+      "Bash(sed -n '1,20p' dto/PartPrice.java)",
+      "Bash(sed -n '1,15p' dto/MyListingInfo.java)",
+      "Bash(sed -n '595,615p' ui/MainWindow.java)",
+      "Bash(awk '/parseCsvFile/{f=1} f{print NR\": \"$0} f&&/^    }/{c++; if\\(c>=1 && /return/\\) {}} f&&/return rows|return result|return list/{}' src/main/java/ru/retail/service/ui/MainWindow.java)",
+      "Bash(sed -n '317,450p' service/AIPriceAdvisor.java)",
+      "Bash(sed -n '843,895p' service/AIPriceAdvisor.java)"
     ]
   }
 }

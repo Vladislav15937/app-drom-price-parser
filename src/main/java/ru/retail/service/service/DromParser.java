@@ -50,7 +50,7 @@ public class DromParser {
     private static final Path DEFAULT_SESSION_FILE = Paths.get("drom-session.json");
     private static final Path NSK_SESSION_FILE = Paths.get("drom-session-nsk.json");
 
-    private static final int DEFAULT_DETAIL_LIMIT = 6;   // сколько детальных страниц реально открываем
+    private static final int DEFAULT_DETAIL_LIMIT = Integer.MAX_VALUE;   // открываем ВСЕ детальные страницы конкурентов (решение заказчика 2026-06)
     private static final long CACHE_TTL_MS = 30 * 60 * 1000L;
     private static final int NAV_TIMEOUT_MS = 30_000;    // тайм-аут навигации: быстрый фейл + ретрай вместо 90с зависаний
 
@@ -539,21 +539,16 @@ public class DromParser {
         Set<String> normalizedExcludes = excludeUrls.stream()
                 .map(u -> u.toLowerCase().replaceAll("/+$", ""))
                 .collect(Collectors.toSet());
-        String regionSlug = "/" + region + "/";
         String normalizedOem = oemNumber.replaceAll("\\s+", "").toUpperCase();
 
-        // Исключаем свои URL + фильтр по региону (с фолбэком на все, если /регион/ нет в пути)
+        // Строго Барнаул: исключаем свои URL и объявления ДРУГИХ городов (на /oem/-странице drom
+        // подмешивает всю Россию). Оставляем /barnaul/ и «голые» g-URL — их город подтверждаем
+        // по карточке ниже (isBarnaulPart). Фолбэка «взять все» больше нет — иначе течёт чужой город.
         List<SearchEntry> regional = entries.stream()
                 .filter(e -> normalizedExcludes.isEmpty()
                         || !normalizedExcludes.contains(e.url().toLowerCase().replaceAll("/+$", "")))
-                .filter(e -> e.url().contains(regionSlug))
+                .filter(e -> !isOtherCityUrl(e.url(), region))
                 .collect(Collectors.toList());
-        if (regional.isEmpty()) {
-            regional = entries.stream()
-                    .filter(e -> normalizedExcludes.isEmpty()
-                            || !normalizedExcludes.contains(e.url().toLowerCase().replaceAll("/+$", "")))
-                    .collect(Collectors.toList());
-        }
 
         // Пре-фильтр по OEM со страницы поиска
         List<SearchEntry> oemFiltered = regional.stream()
@@ -652,8 +647,27 @@ public class DromParser {
         }
 
         results.sort((a, b2) -> a.getPrice().compareTo(b2.getPrice()));
-        log.info("Собрано в [{}]: {} предложений (детально: {})", region, results.size(), visited);
-        return results;
+        // Финальный жёсткий отсев не-Барнаула: оставляем только подтверждённые (URL /region/ или город карточки = Барнаул).
+        List<PartPrice> barnaul = results.stream().filter(p -> isBarnaulPart(p, region)).collect(Collectors.toList());
+        log.info("Собрано в [{}]: {} предложений (детально: {}, отсев не-Барнаул: {})",
+                region, barnaul.size(), visited, results.size() - barnaul.size());
+        return barnaul;
+    }
+
+    private static final Pattern CITY_IN_URL = Pattern.compile("baza\\.drom\\.ru/([a-z][a-z\\-]+)/sell_spare_parts/");
+
+    /** URL объявления из ДРУГОГО города (не region). «Голые» g-URL без города → false (город проверим по карточке). */
+    private boolean isOtherCityUrl(String url, String region) {
+        if (url == null) return false;
+        Matcher m = CITY_IN_URL.matcher(url.toLowerCase());
+        return m.find() && !m.group(1).equals(region);
+    }
+
+    /** Подтверждённо барнаульское объявление: URL содержит /region/ или город карточки = Барнаул. */
+    private boolean isBarnaulPart(PartPrice p, String region) {
+        String u = p.getUrl() == null ? "" : p.getUrl().toLowerCase();
+        String loc = p.getLocation() == null ? "" : p.getLocation().toLowerCase();
+        return u.contains("/" + region + "/") || loc.contains("барнаул");
     }
 
     /** Лёгкая запись конкурента из данных страницы поиска (без захода на детальную). */

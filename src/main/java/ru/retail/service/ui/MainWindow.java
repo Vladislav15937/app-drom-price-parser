@@ -794,6 +794,19 @@ public class MainWindow extends JFrame {
 
                         try {
                             AggregationResult result = priceAnalyzer.analyzeCatalogLane(oem, price, regionF, companyF, laneId);
+                            if (result.isBelowMinPrice()) {
+                                // Живая цена < 600₽ — деталь не проценивается и НЕ попадает в Excel.
+                                final int d0 = done.incrementAndGet();
+                                SwingUtilities.invokeLater(() -> {
+                                    batchResults.set(rowIdx, result);
+                                    batchModel.setValueAt("—", rowIdx, 4);
+                                    batchModel.setValueAt(0, rowIdx, 5);
+                                    batchModel.setValueAt("Пропущено <600₽", rowIdx, 6);
+                                    batchStatusLabel.setText("Готово " + d0 + " / " + totalTasks + " (дорожек: " + lanes + ")");
+                                    batchStatusLabel.setForeground(BLUE);
+                                });
+                                continue;
+                            }
                             if (report != null) report.append(oem, partName, car, price, result);
                             final int d = done.incrementAndGet();
                             SwingUtilities.invokeLater(() -> {
@@ -802,8 +815,7 @@ public class MainWindow extends JFrame {
                                         && result.getRecommendedPrice().compareTo(BigDecimal.ZERO) > 0;
                                 if (found) {
                                     batchModel.setValueAt(formatPrice(result.getRecommendedPrice()) + " ₽", rowIdx, 4);
-                                    batchModel.setValueAt(
-                                            result.getCityCompetitorCount() + result.getSiberiaCompetitorCount(), rowIdx, 5);
+                                    batchModel.setValueAt(result.getCityCompetitorCount(), rowIdx, 5);
                                     batchModel.setValueAt("Готово", rowIdx, 6);
                                 } else {
                                     batchModel.setValueAt("—", rowIdx, 4);

@@ -10,7 +10,7 @@ import java.math.BigDecimal;
 import java.util.List;
 
 @Data
-@Builder
+@Builder(toBuilder = true)
 @NoArgsConstructor
 @AllArgsConstructor
 @Schema(description = "Цена на запчасть")

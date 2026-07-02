@@ -28,8 +28,11 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class PriceAnalyzer {
 
-    private static final int TOP_N = 5;                    // сколько дешёвых конкурентов берём в каждом регионе
-    private static final String FALLBACK_REGION = "novosibirsk";
+    // Решение заказчика (2026-06): проценим ТОЛЬКО по Барнаулу и по ВСЕМ объявлениям детали (не топ-5).
+    // НСК (Новосибирск) из расчёта убран. CITY_LIMIT с запасом перекрывает страницу поиска (~50 ссылок).
+    private static final int CITY_LIMIT = 100;
+    // Деталь с живой ценой на сайте < 600₽ не проценивается и не попадает в отчёт.
+    private static final BigDecimal MIN_LISTING_PRICE = new BigDecimal("600");
 
     private final DromParser dromParser;          // одиночная дорожка (веб / одиночный анализ)
     private final DromParserPool pool;            // пул дорожек (IP) для параллельного батча
@@ -84,23 +87,24 @@ public class PriceAnalyzer {
         log.info("Моё объявление: цена={}₽, дата={}, фото={}",
                 myPrice, myListing.getPublishedDate(), myListing.getPhotoUrls().size());
 
-        // 2. Парсим 5 дешёвых конкурентов в городе (без ремкомплектов/поршней)
+        // Порог: живая цена на сайте < 600₽ — деталь не проценивается (и не попадёт в отчёт).
+        BigDecimal livePrice = myListing.getPrice();
+        if (livePrice != null && livePrice.compareTo(MIN_LISTING_PRICE) < 0) {
+            log.info("OEM {}: цена на сайте {}₽ < {}₽ — не проценивается.", oemNumber, livePrice, MIN_LISTING_PRICE);
+            return belowMinResult(oemNumber, myListingUrl, livePrice, myListing.getPublishedDate(), 0);
+        }
+
+        // 2. Парсим ВСЕ объявления конкурентов по Барнаулу (без ремкомплектов/поршней)
         String normalizedMyUrl = myListingUrl.toLowerCase().replaceAll("/+$", "");
-        List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region, TOP_N).stream()
+        List<PartPrice> cityRaw = dromParser.parseParts(oemNumber, region, CITY_LIMIT).stream()
                 .filter(p -> !p.getUrl().toLowerCase().replaceAll("/+$", "").equals(normalizedMyUrl))
                 .collect(java.util.stream.Collectors.toList());
         List<PartPrice> cityPrices = filterAssemblies(cityRaw, oemNumber);
         log.info("Конкуренты в городе: {} (до фильтра: {})", cityPrices.size(), cityRaw.size());
 
-        // 3. Всегда добавляем 5 дешёвых из Новосибирска — работаем по двум регионам
+        // 3. Только Барнаул: НСК (Новосибирск) из расчёта убран.
         boolean isOldListing = isOlderThan6Months(myListing.getPublishedDate());
-        boolean searchedNsk = !region.equals(FALLBACK_REGION);
         List<PartPrice> siberiaPrices = Collections.emptyList();
-        if (searchedNsk) {
-            List<PartPrice> fallbackRaw = dromParser.parseParts(oemNumber, FALLBACK_REGION, TOP_N);
-            siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
-            log.info("{} после фильтра: {} (до фильтра: {})", FALLBACK_REGION, siberiaPrices.size(), fallbackRaw.size());
-        }
 
         // 4. AI-анализ
         AIPriceAdvisor.AIRecommendation ai = aiAdvisor.analyze(
@@ -115,14 +119,14 @@ public class PriceAnalyzer {
         BigDecimal avgPrice    = stats != null ? stats.avg()    : BigDecimal.ZERO;
         BigDecimal medianPrice = stats != null ? stats.median() : BigDecimal.ZERO;
 
-        String marketNote = buildMarketNote(isOldListing, cityPrices.size(), siberiaPrices.size(), searchedNsk);
+        String marketNote = buildMarketNote(isOldListing, cityPrices.size(), 0, false);
 
         return AggregationResult.builder()
                 .oemNumber(oemNumber)
-                .totalFound(cityPrices.size() + siberiaPrices.size())
+                .totalFound(cityPrices.size())
                 .cityCompetitorCount(cityPrices.size())
-                .siberiaCompetitorCount(siberiaPrices.size())
-                .searchedSiberia(searchedNsk)
+                .siberiaCompetitorCount(0)
+                .searchedSiberia(false)
                 .minPrice(minPrice)
                 .maxPrice(maxPrice)
                 .avgPrice(avgPrice)
@@ -195,6 +199,25 @@ public class PriceAnalyzer {
         return new PriceStats(sorted.get(0), sorted.get(size - 1), avg, median);
     }
 
+    /** Результат для детали ниже порога цены: помечаем belowMinPrice, в отчёт MainWindow её не включает. */
+    private AggregationResult belowMinResult(String oemNumber, String myListingUrl, BigDecimal livePrice,
+                                             String listingDate, int cityCount) {
+        return AggregationResult.builder()
+                .oemNumber(oemNumber)
+                .belowMinPrice(true)
+                .recommendedPrice(BigDecimal.ZERO)
+                .aiConfidence("не проценивается")
+                .aiReason("Цена на сайте " + livePrice + "₽ ниже порога " + MIN_LISTING_PRICE + "₽ — не проценивается")
+                .totalFound(cityCount).cityCompetitorCount(cityCount).siberiaCompetitorCount(0)
+                .searchedSiberia(false)
+                .myListingUrl(myListingUrl)
+                .myListingPrice(livePrice)
+                .myListingDate(listingDate)
+                .items(Collections.emptyList()).siberiaItems(Collections.emptyList())
+                .collectedAt(java.time.Instant.now())
+                .build();
+    }
+
     private String buildMarketNote(boolean isOld, int cityCount, int fallbackCount, boolean usedFallback) {
         StringBuilder sb = new StringBuilder();
         if (isOld) sb.append("Объявление старше 6 месяцев. ");
@@ -261,7 +284,7 @@ public class PriceAnalyzer {
             log.info("Город из кэша [{}]: конкурентов {}, вариантов «{}» {}",
                     cityKey, cityPrices.size(), myCompany, cm.candidates().size());
         } else {
-            DromParser.CityParseResult city = p.parseCityWithMyListing(oemNumber, region, TOP_N, myCompany, catalogPrice);
+            DromParser.CityParseResult city = p.parseCityWithMyListing(oemNumber, region, CITY_LIMIT, myCompany, catalogPrice);
             myListingUrl = city.myListingUrl();
             cityPrices = filterAssemblies(city.competitors(), oemNumber);
             // Кэшируем только успешную загрузку (наше объявление найдено → страница отрисовалась, не капча).
@@ -303,34 +326,26 @@ public class PriceAnalyzer {
                         catalogPrice, livePrice, Math.round(diff * 100));
         }
 
+        // Порог: живая цена на сайте < 600₽ — деталь не проценивается и не попадает в отчёт (решение заказчика).
+        if (livePrice != null && livePrice.compareTo(MIN_LISTING_PRICE) < 0) {
+            log.info("OEM {}: цена на сайте {}₽ < {}₽ — не проценивается, пропуск.",
+                    oemNumber, livePrice, MIN_LISTING_PRICE);
+            return belowMinResult(oemNumber, myListingUrl, livePrice,
+                    myListingInfo.getPublishedDate(), cityPrices.size());
+        }
+
         log.info("Цена: {}₽", myPrice);
 
-        // 4. Всегда добавляем 5 дешёвых из Новосибирска — работаем по двум регионам
+        // 4. Только Барнаул: НСК (Новосибирск) из расчёта убран.
         boolean isOldListing = isOlderThan6Months(myListingInfo.getPublishedDate());
-        boolean searchedNsk = !region.equals(FALLBACK_REGION);
         List<PartPrice> siberiaPrices = Collections.emptyList();
-        if (searchedNsk) {
-            String nskKey = oemNumber.trim() + "|" + FALLBACK_REGION;
-            List<PartPrice> cachedNsk = nskCache.get(nskKey);
-            if (cachedNsk != null) {
-                siberiaPrices = cachedNsk;
-                log.info("{} из кэша [{}]: {}", FALLBACK_REGION, nskKey, siberiaPrices.size());
-            } else {
-                List<PartPrice> fallbackRaw = p.parseParts(oemNumber, FALLBACK_REGION, TOP_N);
-                siberiaPrices = filterAssemblies(fallbackRaw, oemNumber);
-                log.info("{} после фильтра: {}", FALLBACK_REGION, siberiaPrices.size());
-                if (!siberiaPrices.isEmpty()) nskCache.put(nskKey, siberiaPrices);   // капчевую пустышку не кэшируем
-            }
-        }
 
         // 5. AI-анализ
         AIPriceAdvisor.AIRecommendation ai = aiAdvisor.analyze(
                 myListingInfo, myPrice, cityPrices, siberiaPrices, isOldListing);
 
-        // 6. Статистика по объединённому рынку (оба региона)
-        List<PartPrice> combined = new java.util.ArrayList<>(cityPrices);
-        combined.addAll(siberiaPrices);
-        PriceStats catalogStats = combined.isEmpty() ? null : computePriceStats(combined);
+        // 6. Статистика по рынку Барнаула
+        PriceStats catalogStats = cityPrices.isEmpty() ? null : computePriceStats(cityPrices);
         BigDecimal minPrice    = catalogStats != null ? catalogStats.min()    : BigDecimal.ZERO;
         BigDecimal maxPrice    = catalogStats != null ? catalogStats.max()    : BigDecimal.ZERO;
         BigDecimal avgPrice    = catalogStats != null ? catalogStats.avg()    : BigDecimal.ZERO;
@@ -338,10 +353,10 @@ public class PriceAnalyzer {
 
         return AggregationResult.builder()
                 .oemNumber(oemNumber)
-                .totalFound(cityPrices.size() + siberiaPrices.size())
+                .totalFound(cityPrices.size())
                 .cityCompetitorCount(cityPrices.size())
-                .siberiaCompetitorCount(siberiaPrices.size())
-                .searchedSiberia(searchedNsk)
+                .siberiaCompetitorCount(0)
+                .searchedSiberia(false)
                 .minPrice(minPrice).maxPrice(maxPrice).avgPrice(avgPrice).medianPrice(medianPrice)
                 .recommendedPrice(ai.recommendedPrice())
                 .aiConfidence(ai.confidence())
@@ -350,7 +365,7 @@ public class PriceAnalyzer {
                 .myListingDate(myListingInfo.getPublishedDate())
                 .myListingUrl(myListingUrl)
                 .myListingPrice(myListingInfo.getPrice())
-                .marketNote(buildMarketNote(isOldListing, cityPrices.size(), siberiaPrices.size(), searchedNsk))
+                .marketNote(buildMarketNote(isOldListing, cityPrices.size(), 0, false))
                 .items(cityPrices)
                 .siberiaItems(siberiaPrices)
                 .collectedAt(java.time.Instant.now())
