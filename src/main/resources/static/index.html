@@ -57,7 +57,9 @@
     <input type="text" id="s-oem" style="width:220px" placeholder="4775068010">
   </div>
   <div class="row">
-    <label>Компания на Drom:</label>
+    <label>Тип детали:</label>
+    <select id="s-profile" style="min-width:140px"></select>
+    <label style="margin-left:16px">Компания на Drom:</label>
     <input type="text" id="s-company" value="YARD86" style="width:140px">
     <label style="margin-left:16px">Цена, ₽:</label>
     <input type="number" id="s-price" style="width:120px" placeholder="необязательно">
@@ -81,7 +83,9 @@
     <input type="file" id="b-file" accept=".csv,.xlsx">
   </div>
   <div class="row">
-    <label>Компания на Drom:</label>
+    <label>Тип детали:</label>
+    <select id="b-profile" style="min-width:140px"></select>
+    <label style="margin-left:16px">Компания на Drom:</label>
     <input type="text" id="b-company" value="YARD86" style="width:140px">
     <label style="margin-left:16px">Кол-во (0 = все):</label>
     <input type="number" id="b-limit" value="0" style="width:80px">
@@ -117,6 +121,18 @@ async function loadInfo() {
   } catch(e) {}
 }
 loadInfo(); setInterval(loadInfo, 15000);
+
+// ── Профили анализа (типы деталей) ──
+async function loadProfiles() {
+  try {
+    const r = await fetch('/api/v1/profiles'); const list = await r.json();
+    for (const sel of [$('s-profile'), $('b-profile')]) {
+      sel.innerHTML = '';
+      list.forEach(n => { const o = document.createElement('option'); o.value = n; o.textContent = n; sel.appendChild(o); });
+    }
+  } catch(e) {}
+}
+loadProfiles();
 
 // ── Tabs ──
 document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
@@ -159,7 +175,7 @@ function linkHtml(url) {
 $('s-btn').onclick = () => {
   const oem = $('s-oem').value.trim();
   if (!oem) { $('s-status').textContent = 'Введите OEM'; return; }
-  const body = new URLSearchParams({ oem, catalogPrice: $('s-price').value || '0', company: $('s-company').value.trim() });
+  const body = new URLSearchParams({ oem, catalogPrice: $('s-price').value || '0', company: $('s-company').value.trim(), profile: $('s-profile').value });
   $('s-btn').disabled = true; $('s-status').textContent = 'Анализ идёт…'; $('s-result').style.display = 'none';
   sse('/api/v1/catalog-item/stream', body, {
     result: d => {
@@ -185,6 +201,7 @@ $('b-btn').onclick = () => {
   fd.append('file', f);
   fd.append('company', $('b-company').value.trim());
   fd.append('limit', $('b-limit').value || '0');
+  fd.append('profile', $('b-profile').value);
   $('b-btn').disabled = true; $('b-tbody').innerHTML = ''; bIndex = 0;
   $('b-status').textContent = 'Запуск…';
   let total = 0, done = 0;

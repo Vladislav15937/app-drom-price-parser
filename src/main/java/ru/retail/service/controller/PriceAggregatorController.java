@@ -9,6 +9,7 @@ import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import jakarta.servlet.http.HttpServletResponse;
+import ru.retail.service.config.AnalysisProfiles;
 import ru.retail.service.dto.AvailabilityResult;
 import ru.retail.service.service.CatalogLoader;
 import ru.retail.service.service.PriceAnalyzer;
@@ -37,6 +38,7 @@ public class PriceAggregatorController {
     private final PriceAnalyzer priceAnalyzer;
     private final ObjectMapper objectMapper;
     private final TunnelService tunnelService;
+    private final AnalysisProfiles analysisProfiles;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "web-analysis");
@@ -70,6 +72,12 @@ public class PriceAggregatorController {
         return map;
     }
 
+    /** Список имён профилей анализа (типов деталей) для выпадающего списка в UI. */
+    @GetMapping("/profiles")
+    public List<String> profiles() {
+        return analysisProfiles.names();
+    }
+
     // ── Анализ одной позиции по OEM (SSE) ──────────────────
 
     @PostMapping(value = "/catalog-item/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
@@ -77,7 +85,9 @@ public class PriceAggregatorController {
             @RequestParam String oem,
             @RequestParam(defaultValue = "0") BigDecimal catalogPrice,
             @RequestParam(defaultValue = "YARD86") String company,
+            @RequestParam(required = false) String profile,
             HttpServletResponse response) {
+        List<String> stops = stopWords(profile);
 
         response.setHeader("X-Accel-Buffering", "no");
         response.setHeader("Cache-Control", "no-cache");
@@ -95,7 +105,7 @@ public class PriceAggregatorController {
         executor.submit(() -> {
             try {
                 priceAnalyzer.resetBreakers();
-                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company);
+                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company, stops);
                 send(emitter, "result", objectMapper.writeValueAsString(result));
             } catch (Exception e) {
                 send(emitter, "error", e.getMessage() != null ? e.getMessage() : "Ошибка анализа");
@@ -113,14 +123,16 @@ public class PriceAggregatorController {
     public Map<String, String> submitCatalogItem(
             @RequestParam String oem,
             @RequestParam(defaultValue = "0") BigDecimal catalogPrice,
-            @RequestParam(defaultValue = "YARD86") String company) {
+            @RequestParam(defaultValue = "YARD86") String company,
+            @RequestParam(required = false) String profile) {
+        List<String> stops = stopWords(profile);
         String jobId = UUID.randomUUID().toString();
         long now = System.currentTimeMillis();
         jobs.put(jobId, new JobResult("pending", null, null, now));
         executor.submit(() -> {
             jobs.put(jobId, new JobResult("running", null, null, now));
             try {
-                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company);
+                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company, stops);
                 jobs.put(jobId, new JobResult("done", result, null, now));
             } catch (Exception e) {
                 jobs.put(jobId, new JobResult("error", null,
@@ -148,7 +160,11 @@ public class PriceAggregatorController {
             @RequestParam("file") MultipartFile file,
             @RequestParam(defaultValue = "YARD86") String company,
             @RequestParam(defaultValue = "0") int limit,
+            @RequestParam(required = false) String profile,
             HttpServletResponse response) throws IOException {
+        AnalysisProfiles.Profile pr = analysisProfiles.byName(profile);
+        String keyword = pr == null ? "" : pr.getKeyword();
+        List<String> stops = pr == null ? List.of() : pr.getStopWords();
 
         response.setHeader("X-Accel-Buffering", "no");
         response.setHeader("Cache-Control", "no-cache");
@@ -166,8 +182,8 @@ public class PriceAggregatorController {
 
         executor.submit(() -> {
             try {
-                // Каталог: только суппорты старше 6 мес по «Создан». Дедуп по OEM (один номер — один прогон).
-                List<CatalogLoader.CatalogItem> all = CatalogLoader.loadOlderThan6Months(csvBytes);
+                // Каталог: только целевой тип (профиль) старше 6 мес по «Создан». Дедуп по OEM (один номер — один прогон).
+                List<CatalogLoader.CatalogItem> all = CatalogLoader.loadOlderThan6Months(csvBytes, keyword, stops);
                 List<CatalogLoader.CatalogItem> items = new ArrayList<>();
                 java.util.Set<String> seen = new java.util.HashSet<>();
                 for (CatalogLoader.CatalogItem it : all) {
@@ -203,7 +219,7 @@ public class PriceAggregatorController {
                     send(emitter, "progress", objectMapper.writeValueAsString(progress));
 
                     try {
-                        AvailabilityResult result = priceAnalyzer.analyzeByOem(it.oem(), it.price(), company);
+                        AvailabilityResult result = priceAnalyzer.analyzeByOem(it.oem(), it.price(), company, stops);
                         progress.put("result", result);
                         progress.put("status", "done");
                     } catch (Exception e) {
@@ -225,6 +241,12 @@ public class PriceAggregatorController {
     }
 
     // ── Утилиты ────────────────────────────────────────────
+
+    /** Стоп-слова профиля по имени (пустое/неизвестное имя → дефолтный профиль). */
+    private List<String> stopWords(String profileName) {
+        AnalysisProfiles.Profile p = analysisProfiles.byName(profileName);
+        return p == null ? List.of() : p.getStopWords();
+    }
 
     private void send(SseEmitter emitter, String event, String data) {
         try {

@@ -5,6 +5,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.ApplicationListener;
 import org.springframework.stereotype.Component;
+import ru.retail.service.config.AnalysisProfiles;
 import ru.retail.service.service.PriceAnalyzer;
 import ru.retail.service.service.TunnelService;
 
@@ -16,6 +17,7 @@ public class DesktopUILauncher implements ApplicationListener<ApplicationReadyEv
 
     private final PriceAnalyzer priceAnalyzer;
     private final TunnelService tunnelService;
+    private final AnalysisProfiles analysisProfiles;
 
     @Override
     public void onApplicationEvent(ApplicationReadyEvent event) {
@@ -23,7 +25,7 @@ public class DesktopUILauncher implements ApplicationListener<ApplicationReadyEv
         SwingUtilities.invokeLater(() -> {
             FlatDarkLaf.setup();
             UIManager.put("defaultFont", new java.awt.Font("Segoe UI", java.awt.Font.PLAIN, 14));
-            new MainWindow(priceAnalyzer, tunnelService).setVisible(true);
+            new MainWindow(priceAnalyzer, tunnelService, analysisProfiles).setVisible(true);
         });
     }
 }

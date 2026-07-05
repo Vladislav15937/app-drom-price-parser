@@ -55,12 +55,6 @@ public class PriceAnalyzer {
     private final DromParser dromParser;   // одиночная дорожка (веб / одиночный анализ)
     private final DromParserPool pool;     // пул дорожек (IP) для параллельного батча
 
-    // Товары каталога с не-узлами (ремкомплекты/компоненты) на drom стоят иначе — считаем только суппорты в сборе.
-    private static final List<String> NON_ASSEMBLY_KEYWORDS = List.of(
-            "ремкомплект", "ремонтный комплект", "поршень", "направляющ",
-            "пыльник", "скоба", "уплотнитель", "манжет", "прокладк",
-            "комплект направляющ", "болт", "пружин", "шплинт", "ступиц", "диск");
-
     // Кэш сканов на батч (ключ OEM+регион, общий на дорожки): дубли OEM не перезапрашивают страницу поиска drom.
     // Кэшируем ТОЛЬКО непустой результат — капчевую пустышку нельзя (иначе ломается повтор-на-свежем-IP).
     private final Map<String, DromParser.RegionScan> scanCache = new ConcurrentHashMap<>();
@@ -81,14 +75,14 @@ public class PriceAnalyzer {
 
     // ==================== ПУБЛИЧНЫЕ ВХОДЫ ====================
 
-    /** Веб/одиночный анализ по OEM — одиночная дорожка. */
-    public AvailabilityResult analyzeByOem(String oem, BigDecimal price, String myCompany) {
-        return analyzeWithRetry(oem, price, myCompany, dromParser);
+    /** Веб/одиночный анализ по OEM — одиночная дорожка. stopWords — профиль типа детали. */
+    public AvailabilityResult analyzeByOem(String oem, BigDecimal price, String myCompany, List<String> stopWords) {
+        return analyzeWithRetry(oem, price, myCompany, dromParser, stopWords);
     }
 
     /** Параллельный батч — конкретная дорожка пула (свой IP). */
-    public AvailabilityResult analyzeCatalogLane(String oem, BigDecimal price, String myCompany, int lane) {
-        return analyzeWithRetry(oem, price, myCompany, pool.lane(lane));
+    public AvailabilityResult analyzeCatalogLane(String oem, BigDecimal price, String myCompany, int lane, List<String> stopWords) {
+        return analyzeWithRetry(oem, price, myCompany, pool.lane(lane), stopWords);
     }
 
     // ==================== ОРКЕСТРАЦИЯ ====================
@@ -97,11 +91,11 @@ public class PriceAnalyzer {
      * Прогон OEM с повтором при капче со сменой IP: если за время прогона дорожка сменила IP
      * (была нерешаемая капча), OEM прогоняется заново на свежем IP.
      */
-    private AvailabilityResult analyzeWithRetry(String oem, BigDecimal price, String myCompany, DromParser p) {
+    private AvailabilityResult analyzeWithRetry(String oem, BigDecimal price, String myCompany, DromParser p, List<String> stopWords) {
         AvailabilityResult res = null;
         for (int attempt = 1; attempt <= MAX_OEM_ATTEMPTS; attempt++) {
             long rotBefore = p.rotationCount();
-            res = analyzeOnce(oem, price, myCompany, p);
+            res = analyzeOnce(oem, price, myCompany, p, stopWords);
             boolean rotatedDuringRun = p.rotationCount() > rotBefore;
             if (!rotatedDuringRun || p.isCaptchaBlocked() || attempt >= MAX_OEM_ATTEMPTS) {
                 if (rotatedDuringRun && attempt > 1)
@@ -114,12 +108,12 @@ public class PriceAnalyzer {
         return res;
     }
 
-    private AvailabilityResult analyzeOnce(String oem, BigDecimal price, String myCompany, DromParser p) {
+    private AvailabilityResult analyzeOnce(String oem, BigDecimal price, String myCompany, DromParser p, List<String> stopWords) {
         log.info("=== Наличие OEM: {} | Компания: {} ===", oem, myCompany);
 
         // 1. Барнаул (город): конкуренты + наше объявление. Порог <4.
         DromParser.RegionScan barnaul = scan(p, oem, HOME_CITY, myCompany);
-        int b = countCompetitors(barnaul.competitors(), oem);
+        int b = countCompetitors(barnaul.competitors(), oem, stopWords);
         String myUrl = pickUrlByPrice(barnaul.myCandidates(), price);
         log.info("Барнаул: конкурентов {} (наших объявлений {})", b, barnaul.myCandidates().size());
 
@@ -130,7 +124,7 @@ public class PriceAnalyzer {
         if (b < SIBERIA_TRIGGER) {
             searched = true;
             for (String region : SIBERIA_REGIONS) {
-                int c = countCompetitors(scan(p, oem, region, myCompany).competitors(), oem);
+                int c = countCompetitors(scan(p, oem, region, myCompany).competitors(), oem, stopWords);
                 siberiaTotal += c;
                 log.info("Сибирь [{}]: конкурентов {} (сумма {})", region, c, siberiaTotal);
             }
@@ -165,10 +159,10 @@ public class PriceAnalyzer {
 
     // ==================== ПОДСЧЁТ / ЦВЕТ ====================
 
-    /** Конкуренты по этому OEM: узлы в сборе, тот же OEM. Б/у-фильтр применён на стороне drom
-     *  (condition[]=used в buildSearchUrl), поэтому здесь достаточно фильтра узлов/OEM. */
-    private int countCompetitors(List<PartPrice> competitors, String oem) {
-        return filterAssemblies(competitors, oem).size();
+    /** Конкуренты по этому OEM: целевая деталь (без стоп-слов), тот же OEM. Б/у-фильтр — на стороне drom
+     *  (condition[]=used в buildSearchUrl), поэтому здесь достаточно фильтра типа/OEM. */
+    private int countCompetitors(List<PartPrice> competitors, String oem, List<String> stopWords) {
+        return filterAssemblies(competitors, oem, stopWords).size();
     }
 
     private Color computeColor(int barnaul, int siberia, boolean searched) {
@@ -197,13 +191,14 @@ public class PriceAnalyzer {
         return oem.replaceAll("[^A-Za-z0-9]", "").toUpperCase();
     }
 
-    /** Выкидывает не-узлы (ремкомплекты/компоненты) и объявления с НЕ совпадающим OEM. */
-    private List<PartPrice> filterAssemblies(List<PartPrice> parts, String targetOem) {
+    /** Выкидывает нецелевые (по стоп-словам профиля) и объявления с НЕ совпадающим OEM. */
+    private List<PartPrice> filterAssemblies(List<PartPrice> parts, String targetOem, List<String> stopWords) {
         String normalizedTarget = normalizeOem(targetOem);
+        List<String> stops = stopWords == null ? List.of() : stopWords;
         return parts.stream()
                 .filter(p -> {
                     String title = p.getTitle() == null ? "" : p.getTitle().toLowerCase();
-                    if (NON_ASSEMBLY_KEYWORDS.stream().anyMatch(title::contains)) return false;
+                    if (stops.stream().anyMatch(w -> !w.isBlank() && title.contains(w.toLowerCase()))) return false;
                     if (p.getOem() != null && !p.getOem().isBlank()) {
                         return normalizeOem(p.getOem()).equals(normalizedTarget);
                     }

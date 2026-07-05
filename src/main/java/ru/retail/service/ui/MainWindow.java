@@ -1,5 +1,6 @@
 package ru.retail.service.ui;
 
+import ru.retail.service.config.AnalysisProfiles;
 import ru.retail.service.dto.AvailabilityResult;
 import ru.retail.service.service.CatalogLoader;
 import ru.retail.service.service.PriceAnalyzer;
@@ -43,7 +44,11 @@ public class MainWindow extends JFrame {
 
     private final PriceAnalyzer priceAnalyzer;
     private final TunnelService tunnelService;
+    private final AnalysisProfiles profiles;
     private JLabel publicUrlLabel;
+    private JComboBox<String> profileCombo;        // тип детали (батч)
+    private JComboBox<String> singleProfileCombo;  // тип детали (одиночный)
+    private File loadedFile;                        // текущий загруженный каталог (для перезагрузки при смене профиля)
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "analysis-thread");
@@ -78,10 +83,20 @@ public class MainWindow extends JFrame {
 
     private static final DateTimeFormatter D = DateTimeFormatter.ofPattern("dd.MM.yyyy");
 
-    public MainWindow(PriceAnalyzer priceAnalyzer, TunnelService tunnelService) {
+    public MainWindow(PriceAnalyzer priceAnalyzer, TunnelService tunnelService, AnalysisProfiles profiles) {
         this.priceAnalyzer = priceAnalyzer;
         this.tunnelService = tunnelService;
+        this.profiles = profiles;
         buildUI();
+    }
+
+    private String[] profileNames() {
+        List<String> n = profiles == null ? List.of() : profiles.names();
+        return n.isEmpty() ? new String[]{"(нет профилей)"} : n.toArray(new String[0]);
+    }
+
+    private AnalysisProfiles.Profile prof(JComboBox<String> combo) {
+        return profiles == null ? null : profiles.byName((String) combo.getSelectedItem());
     }
 
     // ═══════════════════════════════════════════════════════
@@ -192,6 +207,11 @@ public class MainWindow extends JFrame {
         lbl.gridy = 1; panel.add(label("Параметры:"), lbl);
         fld.gridy = 1;
         JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        row.add(label("Тип детали:"));
+        row.add(Box.createHorizontalStrut(8));
+        singleProfileCombo = new JComboBox<>(profileNames());
+        row.add(singleProfileCombo);
+        row.add(Box.createHorizontalStrut(20));
         row.add(label("Компания на Drom:"));
         row.add(Box.createHorizontalStrut(8));
         singleCompanyField = new JTextField("YARD86", 12);
@@ -294,6 +314,13 @@ public class MainWindow extends JFrame {
         lbl.gridy = 1; panel.add(label("Параметры:"), lbl);
         fld.gridy = 1;
         JPanel settingsRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        settingsRow.add(label("Тип детали:"));
+        settingsRow.add(Box.createHorizontalStrut(8));
+        profileCombo = new JComboBox<>(profileNames());
+        profileCombo.setToolTipText("Профиль из application.yml: ключевое слово каталога + стоп-слова");
+        profileCombo.addActionListener(e -> { if (loadedFile != null) loadCsvFile(loadedFile); });
+        settingsRow.add(profileCombo);
+        settingsRow.add(Box.createHorizontalStrut(20));
         settingsRow.add(label("Компания на Drom:"));
         settingsRow.add(Box.createHorizontalStrut(8));
         companyField = new JTextField("YARD86", 12);
@@ -441,7 +468,9 @@ public class MainWindow extends JFrame {
         executor.submit(() -> {
             try {
                 priceAnalyzer.resetBreakers();
-                AvailabilityResult res = priceAnalyzer.analyzeByOem(oem, priceF, company);
+                AnalysisProfiles.Profile pr = prof(singleProfileCombo);
+                AvailabilityResult res = priceAnalyzer.analyzeByOem(oem, priceF, company,
+                        pr == null ? List.of() : pr.getStopWords());
                 SwingUtilities.invokeLater(() -> showSingle(res));
             } catch (Exception ex) {
                 SwingUtilities.invokeLater(() -> {
@@ -513,7 +542,11 @@ public class MainWindow extends JFrame {
 
     private void loadCsvFile(File file) {
         try {
-            catalogItems = CatalogLoader.loadOlderThan6Months(file);
+            loadedFile = file;
+            AnalysisProfiles.Profile pr = prof(profileCombo);
+            String kw = pr == null ? "" : pr.getKeyword();
+            List<String> stops = pr == null ? List.of() : pr.getStopWords();
+            catalogItems = CatalogLoader.loadOlderThan6Months(file, kw, stops);
             batchModel.setRowCount(0);
             for (CatalogLoader.CatalogItem it : catalogItems) {
                 batchModel.addRow(new Object[]{
@@ -567,6 +600,8 @@ public class MainWindow extends JFrame {
         setBatchLink(null);
 
         final String company = companyField.getText().trim();
+        AnalysisProfiles.Profile pr = prof(profileCombo);
+        final List<String> stops = pr == null ? List.of() : pr.getStopWords();
         int limitVal = 0;
         try { limitVal = Integer.parseInt(batchLimitField.getText().trim()); } catch (Exception ignored) {}
         final int total = (limitVal > 0 && limitVal < catalogItems.size()) ? limitVal : catalogItems.size();
@@ -605,7 +640,7 @@ public class MainWindow extends JFrame {
 
                         try {
                             AvailabilityResult res = priceAnalyzer.analyzeCatalogLane(
-                                    it.oem(), it.price(), company, laneId);
+                                    it.oem(), it.price(), company, laneId, stops);
                             if (report != null)
                                 report.append(it.oem(), it.name(), auto(it), it.price(),
                                         it.created().format(D), res);

@@ -43,15 +43,18 @@ public final class CatalogLoader {
     private static final DateTimeFormatter DT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter D  = DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
-    public static List<CatalogItem> loadOlderThan6Months(File file) throws Exception {
-        return loadOlderThan6Months(Files.readAllBytes(file.toPath()));
+    public static List<CatalogItem> loadOlderThan6Months(File file, String keyword, List<String> stopWords) throws Exception {
+        return loadOlderThan6Months(Files.readAllBytes(file.toPath()), keyword, stopWords);
     }
 
     /**
-     * Разбирает CSV и оставляет только суппорты в сборе, у которых «Создан» старше 6 месяцев.
-     * Нераспарсенные даты и не-суппорты пропускаются (с логом статистики).
+     * Разбирает CSV/XLSX и оставляет только позиции целевого типа (название содержит {@code keyword}
+     * и НЕ содержит ни одного из {@code stopWords}), у которых «Создан» старше 6 месяцев.
+     * Нераспарсенные даты и нецелевые строки пропускаются (с логом статистики).
      */
-    public static List<CatalogItem> loadOlderThan6Months(byte[] bytes) {
+    public static List<CatalogItem> loadOlderThan6Months(byte[] bytes, String keyword, List<String> stopWords) {
+        String kw = keyword == null ? "" : keyword.toLowerCase();
+        List<String> stops = stopWords == null ? List.of() : stopWords;
         List<String[]> rows = looksLikeXlsx(bytes) ? parseXlsx(bytes) : parseCsv(bytes);
         if (rows.isEmpty()) return List.of();
 
@@ -80,7 +83,7 @@ public final class CatalogLoader {
 
             String name = get(row, iName);
             String partType = get(row, iPartType);
-            if (!isSupport(name, partType)) { skippedPart++; continue; }
+            if (!matchesType(name, partType, kw, stops)) { skippedPart++; continue; }
 
             LocalDateTime created = parseDate(get(row, iCreated));
             if (created == null) { skippedDate++; continue; }
@@ -95,16 +98,17 @@ public final class CatalogLoader {
                     created));
         }
 
-        log.info("Каталог: отобрано {} (старше 6 мес). Пропущено: свежих {}, не-суппортов {}, без даты {}, без OEM {}.",
-                out.size(), skippedFresh, skippedPart, skippedDate, skippedOem);
+        log.info("Каталог [{}]: отобрано {} (старше 6 мес). Пропущено: свежих {}, нецелевых {}, без даты {}, без OEM {}.",
+                keyword, out.size(), skippedFresh, skippedPart, skippedDate, skippedOem);
         return out;
     }
 
-    /** Суппорт в сборе: название/тип содержит «суппорт», но не ремкомплект/поршень/направляющую. */
-    private static boolean isSupport(String name, String partType) {
+    /** Целевая деталь: название/тип содержит keyword и не содержит ни одного стоп-слова. */
+    private static boolean matchesType(String name, String partType, String keyword, List<String> stopWords) {
         String s = (name + " " + partType).toLowerCase();
-        if (!s.contains("суппорт")) return false;
-        return !(s.contains("ремкомплект") || s.contains("поршень") || s.contains("направля"));
+        if (keyword.isBlank() || !s.contains(keyword)) return false;
+        for (String w : stopWords) if (!w.isBlank() && s.contains(w.toLowerCase())) return false;
+        return true;
     }
 
     private static LocalDateTime parseDate(String s) {
