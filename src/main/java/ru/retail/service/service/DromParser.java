@@ -525,8 +525,12 @@ public class DromParser {
             List<MyListingCandidate> mine = new ArrayList<>();
             List<PartPrice> competitors = new ArrayList<>();
             for (SearchEntry e : entries) {
-                // Подмешанные объявления из других городов (метка доставки «в <город>») — не наш регион, пропускаем.
-                if (e.otherCity() != null && !e.otherCity().isBlank()) continue;
+                // Подмешка из ДРУГОГО региона/города: drom помечает такие меткой с предлогом «в <город>»
+                // («в Улан-Удэ», «во Владивостоке»). Объявления ВНУТРИ искомой гео-области помечены городом
+                // без предлога («Барнаул», «Новоалтайск») либо без метки — их оставляем. Так работает и для
+                // поиска по городу, и по региону (регион показывает все свои города без предлога).
+                String oc = e.otherCity() == null ? "" : e.otherCity().trim().toLowerCase();
+                if (oc.startsWith("в ") || oc.startsWith("во ")) continue;
                 boolean isMine = !companyLower.isBlank() && e.dealer() != null
                         && e.dealer().toLowerCase().contains(companyLower);
                 if (isMine) {

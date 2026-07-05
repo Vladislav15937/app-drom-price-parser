@@ -28,9 +28,22 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class PriceAnalyzer {
 
-    /** Барнаул — первый (домашний). Остальные — «Сибирь» для расширенного поиска при разреженном рынке. */
-    private static final List<String> SIBERIA = List.of(
-            "barnaul", "novosibirsk", "omsk", "tomsk", "kemerovo", "krasnoyarsk", "irkutsk");
+    /** Домашний город (порог <4). */
+    private static final String HOME_CITY = "barnaul";
+
+    /** «Сибирь» — поиск ПО РЕГИОНАМ ЦЕЛИКОМ (drom по geo-slug региона показывает все его города).
+     *  Алтайский край включает Барнаул, поэтому S считаем ТОЛЬКО по регионам (без отдельного +Барнаул). */
+    private static final List<String> SIBERIA_REGIONS = List.of(
+            "altai-resp",        // Республика Алтай
+            "altaiskii-krai",    // Алтайский край (вкл. Барнаул)
+            "irkutskaya-obl",    // Иркутская область
+            "kemerovskaya-obl",  // Кемеровская область
+            "krasnoyarskii-krai",// Красноярский край
+            "novosibirskaya-obl",// Новосибирская область
+            "omskaya-obl",       // Омская область
+            "khakasiya-resp",    // Республика Хакасия
+            "tomskaya-obl",      // Томская область
+            "tyva-resp");        // Республика Тыва
 
     private static final int BARNAUL_MIN     = 4;    // < 4 конкурентов в Барнауле → жёлтый/красный
     private static final int SIBERIA_TRIGGER = 10;   // < 10 в Барнауле → идём в Сибирь
@@ -46,7 +59,7 @@ public class PriceAnalyzer {
     private static final List<String> NON_ASSEMBLY_KEYWORDS = List.of(
             "ремкомплект", "ремонтный комплект", "поршень", "направляющ",
             "пыльник", "скоба", "уплотнитель", "манжет", "прокладк",
-            "комплект направляющ", "болт", "пружин", "шплинт", "ступиц");
+            "комплект направляющ", "болт", "пружин", "шплинт", "ступиц", "диск");
 
     // Кэш сканов на батч (ключ OEM+регион, общий на дорожки): дубли OEM не перезапрашивают страницу поиска drom.
     // Кэшируем ТОЛЬКО непустой результат — капчевую пустышку нельзя (иначе ломается повтор-на-свежем-IP).
@@ -104,22 +117,22 @@ public class PriceAnalyzer {
     private AvailabilityResult analyzeOnce(String oem, BigDecimal price, String myCompany, DromParser p) {
         log.info("=== Наличие OEM: {} | Компания: {} ===", oem, myCompany);
 
-        // 1. Барнаул: конкуренты + наше объявление.
-        DromParser.RegionScan barnaul = scan(p, oem, "barnaul", myCompany);
+        // 1. Барнаул (город): конкуренты + наше объявление. Порог <4.
+        DromParser.RegionScan barnaul = scan(p, oem, HOME_CITY, myCompany);
         int b = countCompetitors(barnaul.competitors(), oem);
         String myUrl = pickUrlByPrice(barnaul.myCandidates(), price);
         log.info("Барнаул: конкурентов {} (наших объявлений {})", b, barnaul.myCandidates().size());
 
-        // 2. При разреженном рынке в Барнауле — расширяем поиск на всю Сибирь.
-        int siberiaTotal = b;
+        // 2. При b<10 — расширяем на всю Сибирь ПО РЕГИОНАМ ЦЕЛИКОМ (все города регионов, вкл. Алтайский край).
+        //    S считаем строго по регионам (altaiskii-krai уже покрывает Барнаул), поэтому начинаем с 0.
+        int siberiaTotal = 0;
         boolean searched = false;
         if (b < SIBERIA_TRIGGER) {
             searched = true;
-            for (int i = 1; i < SIBERIA.size(); i++) {
-                String city = SIBERIA.get(i);
-                int c = countCompetitors(scan(p, oem, city, myCompany).competitors(), oem);
+            for (String region : SIBERIA_REGIONS) {
+                int c = countCompetitors(scan(p, oem, region, myCompany).competitors(), oem);
                 siberiaTotal += c;
-                log.info("Сибирь [{}]: конкурентов {} (сумма {})", city, c, siberiaTotal);
+                log.info("Сибирь [{}]: конкурентов {} (сумма {})", region, c, siberiaTotal);
             }
         }
 
