@@ -525,6 +525,8 @@ public class DromParser {
             List<MyListingCandidate> mine = new ArrayList<>();
             List<PartPrice> competitors = new ArrayList<>();
             for (SearchEntry e : entries) {
+                // Подмешанные объявления из других городов (метка доставки «в <город>») — не наш регион, пропускаем.
+                if (e.otherCity() != null && !e.otherCity().isBlank()) continue;
                 boolean isMine = !companyLower.isBlank() && e.dealer() != null
                         && e.dealer().toLowerCase().contains(companyLower);
                 if (isMine) {
@@ -796,9 +798,12 @@ public class DromParser {
     // ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
 
     /** Данные объявления, извлечённые прямо со страницы результатов поиска. */
-    record SearchEntry(String url, String dealer, String oem, String title, BigDecimal price, String date) {
-        SearchEntry(String url, String dealer) { this(url, dealer, "", "", null, ""); }
-        SearchEntry(String url, String dealer, String oem) { this(url, dealer, oem, "", null, ""); }
+    // otherCity — непусто, если объявление ПОДМЕШАНО из другого города (drom добивает выдачу до 50
+    // объявлениями из других городов, когда локальных мало; у них метка доставки «в <город>»). Такие
+    // при подсчёте наличия по региону отсекаются — иначе редкие детали ложно выглядят «плотными».
+    record SearchEntry(String url, String dealer, String oem, String title, BigDecimal price, String date, String otherCity) {
+        SearchEntry(String url, String dealer) { this(url, dealer, "", "", null, "", ""); }
+        SearchEntry(String url, String dealer, String oem) { this(url, dealer, oem, "", null, "", ""); }
     }
 
     @SuppressWarnings("unchecked")
@@ -828,8 +833,11 @@ public class DromParser {
                     // Дата
                     const dateEl = row.querySelector('.date, .bull-item__date, .viewbull-actual-date');
                     const dateText = dateEl ? dateEl.textContent.trim() : '';
+                    // Метка доставки из другого города (примесь, когда локальных объявлений мало)
+                    const cityEl = row.querySelector('.bull-delivery__city, .bull-delivery_city');
+                    const otherCity = cityEl ? cityEl.textContent.trim() : '';
                     return { url: a.href, dealer: dealer ? dealer.textContent.trim() : '',
-                             oem: oem, title: titleText, price: priceText, date: dateText };
+                             oem: oem, title: titleText, price: priceText, date: dateText, otherCity: otherCity };
                   }).filter(e => e && e.url && e.url.length > 15)
                 )
                 """);
@@ -843,10 +851,11 @@ public class DromParser {
                 String oem    = m.get("oem")    instanceof String o ? o : "";
                 String title  = m.get("title")  instanceof String t ? t : "";
                 String date   = m.get("date")   instanceof String d ? d : "";
+                String otherCity = m.get("otherCity") instanceof String oc ? oc : "";
                 String priceStr = m.get("price") instanceof String p ? p : "";
                 BigDecimal price = null;
                 try { if (!priceStr.isBlank()) price = new BigDecimal(priceStr); } catch (Exception ignored) {}
-                if (url != null && !url.isBlank()) entries.add(new SearchEntry(url, dealer, oem, title, price, date));
+                if (url != null && !url.isBlank()) entries.add(new SearchEntry(url, dealer, oem, title, price, date, otherCity));
             }
             if (!entries.isEmpty()) return entries;
         } catch (Exception e) {
@@ -1252,7 +1261,12 @@ public class DromParser {
     }
 
     private String buildSearchUrl(String oem, String region) {
-        return String.format("https://baza.drom.ru/%s/sell_spare_parts/?query=%s", region, oem);
+        // condition[]=used — только Б/у (drom убирает магазины новых з/ч; если новых нет — фильтр просто
+        // «неэффективен» и ничего не меняет). goodPresentState[]=present — только «в наличии» (без архива/проданных).
+        // Так подсчёт = реально доступные б/у-конкуренты, а не оптовые новые аналоги.
+        return String.format(
+                "https://baza.drom.ru/%s/sell_spare_parts/?condition%%5B%%5D=used&goodPresentState%%5B%%5D=present&query=%s",
+                region, oem);
     }
 
     /**

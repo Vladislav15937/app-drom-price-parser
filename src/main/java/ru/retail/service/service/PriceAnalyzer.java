@@ -46,7 +46,7 @@ public class PriceAnalyzer {
     private static final List<String> NON_ASSEMBLY_KEYWORDS = List.of(
             "ремкомплект", "ремонтный комплект", "поршень", "направляющ",
             "пыльник", "скоба", "уплотнитель", "манжет", "прокладк",
-            "комплект направляющ", "болт", "пружин", "шплинт");
+            "комплект направляющ", "болт", "пружин", "шплинт", "ступиц");
 
     // Кэш сканов на батч (ключ OEM+регион, общий на дорожки): дубли OEM не перезапрашивают страницу поиска drom.
     // Кэшируем ТОЛЬКО непустой результат — капчевую пустышку нельзя (иначе ломается повтор-на-свежем-IP).
@@ -152,17 +152,10 @@ public class PriceAnalyzer {
 
     // ==================== ПОДСЧЁТ / ЦВЕТ ====================
 
-    /** Конкуренты по этому OEM: узлы в сборе, тот же OEM, б/у (не помечены как новые). */
+    /** Конкуренты по этому OEM: узлы в сборе, тот же OEM. Б/у-фильтр применён на стороне drom
+     *  (condition[]=used в buildSearchUrl), поэтому здесь достаточно фильтра узлов/OEM. */
     private int countCompetitors(List<PartPrice> competitors, String oem) {
-        return (int) filterAssemblies(competitors, oem).stream()
-                .filter(this::isUsedOrUnknown)
-                .count();
-    }
-
-    /** Б/у или без явной пометки. Явно новые объявления не считаем (нам нужен рынок б/у). */
-    private boolean isUsedOrUnknown(PartPrice p) {
-        String t = (p.getTitle() == null ? "" : p.getTitle()).toLowerCase();
-        return !(t.contains("новый") || t.contains("новая") || t.contains("новое") || t.contains("new"));
+        return filterAssemblies(competitors, oem).size();
     }
 
     private Color computeColor(int barnaul, int siberia, boolean searched) {
