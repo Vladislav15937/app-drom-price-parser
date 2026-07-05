@@ -1,21 +1,17 @@
 package ru.retail.service.ui;
 
-import ru.retail.service.dto.AggregationResult;
-import ru.retail.service.dto.PartPrice;
+import ru.retail.service.dto.AvailabilityResult;
+import ru.retail.service.service.CatalogLoader;
 import ru.retail.service.service.PriceAnalyzer;
 import ru.retail.service.service.TunnelService;
 
 import javax.swing.*;
-import javax.swing.event.ListSelectionEvent;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.InputStreamReader;
 import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -27,6 +23,11 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * Десктоп-окно анализа наличия/плотности рынка (без ИИ).
+ * Загрузка каталога → фильтр по «Создан» (старше 6 мес) → подсчёт конкурентов по OEM
+ * (Барнаул, при разреженном рынке — вся Сибирь) → цветной xlsx-отчёт со ссылкой на наше объявление.
+ */
 public class MainWindow extends JFrame {
 
     private static final Color GREEN  = new Color(34, 197, 94);
@@ -34,6 +35,11 @@ public class MainWindow extends JFrame {
     private static final Color RED    = new Color(239, 68, 68);
     private static final Color DIM    = new Color(160, 160, 160);
     private static final Color BLUE   = new Color(96, 165, 250);
+
+    // Фон строк таблицы по цвету результата (тёмная тема).
+    private static final Color BG_RED    = new Color(80, 30, 30);
+    private static final Color BG_PURPLE = new Color(60, 40, 80);
+    private static final Color BG_YELLOW = new Color(80, 70, 20);
 
     private final PriceAnalyzer priceAnalyzer;
     private final TunnelService tunnelService;
@@ -45,55 +51,32 @@ public class MainWindow extends JFrame {
         return t;
     });
 
-    // ── Tab 1: Single analysis ──
+    // ── Tab 1: Single (по OEM) ──
     private JTextField oemField;
-    private JTextField urlField;
-    private JComboBox<String> regionCombo;
     private JTextField priceField;
+    private JTextField singleCompanyField;
     private JButton analyzeBtn;
     private JLabel statusLabel;
-    private JScrollPane resultScroll;
-    private JLabel recPriceLabel;
-    private JLabel confidenceLabel;
-    private JLabel statsLabel;
-    private JLabel marketNoteLabel;
-    private JTextArea aiReasonArea;
-    private DefaultTableModel cityModel;
-    private DefaultTableModel siberiaModel;
-    private JPanel siberiaSection;
+    private JLabel resultTitleLabel;
+    private JLabel resultCountsLabel;
+    private JLabel resultStatusLabel;
+    private JLabel myLinkLabel;
 
-    // ── Tab 2: Batch analysis ──
+    // ── Tab 2: Batch (по каталогу) ──
     private JTextField csvPathField;
     private JTextField batchLimitField;
-    private JComboBox<String> batchRegionCombo;
     private JTextField companyField;
     private JButton batchAnalyzeBtn;
     private JButton batchStopBtn;
     private JLabel batchStatusLabel;
     private DefaultTableModel batchModel;
     private JTable batchTable;
-    private List<String[]> catalogRows = new ArrayList<>();
-
-    // CSV-каталог (Windows-1251, ; , кавычки). Колонки (0-idx) нового формата 14-06-26:
-    // 0 Номер товара | 1 Запчасть | 2 Цена | 3 Номер производителя (OEM) | 4 Ткацкая(своб) | 5..6 Ткацкая | 7..9 54 YARD
-    private static final int COL_PART  = 1;   // имя детали («суппорт», «Ремкомплект суппорта», …)
-    private static final int COL_PRICE = 2;   // цена каталога
-    private static final int COL_OEM   = 3;   // номер производителя = OEM для поиска на drom
-    private static final int COL_STOCK = 4;   // Ткацкая (свободно) — остаток на основном складе
-    private List<AggregationResult> batchResults = new ArrayList<>();
+    private JLabel batchLinkLabel;
+    private List<CatalogLoader.CatalogItem> catalogItems = new ArrayList<>();
+    private List<AvailabilityResult> batchResults = new ArrayList<>();
     private volatile boolean batchStopped = false;
 
-    // ── Tab 2: Batch detail panel ──
-    private JLabel batchRecPriceLabel;
-    private JLabel batchConfidenceLabel;
-    private JLabel batchStatsLabel;
-    private JLabel batchMarketNoteLabel;
-    private JTextArea batchAiReasonArea;
-    private DefaultTableModel batchCityModel;
-    private DefaultTableModel batchSiberiaModel;
-    private JPanel batchSiberiaSection;
-    private JLabel batchDetailHint;
-    private JScrollPane batchDetailScroll;
+    private static final DateTimeFormatter D = DateTimeFormatter.ofPattern("dd.MM.yyyy");
 
     public MainWindow(PriceAnalyzer priceAnalyzer, TunnelService tunnelService) {
         this.priceAnalyzer = priceAnalyzer;
@@ -106,13 +89,13 @@ public class MainWindow extends JFrame {
     // ═══════════════════════════════════════════════════════
 
     private void buildUI() {
-        setTitle("Анализ цен на запчасти — Drom.ru");
+        setTitle("Анализ наличия запчастей — Drom.ru");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setMinimumSize(new Dimension(950, 700));
-        setPreferredSize(new Dimension(1200, 960));
+        setPreferredSize(new Dimension(1200, 900));
 
         JTabbedPane tabs = new JTabbedPane();
-        tabs.addTab("Анализ по ссылке", buildSinglePanel());
+        tabs.addTab("Проверка по OEM", buildSinglePanel());
         tabs.addTab("Анализ по каталогу", buildBatchPanel());
 
         JPanel content = new JPanel(new BorderLayout());
@@ -122,7 +105,6 @@ public class MainWindow extends JFrame {
         pack();
         setLocationRelativeTo(null);
 
-        // Ждём публичный URL в фоне и обновляем строку
         Thread urlWaiter = new Thread(() -> {
             String pub = tunnelService.waitForPublicUrl();
             SwingUtilities.invokeLater(() -> updatePublicUrl(pub));
@@ -146,8 +128,7 @@ public class MainWindow extends JFrame {
         localLbl.setToolTipText("Нажмите, чтобы скопировать");
         localLbl.addMouseListener(new java.awt.event.MouseAdapter() {
             @Override public void mouseClicked(java.awt.event.MouseEvent e) {
-                Toolkit.getDefaultToolkit().getSystemClipboard()
-                        .setContents(new StringSelection(local), null);
+                copy(local);
             }
             @Override public void mouseEntered(java.awt.event.MouseEvent e) { localLbl.setForeground(BLUE); }
             @Override public void mouseExited(java.awt.event.MouseEvent e)  { localLbl.setForeground(DIM); }
@@ -173,10 +154,7 @@ public class MainWindow extends JFrame {
             publicUrlLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
             publicUrlLabel.setToolTipText("Нажмите, чтобы скопировать");
             publicUrlLabel.addMouseListener(new java.awt.event.MouseAdapter() {
-                @Override public void mouseClicked(java.awt.event.MouseEvent e) {
-                    Toolkit.getDefaultToolkit().getSystemClipboard()
-                            .setContents(new StringSelection(pub), null);
-                }
+                @Override public void mouseClicked(java.awt.event.MouseEvent e) { copy(pub); }
                 @Override public void mouseEntered(java.awt.event.MouseEvent e) { publicUrlLabel.setForeground(BLUE); }
                 @Override public void mouseExited(java.awt.event.MouseEvent e)  { publicUrlLabel.setForeground(GREEN); }
             });
@@ -187,17 +165,13 @@ public class MainWindow extends JFrame {
     }
 
     // ──────────────────────────────────────────────────────
-    // TAB 1: Single analysis
+    // TAB 1: по OEM
     // ──────────────────────────────────────────────────────
 
     private JPanel buildSinglePanel() {
         JPanel panel = new JPanel(new BorderLayout(0, 0));
         panel.add(buildFormPanel(), BorderLayout.NORTH);
-
-        resultScroll = new JScrollPane(buildResultPanel());
-        resultScroll.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, new Color(60, 60, 60)));
-        resultScroll.getVerticalScrollBar().setUnitIncrement(16);
-        panel.add(resultScroll, BorderLayout.CENTER);
+        panel.add(buildResultPanel(), BorderLayout.CENTER);
         return panel;
     }
 
@@ -212,38 +186,31 @@ public class MainWindow extends JFrame {
         lbl.gridy = 0; panel.add(label("OEM номер:"), lbl);
         fld.gridy = 0;
         oemField = new JTextField();
-        oemField.setToolTipText("Например: 4785033210");
+        oemField.setToolTipText("Например: 4775068010");
         panel.add(oemField, fld);
 
-        lbl.gridy = 1; panel.add(label("URL моего объявления:"), lbl);
+        lbl.gridy = 1; panel.add(label("Параметры:"), lbl);
         fld.gridy = 1;
-        urlField = new JTextField();
-        urlField.setToolTipText("Полная ссылка на baza.drom.ru");
-        panel.add(urlField, fld);
-
-        lbl.gridy = 2; panel.add(label("Регион:"), lbl);
-        fld.gridy = 2;
         JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
-        regionCombo = new JComboBox<>(new String[]{
-                "barnaul", "novosibirsk", "omsk", "tomsk", "kemerovo", "krasnoyarsk", "irkutsk"
-        });
-        regionCombo.setEditable(true);
-        regionCombo.setPreferredSize(new Dimension(160, 30));
-        row.add(regionCombo);
+        row.add(label("Компания на Drom:"));
+        row.add(Box.createHorizontalStrut(8));
+        singleCompanyField = new JTextField("YARD86", 12);
+        singleCompanyField.setToolTipText("Частичное совпадение, без учёта регистра");
+        row.add(singleCompanyField);
         row.add(Box.createHorizontalStrut(24));
-        row.add(label("Моя цена, ₽ (необязательно):"));
+        row.add(label("Цена, ₽ (для выбора объявления):"));
         row.add(Box.createHorizontalStrut(8));
         priceField = new JTextField(10);
-        priceField.setToolTipText("Оставьте пустым — цена возьмётся из объявления");
+        priceField.setToolTipText("Необязательно — помогает выбрать наше объявление среди нескольких");
         row.add(priceField);
         panel.add(row, fld);
 
-        lbl.gridy = 3; panel.add(new JLabel(""), lbl);
-        fld.gridy = 3;
+        lbl.gridy = 2; panel.add(new JLabel(""), lbl);
+        fld.gridy = 2;
         JPanel btnRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
-        analyzeBtn = new JButton("Анализировать");
-        analyzeBtn.setPreferredSize(new Dimension(160, 34));
-        analyzeBtn.addActionListener(e -> runAnalysis());
+        analyzeBtn = new JButton("Проверить наличие");
+        analyzeBtn.setPreferredSize(new Dimension(190, 34));
+        analyzeBtn.addActionListener(e -> runSingle());
         btnRow.add(analyzeBtn);
         btnRow.add(Box.createHorizontalStrut(14));
         statusLabel = new JLabel("");
@@ -259,74 +226,49 @@ public class MainWindow extends JFrame {
         panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
         panel.setBorder(BorderFactory.createEmptyBorder(16, 16, 16, 16));
 
-        JPanel priceRow = hPanel();
-        recPriceLabel = new JLabel("—");
-        recPriceLabel.setFont(recPriceLabel.getFont().deriveFont(Font.BOLD, 32f));
-        recPriceLabel.setForeground(GREEN);
-        priceRow.add(recPriceLabel);
-        priceRow.add(Box.createHorizontalStrut(12));
-        confidenceLabel = new JLabel("");
-        confidenceLabel.setFont(confidenceLabel.getFont().deriveFont(Font.PLAIN, 13f));
-        confidenceLabel.setForeground(DIM);
-        priceRow.add(confidenceLabel);
-        panel.add(priceRow);
+        resultTitleLabel = new JLabel("—");
+        resultTitleLabel.setFont(resultTitleLabel.getFont().deriveFont(Font.BOLD, 26f));
+        resultTitleLabel.setForeground(DIM);
+        resultTitleLabel.setAlignmentX(LEFT_ALIGNMENT);
+        panel.add(resultTitleLabel);
+        panel.add(vgap(10));
+
+        resultCountsLabel = new JLabel("—");
+        resultCountsLabel.setFont(resultCountsLabel.getFont().deriveFont(Font.PLAIN, 15f));
+        resultCountsLabel.setAlignmentX(LEFT_ALIGNMENT);
+        panel.add(resultCountsLabel);
         panel.add(vgap(6));
 
-        statsLabel = new JLabel("—");
-        statsLabel.setForeground(DIM);
-        statsLabel.setAlignmentX(LEFT_ALIGNMENT);
-        panel.add(statsLabel);
-        panel.add(vgap(4));
-
-        marketNoteLabel = new JLabel("");
-        marketNoteLabel.setForeground(DIM);
-        marketNoteLabel.setFont(marketNoteLabel.getFont().deriveFont(Font.ITALIC, 12f));
-        marketNoteLabel.setAlignmentX(LEFT_ALIGNMENT);
-        panel.add(marketNoteLabel);
-        panel.add(vgap(12));
-
-        panel.add(sectionHeader("Обоснование AI"));
-        aiReasonArea = textArea(5);
-        panel.add(wrapScroll(aiReasonArea, 100));
+        resultStatusLabel = new JLabel("");
+        resultStatusLabel.setFont(resultStatusLabel.getFont().deriveFont(Font.ITALIC, 13f));
+        resultStatusLabel.setForeground(DIM);
+        resultStatusLabel.setAlignmentX(LEFT_ALIGNMENT);
+        panel.add(resultStatusLabel);
         panel.add(vgap(14));
 
-        panel.add(sectionHeader("Конкуренты в городе"));
-        String[] cols = {"Цена, ₽", "Название", "Продавец", "Дата", "URL"};
-        cityModel = new DefaultTableModel(cols, 0) {
-            @Override public boolean isCellEditable(int r, int c) { return false; }
-        };
-        panel.add(buildCompetitorTable(cityModel, 220));
-        panel.add(vgap(14));
-
-        siberiaSection = new JPanel();
-        siberiaSection.setLayout(new BoxLayout(siberiaSection, BoxLayout.Y_AXIS));
-        siberiaSection.setAlignmentX(LEFT_ALIGNMENT);
-        siberiaSection.add(sectionHeader("Конкуренты в Новосибирске"));
-        siberiaModel = new DefaultTableModel(cols, 0) {
-            @Override public boolean isCellEditable(int r, int c) { return false; }
-        };
-        siberiaSection.add(buildCompetitorTable(siberiaModel, 180));
-        siberiaSection.setVisible(false);
-        panel.add(siberiaSection);
-
+        myLinkLabel = new JLabel("");
+        myLinkLabel.setForeground(BLUE);
+        myLinkLabel.setAlignmentX(LEFT_ALIGNMENT);
+        myLinkLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        myLinkLabel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                String u = myLinkLabel.getToolTipText();
+                if (u != null && !u.isBlank()) { copy(u); setStatus("Ссылка скопирована", DIM); }
+            }
+        });
+        panel.add(myLinkLabel);
         return panel;
     }
 
     // ──────────────────────────────────────────────────────
-    // TAB 2: Batch analysis
+    // TAB 2: по каталогу
     // ──────────────────────────────────────────────────────
 
     private JPanel buildBatchPanel() {
         JPanel panel = new JPanel(new BorderLayout(0, 0));
         panel.add(buildBatchFormPanel(), BorderLayout.NORTH);
-
-        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT,
-                buildBatchTableScrollPane(),
-                buildBatchDetailPanel());
-        split.setDividerLocation(260);
-        split.setResizeWeight(0.35);
-        split.setBorder(null);
-        panel.add(split, BorderLayout.CENTER);
+        panel.add(buildBatchTableScrollPane(), BorderLayout.CENTER);
+        panel.add(buildBatchFooter(), BorderLayout.SOUTH);
         return panel;
     }
 
@@ -338,8 +280,7 @@ public class MainWindow extends JFrame {
         lbl.anchor = GridBagConstraints.WEST;
         GridBagConstraints fld = gbc(1, 0, 1.0, new Insets(5, 0, 5, 0));
 
-        // File picker
-        lbl.gridy = 0; panel.add(label("Файл каталога (CSV):"), lbl);
+        lbl.gridy = 0; panel.add(label("Файл каталога (CSV/XLSX):"), lbl);
         fld.gridy = 0;
         JPanel fileRow = new JPanel(new BorderLayout(6, 0));
         csvPathField = new JTextField();
@@ -350,31 +291,21 @@ public class MainWindow extends JFrame {
         fileRow.add(browseBtn, BorderLayout.EAST);
         panel.add(fileRow, fld);
 
-        // Settings row
-        lbl.gridy = 1; panel.add(label("Регион:"), lbl);
+        lbl.gridy = 1; panel.add(label("Параметры:"), lbl);
         fld.gridy = 1;
         JPanel settingsRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
-        batchRegionCombo = new JComboBox<>(new String[]{
-                "barnaul", "novosibirsk", "omsk", "tomsk", "kemerovo", "krasnoyarsk", "irkutsk"
-        });
-        batchRegionCombo.setEditable(true);
-        batchRegionCombo.setPreferredSize(new Dimension(160, 30));
-        settingsRow.add(batchRegionCombo);
-        settingsRow.add(Box.createHorizontalStrut(20));
         settingsRow.add(label("Компания на Drom:"));
         settingsRow.add(Box.createHorizontalStrut(8));
         companyField = new JTextField("YARD86", 12);
         companyField.setToolTipText("Частичное совпадение, без учёта регистра");
         settingsRow.add(companyField);
         settingsRow.add(Box.createHorizontalStrut(20));
-        settingsRow.add(label("Кол-во OEM (0 = все):"));
+        settingsRow.add(label("Кол-во позиций (0 = все):"));
         settingsRow.add(Box.createHorizontalStrut(8));
         batchLimitField = new JTextField("0", 5);
-        batchLimitField.setToolTipText("0 — обработать все строки из файла");
         settingsRow.add(batchLimitField);
         panel.add(settingsRow, fld);
 
-        // Buttons
         lbl.gridy = 2; panel.add(new JLabel(""), lbl);
         fld.gridy = 2;
         JPanel btnRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
@@ -385,15 +316,12 @@ public class MainWindow extends JFrame {
         batchStopBtn = new JButton("Стоп");
         batchStopBtn.setPreferredSize(new Dimension(80, 34));
         batchStopBtn.setEnabled(false);
-        batchStopBtn.addActionListener(e -> {
-            batchStopped = true;
-            batchStopBtn.setEnabled(false);
-        });
+        batchStopBtn.addActionListener(e -> { batchStopped = true; batchStopBtn.setEnabled(false); });
         btnRow.add(batchAnalyzeBtn);
         btnRow.add(Box.createHorizontalStrut(8));
         btnRow.add(batchStopBtn);
         btnRow.add(Box.createHorizontalStrut(14));
-        batchStatusLabel = new JLabel("Загрузите CSV-файл каталога");
+        batchStatusLabel = new JLabel("Загрузите файл каталога (CSV или XLSX)");
         batchStatusLabel.setForeground(DIM);
         btnRow.add(batchStatusLabel);
         panel.add(btnRow, fld);
@@ -402,7 +330,7 @@ public class MainWindow extends JFrame {
     }
 
     private JScrollPane buildBatchTableScrollPane() {
-        String[] cols = {"OEM", "Запчасть", "Марка / Модель", "Цена каталог, ₽", "Рек. цена, ₽", "Конкурентов", "Статус"};
+        String[] cols = {"OEM", "Запчасть", "Авто", "Цена, ₽", "Создан", "Барнаул", "Сибирь", "Статус"};
         batchModel = new DefaultTableModel(cols, 0) {
             @Override public boolean isCellEditable(int r, int c) { return false; }
         };
@@ -413,42 +341,22 @@ public class MainWindow extends JFrame {
         batchTable.getTableHeader().setReorderingAllowed(false);
         batchTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
 
-        int[] widths = {130, 200, 200, 120, 120, 90, 120};
-        for (int i = 0; i < widths.length; i++) {
+        int[] widths = {120, 340, 200, 90, 100, 80, 80, 320};
+        for (int i = 0; i < widths.length; i++)
             batchTable.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
-        }
 
-        DefaultTableCellRenderer rightAlign = new DefaultTableCellRenderer();
-        rightAlign.setHorizontalAlignment(SwingConstants.RIGHT);
-        batchTable.getColumnModel().getColumn(3).setCellRenderer(rightAlign);
-        batchTable.getColumnModel().getColumn(4).setCellRenderer(rightAlign);
-        batchTable.getColumnModel().getColumn(5).setCellRenderer(rightAlign);
+        ColorRowRenderer renderer = new ColorRowRenderer();
+        for (int i = 0; i < cols.length; i++)
+            batchTable.getColumnModel().getColumn(i).setCellRenderer(renderer);
 
-        batchTable.getColumnModel().getColumn(6).setCellRenderer(new DefaultTableCellRenderer() {
-            @Override
-            public Component getTableCellRendererComponent(JTable t, Object val, boolean sel, boolean foc, int row, int col) {
-                super.getTableCellRendererComponent(t, val, sel, foc, row, col);
-                String s = val == null ? "" : val.toString();
-                setForeground(switch (s) {
-                    case "Готово"           -> GREEN;
-                    case "Не найдено"       -> RED;
-                    case "Ошибка"           -> RED;
-                    case "Анализируется..." -> BLUE;
-                    default                 -> DIM;
-                });
-                return this;
-            }
-        });
-
-        // Row selection → show detail
-        batchTable.getSelectionModel().addListSelectionListener((ListSelectionEvent e) -> {
+        // выбор строки → показать ссылку на наше объявление
+        batchTable.getSelectionModel().addListSelectionListener(e -> {
             if (e.getValueIsAdjusting()) return;
             int row = batchTable.getSelectedRow();
-            if (row >= 0 && row < batchResults.size()) {
-                AggregationResult r = batchResults.get(row);
-                if (r != null) showBatchDetail(r);
-                else clearBatchDetail();
-            }
+            if (row >= 0 && row < batchResults.size() && batchResults.get(row) != null) {
+                String url = batchResults.get(row).getMyListingUrl();
+                setBatchLink(url);
+            } else setBatchLink(null);
         });
 
         JScrollPane sp = new JScrollPane(batchTable,
@@ -459,112 +367,82 @@ public class MainWindow extends JFrame {
         return sp;
     }
 
-    private JScrollPane buildBatchDetailPanel() {
-        JPanel panel = new JPanel();
-        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
-        panel.setBorder(BorderFactory.createEmptyBorder(14, 16, 14, 16));
+    private JPanel buildBatchFooter() {
+        JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT, 14, 6));
+        p.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, new Color(60, 60, 60)));
+        JLabel legend = new JLabel("Цвета: красный — дефицит (Барнаул<4 и Сибирь<10) · фиолетовый — Сибирь<10 · жёлтый — Барнаул<4");
+        legend.setForeground(DIM);
+        legend.setFont(legend.getFont().deriveFont(Font.PLAIN, 12f));
+        p.add(legend);
+        p.add(new JLabel("   "));
+        batchLinkLabel = new JLabel("");
+        batchLinkLabel.setForeground(BLUE);
+        batchLinkLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        batchLinkLabel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                String u = batchLinkLabel.getToolTipText();
+                if (u != null && !u.isBlank()) copy(u);
+            }
+        });
+        p.add(batchLinkLabel);
+        return p;
+    }
 
-        // Hint shown before any row is selected
-        batchDetailHint = new JLabel("Выберите строку в таблице чтобы увидеть детали анализа");
-        batchDetailHint.setForeground(DIM);
-        batchDetailHint.setFont(batchDetailHint.getFont().deriveFont(Font.ITALIC, 13f));
-        batchDetailHint.setAlignmentX(LEFT_ALIGNMENT);
-        panel.add(batchDetailHint);
-        panel.add(vgap(8));
+    private void setBatchLink(String url) {
+        if (url == null || url.isBlank()) {
+            batchLinkLabel.setText("");
+            batchLinkLabel.setToolTipText(null);
+        } else {
+            batchLinkLabel.setText("Моё объявление: " + url + "  (клик — копировать)");
+            batchLinkLabel.setToolTipText(url);
+        }
+    }
 
-        // Price row
-        JPanel priceRow = hPanel();
-        batchRecPriceLabel = new JLabel("—");
-        batchRecPriceLabel.setFont(batchRecPriceLabel.getFont().deriveFont(Font.BOLD, 28f));
-        batchRecPriceLabel.setForeground(GREEN);
-        priceRow.add(batchRecPriceLabel);
-        priceRow.add(Box.createHorizontalStrut(12));
-        batchConfidenceLabel = new JLabel("");
-        batchConfidenceLabel.setFont(batchConfidenceLabel.getFont().deriveFont(Font.PLAIN, 13f));
-        batchConfidenceLabel.setForeground(DIM);
-        priceRow.add(batchConfidenceLabel);
-        panel.add(priceRow);
-        panel.add(vgap(6));
-
-        batchStatsLabel = new JLabel("—");
-        batchStatsLabel.setForeground(DIM);
-        batchStatsLabel.setAlignmentX(LEFT_ALIGNMENT);
-        panel.add(batchStatsLabel);
-        panel.add(vgap(4));
-
-        batchMarketNoteLabel = new JLabel("");
-        batchMarketNoteLabel.setForeground(DIM);
-        batchMarketNoteLabel.setFont(batchMarketNoteLabel.getFont().deriveFont(Font.ITALIC, 12f));
-        batchMarketNoteLabel.setAlignmentX(LEFT_ALIGNMENT);
-        panel.add(batchMarketNoteLabel);
-        panel.add(vgap(10));
-
-        panel.add(sectionHeader("Обоснование AI"));
-        batchAiReasonArea = textArea(4);
-        panel.add(wrapScroll(batchAiReasonArea, 90));
-        panel.add(vgap(12));
-
-        panel.add(sectionHeader("Конкуренты в городе"));
-        String[] cols = {"Цена, ₽", "Название", "Продавец", "Дата", "URL"};
-        batchCityModel = new DefaultTableModel(cols, 0) {
-            @Override public boolean isCellEditable(int r, int c) { return false; }
-        };
-        panel.add(buildCompetitorTable(batchCityModel, 200));
-        panel.add(vgap(12));
-
-        batchSiberiaSection = new JPanel();
-        batchSiberiaSection.setLayout(new BoxLayout(batchSiberiaSection, BoxLayout.Y_AXIS));
-        batchSiberiaSection.setAlignmentX(LEFT_ALIGNMENT);
-        batchSiberiaSection.add(sectionHeader("Конкуренты в Новосибирске"));
-        batchSiberiaModel = new DefaultTableModel(cols, 0) {
-            @Override public boolean isCellEditable(int r, int c) { return false; }
-        };
-        batchSiberiaSection.add(buildCompetitorTable(batchSiberiaModel, 160));
-        batchSiberiaSection.setVisible(false);
-        panel.add(batchSiberiaSection);
-
-        batchDetailScroll = new JScrollPane(panel,
-                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
-                JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
-        batchDetailScroll.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, new Color(60, 60, 60)));
-        batchDetailScroll.getVerticalScrollBar().setUnitIncrement(16);
-        return batchDetailScroll;
+    /** Рендерер строки таблицы: фон по цвету результата (красный/фиолетовый/жёлтый/без). */
+    private class ColorRowRenderer extends DefaultTableCellRenderer {
+        @Override
+        public Component getTableCellRendererComponent(JTable t, Object val, boolean sel, boolean foc, int row, int col) {
+            Component c = super.getTableCellRendererComponent(t, val, sel, foc, row, col);
+            if (sel) return c;
+            Color bg = t.getBackground();
+            if (row < batchResults.size() && batchResults.get(row) != null) {
+                bg = switch (batchResults.get(row).getColor()) {
+                    case RED    -> BG_RED;
+                    case PURPLE -> BG_PURPLE;
+                    case YELLOW -> BG_YELLOW;
+                    case NONE   -> t.getBackground();
+                };
+            }
+            c.setBackground(bg);
+            return c;
+        }
     }
 
     // ═══════════════════════════════════════════════════════
-    // SINGLE ANALYSIS
+    // SINGLE
     // ═══════════════════════════════════════════════════════
 
-    private void runAnalysis() {
-        String oem      = oemField.getText().trim();
-        String url      = urlField.getText().trim();
-        String region   = ((String) regionCombo.getSelectedItem()).trim();
-        String priceText = priceField.getText().trim();
-
-        if (oem.isEmpty() || url.isEmpty()) {
-            JOptionPane.showMessageDialog(this,
-                    "Заполните OEM номер и URL объявления", "Ошибка", JOptionPane.WARNING_MESSAGE);
+    private void runSingle() {
+        String oem = oemField.getText().trim();
+        if (oem.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Введите OEM номер", "Ошибка", JOptionPane.WARNING_MESSAGE);
             return;
         }
+        String company = singleCompanyField.getText().trim();
+        BigDecimal price = BigDecimal.ZERO;
+        try { if (!priceField.getText().isBlank()) price = new BigDecimal(priceField.getText().replaceAll("[^\\d.]", "")); }
+        catch (NumberFormatException ignored) {}
 
-        BigDecimal myPrice = BigDecimal.ZERO;
-        if (!priceText.isEmpty()) {
-            try { myPrice = new BigDecimal(priceText.replaceAll("[^\\d.]", "")); }
-            catch (NumberFormatException ex) {
-                JOptionPane.showMessageDialog(this, "Некорректная цена", "Ошибка", JOptionPane.WARNING_MESSAGE);
-                return;
-            }
-        }
-
-        BigDecimal finalPrice = myPrice;
+        final BigDecimal priceF = price;
         analyzeBtn.setEnabled(false);
         setStatus("Анализ идёт...", DIM);
-        clearResults();
+        clearSingle();
 
         executor.submit(() -> {
             try {
-                AggregationResult res = priceAnalyzer.analyze(oem, region, url, finalPrice);
-                SwingUtilities.invokeLater(() -> showResult(res));
+                priceAnalyzer.resetBreakers();
+                AvailabilityResult res = priceAnalyzer.analyzeByOem(oem, priceF, company);
+                SwingUtilities.invokeLater(() -> showSingle(res));
             } catch (Exception ex) {
                 SwingUtilities.invokeLater(() -> {
                     setStatus("Ошибка: " + ex.getMessage(), RED);
@@ -574,68 +452,57 @@ public class MainWindow extends JFrame {
         });
     }
 
-    private void clearResults() {
-        recPriceLabel.setText("—");
-        recPriceLabel.setForeground(GREEN);
-        confidenceLabel.setText("");
-        statsLabel.setText("—");
-        marketNoteLabel.setText("");
-        aiReasonArea.setText("");
-        cityModel.setRowCount(0);
-        siberiaModel.setRowCount(0);
-        siberiaSection.setVisible(false);
+    private void clearSingle() {
+        resultTitleLabel.setText("—");
+        resultTitleLabel.setForeground(DIM);
+        resultCountsLabel.setText("—");
+        resultStatusLabel.setText("");
+        myLinkLabel.setText("");
+        myLinkLabel.setToolTipText(null);
     }
 
-    private void showResult(AggregationResult r) {
-        if (r.getRecommendedPrice() != null)
-            recPriceLabel.setText(formatPrice(r.getRecommendedPrice()) + " ₽");
-
-        if (r.getAiConfidence() != null) {
-            String conf = r.getAiConfidence().toLowerCase();
-            Color c = conf.contains("высок") ? GREEN : conf.contains("средн") ? YELLOW : RED;
-            confidenceLabel.setForeground(c);
-            confidenceLabel.setText("уверенность: " + r.getAiConfidence());
+    private void showSingle(AvailabilityResult r) {
+        resultTitleLabel.setText(colorTitle(r.getColor()));
+        resultTitleLabel.setForeground(swingColor(r.getColor()));
+        resultCountsLabel.setText(String.format("Барнаул: %d конкурентов   •   Сибирь: %s",
+                r.getBarnaulCount(), r.isSearchedSiberia() ? r.getSiberiaCount() + " конкурентов" : "не искали (в Барнауле ≥ 10)"));
+        resultStatusLabel.setText(r.getStatus() != null ? r.getStatus() : "");
+        if (r.getMyListingUrl() != null && !r.getMyListingUrl().isBlank()) {
+            myLinkLabel.setText("Моё объявление: " + r.getMyListingUrl() + "  (клик — копировать)");
+            myLinkLabel.setToolTipText(r.getMyListingUrl());
+        } else {
+            myLinkLabel.setText("Моё объявление не найдено на drom.");
+            myLinkLabel.setToolTipText(null);
         }
-        statsLabel.setText(String.format(
-                "Город: %d  •  Новосибирск: %d  •  Мин: %s ₽  •  Макс: %s ₽  •  Ср: %s ₽  •  Медиана: %s ₽",
-                r.getCityCompetitorCount(), r.getSiberiaCompetitorCount(),
-                formatPrice(r.getMinPrice()), formatPrice(r.getMaxPrice()),
-                formatPrice(r.getAvgPrice()), formatPrice(r.getMedianPrice())));
-        if (r.getMarketNote() != null) marketNoteLabel.setText(r.getMarketNote());
-
-        aiReasonArea.setText(r.getAiReason() != null ? r.getAiReason() : "");
-        aiReasonArea.setCaretPosition(0);
-
-        fillTable(cityModel, r.getItems());
-        fillTable(siberiaModel, r.getSiberiaItems());
-        siberiaSection.setVisible(r.getSiberiaItems() != null && !r.getSiberiaItems().isEmpty());
-
         setStatus("Готово", GREEN);
         analyzeBtn.setEnabled(true);
-        SwingUtilities.invokeLater(() -> resultScroll.getVerticalScrollBar().setValue(0));
     }
 
-    private void fillTable(DefaultTableModel model, List<PartPrice> items) {
-        model.setRowCount(0);
-        if (items == null) return;
-        for (PartPrice p : items) {
-            model.addRow(new Object[]{
-                    p.getPrice() != null ? p.getPrice().toPlainString() : "—",
-                    p.getTitle() != null ? p.getTitle() : "",
-                    p.getDealer() != null ? p.getDealer() : p.getLocation(),
-                    p.getPublishedDate() != null ? p.getPublishedDate() : "",
-                    p.getUrl() != null ? p.getUrl() : ""
-            });
-        }
+    private String colorTitle(AvailabilityResult.Color c) {
+        return switch (c) {
+            case RED    -> "🔴 Дефицит";
+            case PURPLE -> "🟣 Мало по Сибири";
+            case YELLOW -> "🟡 Мало в Барнауле";
+            case NONE   -> "⚪ Конкуренция достаточная";
+        };
+    }
+
+    private Color swingColor(AvailabilityResult.Color c) {
+        return switch (c) {
+            case RED    -> RED;
+            case PURPLE -> new Color(168, 120, 220);
+            case YELLOW -> YELLOW;
+            case NONE   -> GREEN;
+        };
     }
 
     // ═══════════════════════════════════════════════════════
-    // BATCH ANALYSIS
+    // BATCH
     // ═══════════════════════════════════════════════════════
 
     private void browseForCsv() {
         JFileChooser chooser = new JFileChooser();
-        chooser.setFileFilter(new FileNameExtensionFilter("CSV файлы (*.csv)", "csv"));
+        chooser.setFileFilter(new FileNameExtensionFilter("Каталог (*.csv, *.xlsx)", "csv", "xlsx"));
         chooser.setCurrentDirectory(new File(System.getProperty("user.home")));
         if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
             File file = chooser.getSelectedFile();
@@ -646,62 +513,37 @@ public class MainWindow extends JFrame {
 
     private void loadCsvFile(File file) {
         try {
-            List<String[]> all = parseCsvFile(file);
-            // Фильтруем catalogRows ОДИН раз: только суппорты в сборе и только с остатком на «Ткацкая».
-            // Так таблица и catalogRows остаются 1:1 — индексы строк в runBatchAnalysis не разъезжаются.
-            catalogRows = new ArrayList<>();
-            int skippedPart = 0, skippedStock = 0;
-            for (String[] row : all) {
-                if (col(row, COL_OEM).isEmpty()) continue;
-                if (!isAssemblyRow(row)) { skippedPart++; continue; }   // ремкомплект/поршень/направляющая
-                if (!inStock(row))       { skippedStock++; continue; }  // нет на складе «Ткацкая»
-                catalogRows.add(row);
-            }
+            catalogItems = CatalogLoader.loadOlderThan6Months(file);
             batchModel.setRowCount(0);
-            for (String[] row : catalogRows) {
-                String price = col(row, COL_PRICE);
+            for (CatalogLoader.CatalogItem it : catalogItems) {
                 batchModel.addRow(new Object[]{
-                        col(row, COL_OEM),
-                        col(row, COL_PART),
-                        "—",   // марка/модель авто в новом формате отсутствуют
-                        price.isEmpty() ? "—" : price,
-                        "—", "—", "Ожидает"
+                        it.oem(), it.name(), auto(it),
+                        it.price() != null && it.price().signum() > 0 ? it.price().toPlainString() : "—",
+                        it.created().format(D), "—", "—", "Ожидает"
                 });
             }
-            int count = batchModel.getRowCount();
+            int count = catalogItems.size();
             batchResults = new ArrayList<>(Collections.nCopies(count, null));
-            batchStatusLabel.setText(String.format(
-                    "Загружено: %d (пропущено не-суппортов: %d, нет на складе: %d)", count, skippedPart, skippedStock));
-            batchStatusLabel.setForeground(GREEN);
+            batchStatusLabel.setText("Загружено (старше 6 мес): " + count);
+            batchStatusLabel.setForeground(count > 0 ? GREEN : YELLOW);
             batchAnalyzeBtn.setEnabled(count > 0);
-            clearBatchDetail();
+            setBatchLink(null);
         } catch (Exception ex) {
             batchStatusLabel.setText("Ошибка чтения файла: " + ex.getMessage());
             batchStatusLabel.setForeground(RED);
         }
     }
 
-    /** Берём только суппорты в сборе (вкл. «Уценка!»). Ремкомплект/поршень/направляющая — другой товар:
-     *  их цены несравнимы с суппортами в сборе на drom (классификатор отсеивает такие у конкурентов). */
-    private boolean isAssemblyRow(String[] row) {
-        String p = col(row, COL_PART).toLowerCase();
-        if (!p.contains("суппорт")) return false;
-        return !(p.contains("ремкомплект") || p.contains("поршень") || p.contains("направля"));
+    private static String auto(CatalogLoader.CatalogItem it) {
+        return (nz(it.brand()) + " " + nz(it.model())).trim();
     }
 
-    /** Только то, что реально на складе: «Ткацкая (свободно) > 0». */
-    private boolean inStock(String[] row) {
-        try { return Integer.parseInt(col(row, COL_STOCK).replaceAll("[^\\d-]", "")) > 0; }
-        catch (Exception e) { return false; }
-    }
-
-    /** Создаёт .xlsx-отчёт на текущий прогон (файл с отметкой времени в рабочей папке). */
     private ExcelReport createReport() {
         try {
-            String name = "price-report_"
+            String name = "availability-report_"
                     + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")) + ".xlsx";
             Path path = Paths.get(name).toAbsolutePath();
-            return new ExcelReport(path, 0.02);   // допуск «совпадает» = ±2%
+            return new ExcelReport(path);
         } catch (Exception e) {
             System.err.println("Не удалось создать Excel-отчёт: " + e.getMessage());
             return null;
@@ -709,52 +551,29 @@ public class MainWindow extends JFrame {
     }
 
     private void runBatchAnalysis() {
-        if (catalogRows.isEmpty()) return;
+        if (catalogItems.isEmpty()) return;
 
         batchStopped = false;
         batchAnalyzeBtn.setEnabled(false);
         batchStopBtn.setEnabled(true);
         analyzeBtn.setEnabled(false);
 
-        // Reset rows
         for (int i = 0; i < batchModel.getRowCount(); i++) {
-            batchModel.setValueAt("Ожидает", i, 6);
-            batchModel.setValueAt("—", i, 4);
             batchModel.setValueAt("—", i, 5);
+            batchModel.setValueAt("—", i, 6);
+            batchModel.setValueAt("Ожидает", i, 7);
         }
-        batchResults = new ArrayList<>(Collections.nCopies(batchModel.getRowCount(), null));
-        clearBatchDetail();
+        batchResults = new ArrayList<>(Collections.nCopies(catalogItems.size(), null));
+        setBatchLink(null);
 
-        String region  = ((String) batchRegionCombo.getSelectedItem()).trim();
-        String company = companyField.getText().trim();
-        int limitVal   = 0;
+        final String company = companyField.getText().trim();
+        int limitVal = 0;
         try { limitVal = Integer.parseInt(batchLimitField.getText().trim()); } catch (Exception ignored) {}
-        int total = (limitVal > 0 && limitVal < batchModel.getRowCount()) ? limitVal : batchModel.getRowCount();
-
-        priceAnalyzer.resetBreakers();   // новый прогон — снимаем взвод предохранителей (прокси/капча) с прошлого раза
-
-        final String regionF = region;
-        final String companyF = company;
-        final int totalF = total;
+        final int total = (limitVal > 0 && limitVal < catalogItems.size()) ? limitVal : catalogItems.size();
         final int lanes = Math.max(1, priceAnalyzer.laneCount());
 
-        // ── Готовим задания: анализируем КАЖДУЮ строку. Дубли OEM — это РАЗНЫЕ наши объявления
-        // (один OEM, но разное качество/цена), поэтому НЕ дедупим: деталь определяется тройкой
-        // компания (YARD86) + OEM + цена. Конкретное объявление на drom выбирается по цене в PriceAnalyzer.
-        final java.util.List<String[]> taskRows = new java.util.ArrayList<>();
-        final java.util.List<Integer> taskTableRows = new java.util.ArrayList<>();
-        int tableRow = 0;
-        for (String[] csvRow : catalogRows) {
-            if (tableRow >= totalF) break;
-            String oem = col(csvRow, COL_OEM);
-            if (oem.isEmpty()) continue;
-            final int rowIdx = tableRow++;
-            taskRows.add(csvRow);
-            taskTableRows.add(rowIdx);
-        }
-        final int totalTasks = taskRows.size();
+        priceAnalyzer.resetBreakers();
 
-        // Диспетчер запускается в фоновом потоке, а внутри поднимает пул из `lanes` воркеров (1 IP на воркера)
         executor.submit(() -> {
             final ExcelReport report = createReport();
             final java.util.concurrent.atomic.AtomicInteger cursor = new java.util.concurrent.atomic.AtomicInteger(0);
@@ -770,7 +589,6 @@ public class MainWindow extends JFrame {
                 final int laneId = L;
                 lanePool.submit(() -> {
                     while (!batchStopped) {
-                        // Предохранитель на КАЖДЫЙ IP отдельно: сбойная дорожка останавливается, остальные работают
                         if (priceAnalyzer.isProxyDown(laneId) || priceAnalyzer.isCaptchaBlocked(laneId)) {
                             SwingUtilities.invokeLater(() -> {
                                 batchStatusLabel.setText("Дорожка " + laneId + ": прокси/капча — остановлена. Смените IP.");
@@ -779,56 +597,32 @@ public class MainWindow extends JFrame {
                             break;
                         }
                         int idx = cursor.getAndIncrement();
-                        if (idx >= totalTasks) break;
+                        if (idx >= total) break;
 
-                        final String[] csvRow = taskRows.get(idx);
-                        final int rowIdx = taskTableRows.get(idx);
-                        final String oem = col(csvRow, COL_OEM);
-                        final String partName = col(csvRow, COL_PART);
-                        final String car = "";   // марка/модель авто в новом формате отсутствуют
-                        BigDecimal cp = BigDecimal.ZERO;
-                        try { cp = new BigDecimal(col(csvRow, COL_PRICE).replaceAll("[^\\d.]", "")); } catch (Exception ignored) {}
-                        final BigDecimal price = cp;
-
-                        SwingUtilities.invokeLater(() -> batchModel.setValueAt("Анализ (L" + laneId + ")...", rowIdx, 6));
+                        final CatalogLoader.CatalogItem it = catalogItems.get(idx);
+                        final int rowIdx = idx;
+                        SwingUtilities.invokeLater(() -> batchModel.setValueAt("Анализ (L" + laneId + ")...", rowIdx, 7));
 
                         try {
-                            AggregationResult result = priceAnalyzer.analyzeCatalogLane(oem, price, regionF, companyF, laneId);
-                            if (result.isBelowMinPrice()) {
-                                // Живая цена < 600₽ — деталь не проценивается и НЕ попадает в Excel.
-                                final int d0 = done.incrementAndGet();
-                                SwingUtilities.invokeLater(() -> {
-                                    batchResults.set(rowIdx, result);
-                                    batchModel.setValueAt("—", rowIdx, 4);
-                                    batchModel.setValueAt(0, rowIdx, 5);
-                                    batchModel.setValueAt("Пропущено <600₽", rowIdx, 6);
-                                    batchStatusLabel.setText("Готово " + d0 + " / " + totalTasks + " (дорожек: " + lanes + ")");
-                                    batchStatusLabel.setForeground(BLUE);
-                                });
-                                continue;
-                            }
-                            if (report != null) report.append(oem, partName, car, price, result);
+                            AvailabilityResult res = priceAnalyzer.analyzeCatalogLane(
+                                    it.oem(), it.price(), company, laneId);
+                            if (report != null)
+                                report.append(it.oem(), it.name(), auto(it), it.price(),
+                                        it.created().format(D), res);
                             final int d = done.incrementAndGet();
                             SwingUtilities.invokeLater(() -> {
-                                batchResults.set(rowIdx, result);
-                                boolean found = result.getRecommendedPrice() != null
-                                        && result.getRecommendedPrice().compareTo(BigDecimal.ZERO) > 0;
-                                if (found) {
-                                    batchModel.setValueAt(formatPrice(result.getRecommendedPrice()) + " ₽", rowIdx, 4);
-                                    batchModel.setValueAt(result.getCityCompetitorCount(), rowIdx, 5);
-                                    batchModel.setValueAt("Готово", rowIdx, 6);
-                                } else {
-                                    batchModel.setValueAt("—", rowIdx, 4);
-                                    batchModel.setValueAt(0, rowIdx, 5);
-                                    batchModel.setValueAt("Не найдено", rowIdx, 6);
-                                }
-                                batchStatusLabel.setText("Готово " + d + " / " + totalTasks + " (дорожек: " + lanes + ")");
+                                batchResults.set(rowIdx, res);
+                                batchModel.setValueAt(res.getBarnaulCount(), rowIdx, 5);
+                                batchModel.setValueAt(res.isSearchedSiberia() ? res.getSiberiaCount() : "—", rowIdx, 6);
+                                batchModel.setValueAt(shortStatus(res.getColor()), rowIdx, 7);
+                                batchStatusLabel.setText("Готово " + d + " / " + total + " (дорожек: " + lanes + ")");
                                 batchStatusLabel.setForeground(BLUE);
-                                if (batchTable.getSelectedRow() == rowIdx) showBatchDetail(result);
+                                batchTable.repaint();
                             });
                         } catch (Exception ex) {
-                            if (report != null) report.append(oem, partName, car, price, null);
-                            SwingUtilities.invokeLater(() -> batchModel.setValueAt("Ошибка", rowIdx, 6));
+                            if (report != null) report.append(it.oem(), it.name(), auto(it), it.price(),
+                                    it.created().format(D), null);
+                            SwingUtilities.invokeLater(() -> batchModel.setValueAt("Ошибка", rowIdx, 7));
                         }
                     }
                 });
@@ -852,175 +646,26 @@ public class MainWindow extends JFrame {
         });
     }
 
-    private void showBatchDetail(AggregationResult r) {
-        batchDetailHint.setVisible(false);
-
-        if (r.getRecommendedPrice() != null)
-            batchRecPriceLabel.setText(formatPrice(r.getRecommendedPrice()) + " ₽");
-
-        if (r.getAiConfidence() != null) {
-            String conf = r.getAiConfidence().toLowerCase();
-            Color c = conf.contains("высок") ? GREEN : conf.contains("средн") ? YELLOW : RED;
-            batchConfidenceLabel.setForeground(c);
-            batchConfidenceLabel.setText("уверенность: " + r.getAiConfidence());
-        }
-        batchStatsLabel.setText(String.format(
-                "Город: %d  •  Новосибирск: %d  •  Мин: %s ₽  •  Макс: %s ₽  •  Ср: %s ₽  •  Медиана: %s ₽",
-                r.getCityCompetitorCount(), r.getSiberiaCompetitorCount(),
-                formatPrice(r.getMinPrice()), formatPrice(r.getMaxPrice()),
-                formatPrice(r.getAvgPrice()), formatPrice(r.getMedianPrice())));
-        if (r.getMarketNote() != null) batchMarketNoteLabel.setText(r.getMarketNote());
-
-        batchAiReasonArea.setText(r.getAiReason() != null ? r.getAiReason() : "");
-        batchAiReasonArea.setCaretPosition(0);
-
-        fillTable(batchCityModel, r.getItems());
-        fillTable(batchSiberiaModel, r.getSiberiaItems());
-        batchSiberiaSection.setVisible(r.getSiberiaItems() != null && !r.getSiberiaItems().isEmpty());
-
-        SwingUtilities.invokeLater(() -> batchDetailScroll.getVerticalScrollBar().setValue(0));
-    }
-
-    private void clearBatchDetail() {
-        batchDetailHint.setVisible(true);
-        batchRecPriceLabel.setText("—");
-        batchRecPriceLabel.setForeground(GREEN);
-        batchConfidenceLabel.setText("");
-        batchStatsLabel.setText("—");
-        batchMarketNoteLabel.setText("");
-        batchAiReasonArea.setText("");
-        batchCityModel.setRowCount(0);
-        batchSiberiaModel.setRowCount(0);
-        if (batchSiberiaSection != null) batchSiberiaSection.setVisible(false);
+    private String shortStatus(AvailabilityResult.Color c) {
+        return switch (c) {
+            case RED    -> "Дефицит";
+            case PURPLE -> "Мало (Сибирь)";
+            case YELLOW -> "Мало (Барнаул)";
+            case NONE   -> "OK";
+        };
     }
 
     // ═══════════════════════════════════════════════════════
-    // CSV PARSER (Windows-1251, semicolon, quoted)
+    // HELPERS
     // ═══════════════════════════════════════════════════════
 
-    private List<String[]> parseCsvFile(File file) throws Exception {
-        List<String[]> result = new ArrayList<>();
-        try (var reader = new BufferedReader(
-                new InputStreamReader(new FileInputStream(file), "Windows-1251"))) {
+    private static String nz(String s) { return s == null ? "" : s; }
 
-            List<String> currentRow = new ArrayList<>();
-            StringBuilder sb = new StringBuilder();
-            boolean inQuotes = false;
-            boolean firstRow = true;
-
-            while (true) {
-                int c = reader.read();
-                if (c == -1) {
-                    currentRow.add(sb.toString().trim());
-                    if (!firstRow && !currentRow.stream().allMatch(String::isEmpty))
-                        result.add(currentRow.toArray(new String[0]));
-                    break;
-                }
-                char ch = (char) c;
-
-                if (ch == '"') {
-                    inQuotes = !inQuotes;
-                } else if (ch == ';' && !inQuotes) {
-                    currentRow.add(sb.toString().trim());
-                    sb.setLength(0);
-                } else if (ch == '\n' && !inQuotes) {
-                    currentRow.add(sb.toString().trim());
-                    sb.setLength(0);
-                    if (!currentRow.stream().allMatch(String::isEmpty)) {
-                        if (firstRow) firstRow = false;
-                        else result.add(currentRow.toArray(new String[0]));
-                    }
-                    currentRow = new ArrayList<>();
-                } else if (ch != '\r') {
-                    sb.append(ch);
-                }
-            }
-        }
-        return result;
-    }
-
-    private String col(String[] row, int index) {
-        if (row == null || index >= row.length) return "";
-        String v = row[index];
-        return v == null ? "" : v.trim();
-    }
-
-    // ═══════════════════════════════════════════════════════
-    // WIDGET HELPERS
-    // ═══════════════════════════════════════════════════════
-
-    private JScrollPane buildCompetitorTable(DefaultTableModel model, int height) {
-        JTable table = new JTable(model);
-        table.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
-        table.setRowHeight(24);
-        table.getTableHeader().setReorderingAllowed(false);
-        table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-
-        int[] widths = {80, 360, 130, 120, 400};
-        for (int i = 0; i < widths.length; i++) {
-            table.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
-        }
-        DefaultTableCellRenderer rightAlign = new DefaultTableCellRenderer();
-        rightAlign.setHorizontalAlignment(SwingConstants.RIGHT);
-        table.getColumnModel().getColumn(0).setCellRenderer(rightAlign);
-
-        table.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
-                if (e.getClickCount() == 2) {
-                    int row = table.getSelectedRow();
-                    if (row >= 0) {
-                        String urlVal = (String) model.getValueAt(row, 4);
-                        if (urlVal != null && !urlVal.isEmpty()) {
-                            Toolkit.getDefaultToolkit().getSystemClipboard()
-                                    .setContents(new StringSelection(urlVal), null);
-                            if (statusLabel != null) setStatus("URL скопирован в буфер", DIM);
-                        }
-                    }
-                }
-            }
-        });
-
-        JScrollPane sp = new JScrollPane(table,
-                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
-                JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
-        sp.setAlignmentX(LEFT_ALIGNMENT);
-        sp.setPreferredSize(new Dimension(0, height));
-        sp.setMaximumSize(new Dimension(Integer.MAX_VALUE, height));
-        return sp;
-    }
-
-    private JPanel hPanel() {
-        JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
-        p.setAlignmentX(LEFT_ALIGNMENT);
-        return p;
+    private void copy(String s) {
+        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(s), null);
     }
 
     private JLabel label(String text) { return new JLabel(text); }
-
-    private JLabel sectionHeader(String text) {
-        JLabel l = new JLabel(text);
-        l.setFont(l.getFont().deriveFont(Font.BOLD, 14f));
-        l.setAlignmentX(LEFT_ALIGNMENT);
-        l.setBorder(BorderFactory.createEmptyBorder(0, 0, 4, 0));
-        return l;
-    }
-
-    private JTextArea textArea(int rows) {
-        JTextArea ta = new JTextArea(rows, 0);
-        ta.setEditable(false);
-        ta.setLineWrap(true);
-        ta.setWrapStyleWord(true);
-        ta.setFont(new Font("Segoe UI", Font.PLAIN, 13));
-        ta.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
-        return ta;
-    }
-
-    private JScrollPane wrapScroll(JTextArea ta, int maxHeight) {
-        JScrollPane sp = new JScrollPane(ta);
-        sp.setAlignmentX(LEFT_ALIGNMENT);
-        sp.setMaximumSize(new Dimension(Integer.MAX_VALUE, maxHeight));
-        return sp;
-    }
 
     private Component vgap(int h) { return Box.createRigidArea(new Dimension(0, h)); }
 
@@ -1035,10 +680,5 @@ public class MainWindow extends JFrame {
     private void setStatus(String text, Color color) {
         statusLabel.setText(text);
         statusLabel.setForeground(color);
-    }
-
-    private String formatPrice(BigDecimal price) {
-        if (price == null) return "—";
-        return String.format("%,.0f", price).replace(',', ' ');
     }
 }

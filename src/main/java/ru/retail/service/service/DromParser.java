@@ -500,6 +500,57 @@ public class DromParser {
         return best != null ? best : mine.get(0);
     }
 
+    /** Результат дешёвого скана региона: наши объявления (для ссылки) + конкуренты со страницы поиска. */
+    public record RegionScan(List<MyListingCandidate> myCandidates, List<PartPrice> competitors) {
+        static RegionScan empty() { return new RegionScan(List.of(), List.of()); }
+    }
+
+    /**
+     * Дешёвый подсчёт наличия: за ОДНУ загрузку страницы поиска по OEM возвращает наши объявления
+     * (dealer содержит {@code myCompany}) и конкурентов (чужие компании) как «лёгкие» {@link PartPrice}
+     * прямо со страницы результатов — БЕЗ захода на детальные страницы (быстро, меньше капчи).
+     * Капча не пройдена / ошибка → пустой результат (как и остальные методы).
+     */
+    public RegionScan scanRegion(String oemNumber, String region, String myCompany) {
+        String searchUrl = buildSearchUrl(oemNumber, region);
+        log.info("Скан наличия [{}] OEM={}: {}", region, oemNumber, searchUrl);
+
+        BrowserContext ctx = newContext(browser, sessionFile);
+        Page page = newPage(ctx);
+        try {
+            List<SearchEntry> entries = loadSearchEntries(page, ctx, sessionFile, searchUrl, region);
+            if (entries == null) return RegionScan.empty();   // капча не пройдена
+
+            String companyLower = myCompany == null ? "" : myCompany.toLowerCase();
+            List<MyListingCandidate> mine = new ArrayList<>();
+            List<PartPrice> competitors = new ArrayList<>();
+            for (SearchEntry e : entries) {
+                boolean isMine = !companyLower.isBlank() && e.dealer() != null
+                        && e.dealer().toLowerCase().contains(companyLower);
+                if (isMine) {
+                    mine.add(new MyListingCandidate(e.url(), e.price()));
+                } else {
+                    competitors.add(PartPrice.builder()
+                            .title(e.title())
+                            .price(e.price())
+                            .url(e.url())
+                            .dealer(e.dealer())
+                            .oem(e.oem())
+                            .publishedDate(e.date())
+                            .build());
+                }
+            }
+            return new RegionScan(mine, competitors);
+        } catch (Exception ex) {
+            noteError(ex);
+            log.error("Ошибка скана [{}]: {}", region, ex.getMessage());
+            return RegionScan.empty();
+        } finally {
+            page.close();
+            ctx.close();
+        }
+    }
+
     /** Загружает страницу поиска (с обработкой капчи) и возвращает сырые объявления; null — капча не пройдена. */
     private List<SearchEntry> loadSearchEntries(Page page, BrowserContext ctx, Path sessionFile,
                                                 String searchUrl, String region) throws InterruptedException {

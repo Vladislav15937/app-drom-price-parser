@@ -2,798 +2,212 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Анализ цен — Drom.ru</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Анализ наличия запчастей — Drom.ru</title>
 <style>
-:root {
-  --bg: #2b2b2b; --panel: #3c3f41; --input-bg: #45494a;
-  --text: #bbbbbb; --text-dim: #888; --border: #555;
-  --green: #22c55e; --yellow: #eab308; --red: #ef4444; --blue: #60a5fa;
-  --hover: #4c5052;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { height: 100%; }
-body { background: var(--bg); color: var(--text); font: 14px/1.5 'Segoe UI', system-ui, sans-serif; }
-a { color: var(--blue); }
-
-.app { display: flex; flex-direction: column; height: 100vh; padding: 16px; overflow: hidden; }
-h1 { font-size: 18px; font-weight: 600; margin-bottom: 12px; flex-shrink: 0; }
-
-/* ── Tabs ── */
-.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 0; flex-shrink: 0; }
-.tab-btn { background: none; border: none; color: var(--text-dim); padding: 8px 18px; cursor: pointer;
-  font-size: 14px; border-bottom: 2px solid transparent; margin-bottom: -1px; }
-.tab-btn:hover { color: var(--text); }
-.tab-btn.active { color: var(--text); border-bottom-color: var(--blue); }
-.tab-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; padding-top: 16px; }
-.tab-panel.active { display: flex; }
-
-/* ── Form ── */
-.form-grid { display: grid; grid-template-columns: max-content 1fr; align-items: center;
-  gap: 8px 12px; max-width: 900px; flex-shrink: 0; }
-.form-grid label { color: var(--text-dim); white-space: nowrap; }
-input[type=text], select {
-  background: var(--input-bg); border: 1px solid var(--border); color: var(--text);
-  padding: 6px 10px; border-radius: 4px; font-size: 14px; width: 100%; }
-input[type=text]:focus, select:focus { outline: none; border-color: var(--blue); }
-.row-inline { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.row-inline label { color: var(--text-dim); white-space: nowrap; }
-.btn { background: var(--panel); border: 1px solid var(--border); color: var(--text);
-  padding: 7px 18px; border-radius: 4px; cursor: pointer; font-size: 14px; white-space: nowrap; }
-.btn:hover:not(:disabled) { background: var(--hover); }
-.btn-primary { background: #2d5a8e; border-color: #3d6fa0; color: #fff; }
-.btn-primary:hover:not(:disabled) { background: #3d6fa0; }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.status { font-size: 13px; color: var(--text-dim); }
-.status.running { color: var(--blue); }
-.status.ok { color: var(--green); }
-.status.err { color: var(--red); }
-.status.warn { color: var(--yellow); }
-
-/* ── Single results ── */
-.single-body { flex: 1; overflow-y: auto; margin-top: 16px; padding-right: 4px; }
-.results { display: none; }
-.price-row { display: flex; align-items: baseline; gap: 12px; margin-bottom: 6px; }
-.rec-price { font-size: 32px; font-weight: 700; color: var(--green); }
-.confidence { font-size: 13px; }
-.stats-line { color: var(--text-dim); font-size: 13px; margin-bottom: 3px; }
-.market-note { color: var(--text-dim); font-size: 12px; font-style: italic; margin-bottom: 14px; }
-.section-title { font-size: 14px; font-weight: 600; margin: 14px 0 6px; }
-.ai-reason { background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
-  padding: 10px; font-size: 13px; line-height: 1.6; white-space: pre-wrap;
-  max-height: 120px; overflow-y: auto; }
-
-/* ── Tables ── */
-.tbl-wrap { overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; font-size: 13px; white-space: nowrap; table-layout: fixed; }
-th { background: var(--panel); color: var(--text-dim); font-weight: 500; text-align: left;
-  padding: 6px 10px; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 1;
-  overflow: hidden; text-overflow: ellipsis; }
-td { padding: 5px 10px; border-bottom: 1px solid #3a3a3a; overflow: hidden; text-overflow: ellipsis; }
-tr:hover td { background: var(--hover); }
-tr.selected td { background: #1e3a5f; }
-.num { text-align: right; }
-.tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; }
-.tag-wait { background: #1c2b3a; color: var(--text-dim); }
-.tag-run  { background: #1e3a5f; color: var(--blue); }
-.tag-done { background: #14532d; color: var(--green); }
-.tag-none { background: #3a1c1c; color: var(--red); }
-.tag-err  { background: #3a1c1c; color: var(--red); }
-
-/* ── Batch split ── */
-.batch-body { flex: 1; display: flex; flex-direction: column; margin-top: 12px; min-height: 0; }
-.split-table { height: 260px; overflow-y: auto; border: 1px solid var(--border); flex-shrink: 0; cursor: pointer; }
-.split-detail { flex: 1; overflow-y: auto; border: 1px solid var(--border); border-top: none; padding: 14px 16px; }
-.hint { color: var(--text-dim); font-style: italic; font-size: 13px; }
-
-/* ── File input ── */
-.file-row { display: flex; align-items: center; gap: 8px; }
-.file-row input[type=file] { display: none; }
-.file-label { color: var(--text-dim); font-size: 13px; }
-
-/* ── Scrollbar ── */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: var(--panel); }
-::-webkit-scrollbar-thumb { background: #666; border-radius: 3px; }
+  :root { --bg:#1e1e1e; --panel:#2b2b2b; --line:#3c3c3c; --dim:#a0a0a0; --blue:#60a5fa;
+          --red:#ef4444; --yellow:#eab308; --purple:#a855f7; --green:#22c55e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); color:#e0e0e0; }
+  #url-bar { padding:6px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--dim); background:var(--panel); }
+  #url-bar b { font-weight:600; }
+  .tabs { display:flex; border-bottom:1px solid var(--line); }
+  .tab { padding:12px 20px; cursor:pointer; color:var(--dim); }
+  .tab.active { color:#fff; border-bottom:2px solid var(--blue); }
+  .panel { padding:20px; display:none; }
+  .panel.active { display:block; }
+  label { display:inline-block; color:var(--dim); font-size:13px; margin-right:6px; }
+  input[type=text], input[type=number] { background:#333; border:1px solid var(--line); color:#eee;
+          border-radius:4px; padding:7px 9px; font-size:14px; }
+  button { background:#3b82f6; color:#fff; border:none; border-radius:4px; padding:9px 18px;
+          font-size:14px; cursor:pointer; }
+  button:disabled { background:#444; color:#888; cursor:default; }
+  .row { margin-bottom:12px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .status { color:var(--dim); font-size:13px; margin-left:8px; }
+  table { border-collapse:collapse; width:100%; margin-top:14px; font-size:13px; }
+  th,td { border:1px solid var(--line); padding:6px 8px; text-align:left; }
+  th { background:#333; position:sticky; top:0; }
+  a { color:var(--blue); }
+  .badge { display:inline-block; padding:3px 10px; border-radius:12px; font-weight:600; font-size:13px; }
+  .c-RED    { background:#7a1f1f; color:#ffd7d7; }
+  .c-PURPLE { background:#4a2f6b; color:#e9d5ff; }
+  .c-YELLOW { background:#6b5a12; color:#fff3b0; }
+  .c-NONE   { background:#2f4a2f; color:#c9f0c9; }
+  tr.RED    td { background:#3a1e1e; }
+  tr.PURPLE td { background:#2e2440; }
+  tr.YELLOW td { background:#3a3410; }
+  .big { font-size:26px; font-weight:700; margin:8px 0; }
 </style>
 </head>
 <body>
-<div class="app">
-  <div id="url-bar" style="display:flex;align-items:center;gap:16px;padding:5px 2px 6px;border-bottom:1px solid var(--border);margin-bottom:10px;font-size:12px;color:var(--text-dim);flex-shrink:0">
-    <span>Локальный: <a id="url-local" href="#" onclick="copyToClipboard(event,'url-local-val')" title="Нажмите, чтобы скопировать"><span id="url-local-val">…</span></a></span>
-    <span style="color:#555">|</span>
-    <span>Публичный: <a id="url-pub" href="#" onclick="copyToClipboard(event,'url-pub-val')" title="Нажмите, чтобы скопировать"><span id="url-pub-val">определяется…</span></a></span>
-    <span id="url-copy-hint" style="color:var(--green);display:none">скопировано!</span>
+<div id="url-bar">
+  <b>Локальный:</b> <span id="url-local">http://localhost:8081</span>
+  &nbsp;|&nbsp; <b>Публичный:</b> <span id="url-pub">определяется…</span>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="single">Проверка по OEM</div>
+  <div class="tab" data-tab="batch">Анализ по каталогу</div>
+</div>
+
+<!-- SINGLE -->
+<div class="panel active" id="p-single">
+  <div class="row">
+    <label>OEM номер:</label>
+    <input type="text" id="s-oem" style="width:220px" placeholder="4775068010">
   </div>
-
-  <h1>Анализ цен на запчасти — Drom.ru</h1>
-
-  <div class="tabs">
-    <button class="tab-btn active" onclick="showTab('single')">Анализ по ссылке</button>
-    <button class="tab-btn" onclick="showTab('batch')">Анализ по каталогу</button>
+  <div class="row">
+    <label>Компания на Drom:</label>
+    <input type="text" id="s-company" value="YARD86" style="width:140px">
+    <label style="margin-left:16px">Цена, ₽:</label>
+    <input type="number" id="s-price" style="width:120px" placeholder="необязательно">
   </div>
-
-  <!-- ═══ TAB 1 ═══ -->
-  <div id="tab-single" class="tab-panel active">
-    <div class="form-grid">
-      <label>OEM номер:</label>
-      <input type="text" id="s-oem" placeholder="например: 4785033210">
-
-      <label>URL моего объявления:</label>
-      <input type="text" id="s-url" placeholder="https://baza.drom.ru/...">
-
-      <label>Регион:</label>
-      <div class="row-inline">
-        <input type="text" id="s-region" list="regions-dl" value="barnaul" style="width:160px" placeholder="barnaul">
-        <label>Моя цена, ₽ (необяз.):</label>
-        <input type="text" id="s-price" placeholder="оставьте пустым" style="width:160px">
-      </div>
-      <datalist id="regions-dl">
-        <option value="barnaul"><option value="novosibirsk"><option value="omsk">
-        <option value="tomsk"><option value="kemerovo"><option value="krasnoyarsk"><option value="irkutsk">
-      </datalist>
-
-      <label></label>
-      <div class="row-inline">
-        <button class="btn btn-primary" id="s-btn" onclick="runSingle()">Анализировать</button>
-        <span class="status" id="s-status"></span>
-      </div>
-    </div>
-
-    <div class="single-body">
-      <div class="results" id="s-results">
-        <div class="price-row">
-          <span class="rec-price" id="s-price-out">—</span>
-          <span class="confidence" id="s-conf"></span>
-        </div>
-        <div class="stats-line" id="s-stats"></div>
-        <div class="market-note" id="s-note"></div>
-        <div class="section-title">Обоснование AI</div>
-        <div class="ai-reason" id="s-reason"></div>
-        <div id="s-city-section">
-          <div class="section-title">Конкуренты в городе</div>
-          <div class="tbl-wrap">
-            <table>
-              <colgroup><col style="width:90px"><col style="width:380px"><col style="width:140px"><col style="width:130px"><col></colgroup>
-              <thead><tr><th class="num">Цена, ₽</th><th>Название</th><th>Продавец</th><th>Дата</th><th>URL</th></tr></thead>
-              <tbody id="s-city-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-        <div id="s-sib-section" style="display:none">
-          <div class="section-title">Конкуренты в Новосибирске</div>
-          <div class="tbl-wrap">
-            <table>
-              <colgroup><col style="width:90px"><col style="width:380px"><col style="width:140px"><col style="width:130px"><col></colgroup>
-              <thead><tr><th class="num">Цена, ₽</th><th>Название</th><th>Продавец</th><th>Дата</th><th>URL</th></tr></thead>
-              <tbody id="s-sib-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-    </div>
+  <div class="row">
+    <button id="s-btn">Проверить наличие</button>
+    <span class="status" id="s-status"></span>
   </div>
+  <div id="s-result" style="display:none; margin-top:16px">
+    <div class="big" id="s-title"></div>
+    <div id="s-counts" style="font-size:15px; margin-bottom:8px"></div>
+    <div id="s-note" style="color:var(--dim); font-style:italic; margin-bottom:12px"></div>
+    <div id="s-link"></div>
+  </div>
+</div>
 
-  <!-- ═══ TAB 2 ═══ -->
-  <div id="tab-batch" class="tab-panel">
-    <div class="form-grid">
-      <label>Файл каталога (CSV):</label>
-      <div class="file-row">
-        <button class="btn" onclick="document.getElementById('b-file-input').click()">Обзор...</button>
-        <input type="file" id="b-file-input" accept=".csv" onchange="onFileSelected(this)">
-        <span class="file-label" id="b-file-name">файл не выбран</span>
-      </div>
-
-      <label>Регион:</label>
-      <div class="row-inline">
-        <input type="text" id="b-region" list="regions-dl" value="barnaul" style="width:160px" placeholder="barnaul">
-        <label>Компания на Drom:</label>
-        <input type="text" id="b-company" value="YARD86" style="width:140px">
-        <label>Кол-во OEM (0=все):</label>
-        <input type="text" id="b-limit" value="0" style="width:60px">
-      </div>
-
-      <label></label>
-      <div class="row-inline">
-        <button class="btn btn-primary" id="b-btn" onclick="runBatch()" disabled>Запустить анализ</button>
-        <button class="btn" id="b-stop" onclick="stopBatch()" disabled>Стоп</button>
-        <span class="status" id="b-status">Загрузите CSV-файл каталога</span>
-      </div>
-    </div>
-
-    <div class="batch-body">
-      <div class="split-table">
-        <table id="b-table">
-          <colgroup>
-            <col style="width:130px"><col style="width:200px"><col style="width:200px">
-            <col style="width:130px"><col style="width:130px"><col style="width:100px"><col style="width:130px">
-          </colgroup>
-          <thead><tr>
-            <th>OEM</th><th>Запчасть</th><th>Марка / Модель</th>
-            <th class="num">Цена каталог, ₽</th><th class="num">Рек. цена, ₽</th>
-            <th class="num">Конкурентов</th><th>Статус</th>
-          </tr></thead>
-          <tbody id="b-tbody"></tbody>
-        </table>
-      </div>
-      <div class="split-detail" id="b-detail">
-        <span class="hint">Выберите строку в таблице, чтобы увидеть детали анализа</span>
-      </div>
-    </div>
+<!-- BATCH -->
+<div class="panel" id="p-batch">
+  <div class="row">
+    <label>Файл каталога (CSV/XLSX):</label>
+    <input type="file" id="b-file" accept=".csv,.xlsx">
+  </div>
+  <div class="row">
+    <label>Компания на Drom:</label>
+    <input type="text" id="b-company" value="YARD86" style="width:140px">
+    <label style="margin-left:16px">Кол-во (0 = все):</label>
+    <input type="number" id="b-limit" value="0" style="width:80px">
+  </div>
+  <div class="row">
+    <button id="b-btn">Запустить анализ</button>
+    <span class="status" id="b-status"></span>
+  </div>
+  <div style="color:var(--dim); font-size:12px; margin-top:6px">
+    Цвета: <span class="badge c-RED">дефицит</span> Барнаул&lt;4 и Сибирь&lt;10 ·
+    <span class="badge c-PURPLE">Сибирь&lt;10</span> · <span class="badge c-YELLOW">Барнаул&lt;4</span>
+  </div>
+  <div style="max-height:60vh; overflow:auto">
+    <table>
+      <thead><tr>
+        <th>#</th><th>OEM</th><th>Запчасть</th><th>Барнаул</th><th>Сибирь</th>
+        <th>Статус</th><th>Моё объявление</th>
+      </tr></thead>
+      <tbody id="b-tbody"></tbody>
+    </table>
   </div>
 </div>
 
 <script>
-// ══════════════════════════════════════════════════════════════
-// URL-bar — адреса сервера
-// ══════════════════════════════════════════════════════════════
+const $ = id => document.getElementById(id);
 
-async function loadServerInfo() {
+// ── Server info ──
+async function loadInfo() {
   try {
-    const r = await fetch('/api/v1/info');
-    if (!r.ok) return;
-    const d = await r.json();
-    if (d.localUrl) {
-      document.getElementById('url-local-val').textContent = d.localUrl;
-      document.getElementById('url-local').href = d.localUrl;
-    }
-    if (d.publicUrl) {
-      document.getElementById('url-pub-val').textContent = d.publicUrl;
-      document.getElementById('url-pub').href = d.publicUrl;
-      document.getElementById('url-pub-val').style.color = 'var(--green)';
-    } else {
-      document.getElementById('url-pub-val').textContent = 'cloudflared не найден → brew install cloudflared';
-      document.getElementById('url-pub-val').style.color = 'var(--yellow)';
-    }
-  } catch (e) {}
+    const r = await fetch('/api/v1/info'); const j = await r.json();
+    if (j.localUrl)  $('url-local').textContent = j.localUrl;
+    $('url-pub').textContent = j.publicUrl || 'cloudflared не найден';
+  } catch(e) {}
 }
+loadInfo(); setInterval(loadInfo, 15000);
 
-let _copyTimer;
-function copyToClipboard(e, spanId) {
-  e.preventDefault();
-  const text = document.getElementById(spanId).textContent;
-  if (!text || text.includes('…') || text.includes('cloudflared')) return;
-  navigator.clipboard.writeText(text).then(() => {
-    const hint = document.getElementById('url-copy-hint');
-    hint.style.display = '';
-    clearTimeout(_copyTimer);
-    _copyTimer = setTimeout(() => { hint.style.display = 'none'; }, 1800);
-  }).catch(() => {});
-}
+// ── Tabs ──
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  $('p-' + t.dataset.tab).classList.add('active');
+});
 
-// Если tunnelService ещё определяет URL — опрашиваем раз в 5 с пока не появится
-async function pollUntilPublicUrl() {
-  for (let i = 0; i < 12; i++) {
-    await new Promise(r => setTimeout(r, 5000));
-    try {
-      const d = await (await fetch('/api/v1/info')).json();
-      if (d.publicUrl) {
-        document.getElementById('url-pub-val').textContent = d.publicUrl;
-        document.getElementById('url-pub').href = d.publicUrl;
-        document.getElementById('url-pub-val').style.color = 'var(--green)';
-        break;
-      }
-    } catch (e) {}
-  }
-}
-
-// ══════════════════════════════════════════════════════════════
-// localStorage — сохранение состояния между перезагрузками
-// ══════════════════════════════════════════════════════════════
-
-const LS = {
-  save(k, v) { try { localStorage.setItem('dp_' + k, JSON.stringify(v)); } catch(e) {} },
-  load(k, d) { try { const v = localStorage.getItem('dp_' + k); return v != null ? JSON.parse(v) : d; } catch(e) { return d; } }
-};
-
-// ══════════════════════════════════════════════════════════════
-// Утилиты
-// ══════════════════════════════════════════════════════════════
-
-function showTab(name) {
-  document.querySelectorAll('.tab-btn').forEach((b, i) =>
-    b.classList.toggle('active', ['single','batch'][i] === name));
-  document.querySelectorAll('.tab-panel').forEach(p =>
-    p.classList.toggle('active', p.id === 'tab-' + name));
-  LS.save('tab', name);
-}
-
-function fmt(val) {
-  if (val == null || val === '' || val === 0 || val === '0') return '—';
-  const n = Number(val);
-  if (isNaN(n) || n === 0) return '—';
-  return n.toLocaleString('ru-RU', {maximumFractionDigits: 0});
-}
-
-function esc(s) {
-  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-function confColor(conf) {
-  if (!conf) return '';
-  const c = conf.toLowerCase();
-  if (c.includes('высок')) return 'color:var(--green)';
-  if (c.includes('средн')) return 'color:var(--yellow)';
-  return 'color:var(--red)';
-}
-
-function setStatus(id, cls, text) {
-  const el = document.getElementById(id);
-  el.className = 'status' + (cls ? ' ' + cls : '');
-  el.textContent = text;
-}
-
-async function readSse(response, onEvent) {
-  const reader = response.body.getReader();
+// ── SSE over fetch (POST) ──
+async function sse(url, body, handlers) {
+  const resp = await fetch(url, { method:'POST', body });
+  const reader = resp.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
   while (true) {
-    const { done, value } = await reader.read();
+    const { value, done } = await reader.read();
     if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const parts = buf.split('\n\n');
-    buf = parts.pop();
-    for (const part of parts) {
-      if (!part.trim()) continue;
-      let type = 'message', data = '';
-      for (const line of part.split('\n')) {
-        if (line.startsWith('event: ')) type = line.slice(7).trim();
-        else if (line.startsWith('data: ')) data = line.slice(6);
-      }
-      console.log('[SSE] event=' + type + ' dataLen=' + data.length);
-      if (type === 'ping') continue;
-      try {
-        onEvent(type, data);
-      } catch (err) {
-        console.error('[SSE] handler error event="' + type + '":', err, '\ndata:', data.slice(0, 500));
-      }
-    }
-  }
-}
-
-function compTbody(items) {
-  return (items || []).map(p => `<tr ondblclick="copyUrl('${esc(p.url||'')}')">
-    <td class="num">${fmt(p.price)}</td>
-    <td>${esc(p.title || '')}</td>
-    <td>${esc(p.dealer || p.location || '')}</td>
-    <td>${esc(p.publishedDate || '')}</td>
-    <td><a href="${esc(p.url||'')}" target="_blank" onclick="event.stopPropagation()">${esc(p.url ? p.url.slice(0,55)+(p.url.length>55?'…':'') : '')}</a></td>
-  </tr>`).join('');
-}
-
-function copyUrl(url) {
-  if (!url) return;
-  navigator.clipboard.writeText(url).then(() => {
-    const prev = document.getElementById('s-status')?.textContent;
-    setStatus('s-status', '', 'URL скопирован');
-    setTimeout(() => setStatus('s-status', '', prev || ''), 2000);
-  }).catch(() => {});
-}
-
-// ══════════════════════════════════════════════════════════════
-// CSV-парсер (Windows-1251, точка с запятой)
-// ══════════════════════════════════════════════════════════════
-
-async function parseCsv(file) {
-  const buf = await file.arrayBuffer();
-  const text = new TextDecoder('windows-1251').decode(buf);
-  const rows = [];
-  let row = [], sb = '', inQ = false, firstRow = true;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (c === '"') { inQ = !inQ; }
-    else if (c === ';' && !inQ) { row.push(sb.trim()); sb = ''; }
-    else if (c === '\n' && !inQ) {
-      row.push(sb.trim()); sb = '';
-      if (row.some(x => x !== '')) {
-        if (firstRow) firstRow = false;
-        else rows.push(row);
-      }
-      row = [];
-    } else if (c !== '\r') { sb += c; }
-  }
-  if (sb) row.push(sb.trim());
-  if (row.some(x => x !== '') && !firstRow) rows.push(row);
-  return rows;
-}
-
-function col(row, i) { return (row && row[i] != null) ? String(row[i]).trim() : ''; }
-
-// ══════════════════════════════════════════════════════════════
-// TAB 1 — Одиночный анализ
-// ══════════════════════════════════════════════════════════════
-
-async function runSingle() {
-  const oem    = document.getElementById('s-oem').value.trim();
-  const url    = document.getElementById('s-url').value.trim();
-  const region = document.getElementById('s-region').value;
-  const price  = document.getElementById('s-price').value.trim();
-
-  if (!oem || !url) { alert('Заполните OEM номер и URL объявления'); return; }
-
-  document.getElementById('s-btn').disabled = true;
-  document.getElementById('s-results').style.display = 'none';
-  setStatus('s-status', 'running', 'Анализ идёт...');
-
-  const params = new URLSearchParams({ oem, region, myListingUrl: url });
-  if (price) params.set('myPrice', price);
-
-  try {
-    const resp = await fetch('/api/v1/analyze/stream?' + params, { method: 'POST' });
-    if (!resp.ok) { setStatus('s-status', 'err', 'Ошибка сервера: ' + resp.status); return; }
-    await readSse(resp, (type, data) => {
-      if      (type === 'status') setStatus('s-status', 'running', data);
-      else if (type === 'result') { showSingleResult(JSON.parse(data)); setStatus('s-status', 'ok', 'Готово'); }
-      else if (type === 'error')  setStatus('s-status', 'err', 'Ошибка: ' + data);
-    });
-  } catch (e) {
-    setStatus('s-status', 'err', 'Ошибка соединения: ' + e.message);
-  } finally {
-    document.getElementById('s-btn').disabled = false;
-  }
-}
-
-function showSingleResult(r) {
-  LS.save('s_result', r);
-
-  document.getElementById('s-results').style.display = '';
-  document.getElementById('s-price-out').textContent = r.recommendedPrice ? fmt(r.recommendedPrice) + ' ₽' : '—';
-  const confEl = document.getElementById('s-conf');
-  confEl.textContent = r.aiConfidence ? 'уверенность: ' + r.aiConfidence : '';
-  confEl.style.cssText = confColor(r.aiConfidence);
-  document.getElementById('s-stats').textContent =
-    `Город: ${r.cityCompetitorCount ?? 0}  •  Новосибирск: ${r.siberiaCompetitorCount ?? 0}  •  ` +
-    `Мин: ${fmt(r.minPrice)} ₽  •  Макс: ${fmt(r.maxPrice)} ₽  •  ` +
-    `Ср: ${fmt(r.avgPrice)} ₽  •  Медиана: ${fmt(r.medianPrice)} ₽`;
-  document.getElementById('s-note').textContent = r.marketNote || '';
-  document.getElementById('s-reason').textContent = r.aiReason || '';
-  document.getElementById('s-city-tbody').innerHTML = compTbody(r.items);
-  const sibSec = document.getElementById('s-sib-section');
-  if (r.siberiaItems && r.siberiaItems.length) {
-    document.getElementById('s-sib-tbody').innerHTML = compTbody(r.siberiaItems);
-    sibSec.style.display = '';
-  } else {
-    sibSec.style.display = 'none';
-  }
-  document.querySelector('.single-body').scrollTop = 0;
-}
-
-// ══════════════════════════════════════════════════════════════
-// TAB 2 — Пакетный анализ
-// ══════════════════════════════════════════════════════════════
-
-let batchAbort  = null;
-let batchResults = [];
-let csvRows      = [];
-let selectedRow  = -1;
-let fileLoaded   = false;   // true = файл выбран, можно запускать
-
-async function onFileSelected(input) {
-  const file = input.files[0];
-  if (!file) return;
-  setStatus('b-status', 'running', 'Читаем файл...');
-  try {
-    csvRows = await parseCsv(file);
-    const count = populateBatchTable(csvRows, file.name);
-    batchResults = new Array(count).fill(null);
-    fileLoaded = true;
-    document.getElementById('b-btn').disabled = false;
-    document.getElementById('b-detail').innerHTML =
-      '<span class="hint">Выберите строку в таблице, чтобы увидеть детали анализа</span>';
-    selectedRow = -1;
-    setStatus('b-status', 'ok', 'Загружено строк: ' + count);
-  } catch (e) {
-    setStatus('b-status', 'err', 'Ошибка чтения: ' + e.message);
-  }
-}
-
-// Заполнить таблицу из CSV-строк (полный пересчёт)
-function populateBatchTable(rows, fileName) {
-  const tbody = document.getElementById('b-tbody');
-  tbody.innerHTML = '';
-  const displayData = [];
-  let idx = 0;
-  rows.forEach(row => {
-    const oem = col(row, 4);
-    if (!oem) return;
-    const item = {
-      oem,
-      partName:   col(row, 3),
-      brandModel: col(row, 8) + (col(row, 9) ? ' ' + col(row, 9) : ''),
-      catalogPrice: col(row, 5)
-    };
-    displayData.push(item);
-    appendBatchRow(tbody, idx++, item, 'wait');
-  });
-  // Сохраняем в localStorage
-  LS.save('b_display', displayData);
-  LS.save('b_results', []);
-  if (fileName) {
-    LS.save('b_csv_name', fileName);
-    document.getElementById('b-file-name').textContent = fileName;
-  }
-  return idx;
-}
-
-// Заполнить таблицу из сохранённых данных (без CSV-файла)
-function populateBatchTableFromSaved(displayData) {
-  const tbody = document.getElementById('b-tbody');
-  tbody.innerHTML = '';
-  displayData.forEach((item, i) => appendBatchRow(tbody, i, item, 'wait'));
-}
-
-function appendBatchRow(tbody, i, item, status) {
-  const tr = document.createElement('tr');
-  tr.id = 'b-row-' + i;
-  tr.dataset.index = i;
-  tr.onclick = () => selectBatchRow(i);
-  tr.innerHTML = `
-    <td>${esc(item.oem)}</td>
-    <td>${esc(item.partName)}</td>
-    <td>${esc(item.brandModel)}</td>
-    <td class="num">${item.catalogPrice && item.catalogPrice !== '0' ? fmt(item.catalogPrice) + ' ₽' : '—'}</td>
-    <td class="num" id="b-rec-${i}">—</td>
-    <td class="num" id="b-cnt-${i}">—</td>
-    <td id="b-st-${i}"><span class="tag tag-wait">Ожидает</span></td>`;
-  tbody.appendChild(tr);
-}
-
-async function runBatch() {
-  if (!csvRows || csvRows.length === 0) { alert('Выберите CSV-файл для запуска анализа'); return; }
-
-  const region  = document.getElementById('b-region').value;
-  const company = document.getElementById('b-company').value.trim() || 'YARD86';
-  const limitVal = parseInt(document.getElementById('b-limit').value) || 0;
-
-  // Фильтруем строки с OEM
-  const items = [];
-  csvRows.forEach(row => {
-    const oem = col(row, 4);
-    if (!oem) return;
-    items.push({ oem, catalogPrice: col(row, 5) || '0', partName: col(row, 3), brand: col(row, 8), model: col(row, 9) });
-  });
-  const total = (limitVal > 0 && limitVal < items.length) ? limitVal : items.length;
-
-  // Сброс всех строк в "Ожидает"
-  batchResults = new Array(total).fill(null);
-  selectedRow = -1;
-  document.getElementById('b-detail').innerHTML =
-    '<span class="hint">Выберите строку в таблице, чтобы увидеть детали анализа</span>';
-  document.querySelectorAll('#b-tbody tr').forEach(tr => {
-    const i = parseInt(tr.dataset.index);
-    if (i >= total) return;
-    const stEl  = document.getElementById('b-st-'  + i);
-    const recEl = document.getElementById('b-rec-' + i);
-    const cntEl = document.getElementById('b-cnt-' + i);
-    if (stEl)  stEl.innerHTML  = '<span class="tag tag-wait">Ожидает</span>';
-    if (recEl) recEl.textContent = '—';
-    if (cntEl) cntEl.textContent = '—';
-    tr.classList.remove('selected');
-  });
-
-  document.getElementById('b-btn').disabled = true;
-  document.getElementById('b-stop').disabled = false;
-  setStatus('b-status', 'running', `Анализируется 0 / ${total}...`);
-
-  batchAbort = new AbortController();
-  const signal = batchAbort.signal;
-
-  try {
-    for (let i = 0; i < total; i++) {
-      if (signal.aborted) break;
-
-      const item = items[i];
-      // Показываем "Анализируется..."
-      const stEl = document.getElementById('b-st-' + i);
-      if (stEl) stEl.innerHTML = '<span class="tag tag-run">Анализируется...</span>';
-      const tr = document.getElementById('b-row-' + i);
-      if (tr) tr.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      setStatus('b-status', 'running', `Анализируется ${i + 1} / ${total}...`);
-
-      const params = new URLSearchParams({
-        oem: item.oem,
-        catalogPrice: item.catalogPrice,
-        region,
-        company
+    buf += dec.decode(value, { stream:true });
+    let i;
+    while ((i = buf.indexOf('\n\n')) >= 0) {
+      const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+      let ev = 'message', data = '';
+      chunk.split('\n').forEach(line => {
+        if (line.startsWith('event:')) ev = line.slice(6).trim();
+        else if (line.startsWith('data:')) data += line.slice(5).trim();
       });
-
-      let result = null;
-      let itemError = null;
-      try {
-        const submitResp = await fetch('/api/v1/catalog-item/submit?' + params, { method: 'POST', signal });
-        if (!submitResp.ok) {
-          itemError = 'HTTP ' + submitResp.status;
-        } else {
-          const { jobId } = await submitResp.json();
-          // Опрашиваем каждые 4 секунды пока задание не завершится
-          pollLoop: while (!signal.aborted) {
-            await new Promise(r => setTimeout(r, 4000));
-            if (signal.aborted) break;
-            let pollResp;
-            try {
-              pollResp = await fetch('/api/v1/job/' + jobId, { signal });
-            } catch (pe) {
-              if (pe.name === 'AbortError') break;
-              itemError = 'Ошибка опроса: ' + pe.message;
-              break;
-            }
-            if (!pollResp.ok) { itemError = 'Poll HTTP ' + pollResp.status; break; }
-            const job = await pollResp.json();
-            if (job.status === 'done')  { result = job.result; break; }
-            if (job.status === 'error') { itemError = job.error || 'Ошибка анализа'; break; }
-            // pending / running — продолжаем ждать
-          }
-        }
-      } catch (e) {
-        if (e.name === 'AbortError') break;
-        itemError = e.message;
-      }
-
-      const row = {
-        index: i,
-        oem: item.oem,
-        partName: item.partName,
-        brand: item.brand,
-        model: item.model,
-        catalogPrice: item.catalogPrice,
-        result,
-        status: itemError ? 'error' : (result && result.recommendedPrice > 0 ? 'done' : 'notFound'),
-        error: itemError
-      };
-      batchResults[i] = row;
-      updateBatchRow(row);
-      LS.save('b_results', batchResults);
-      setStatus('b-status', 'running', `Готово ${i + 1} / ${total}...`);
-      if (selectedRow === i) showBatchDetail(row);
+      if (handlers[ev]) handlers[ev](data);
     }
-
-    const stopped = signal.aborted;
-    setStatus('b-status', stopped ? 'warn' : 'ok', stopped ? 'Остановлено' : 'Анализ завершён');
-    LS.save('b_results', batchResults);
-  } catch (e) {
-    if (e.name !== 'AbortError') setStatus('b-status', 'err', 'Ошибка: ' + e.message);
-    else setStatus('b-status', 'warn', 'Остановлено');
-  } finally {
-    document.getElementById('b-btn').disabled = false;
-    document.getElementById('b-stop').disabled = true;
-    batchAbort = null;
   }
 }
 
-function stopBatch() {
-  if (batchAbort) batchAbort.abort();
+const COLORS = { RED:'🔴 Дефицит', PURPLE:'🟣 Мало по Сибири', YELLOW:'🟡 Мало в Барнауле', NONE:'⚪ Конкуренция достаточная' };
+
+function linkHtml(url) {
+  return url ? `<a href="${url}" target="_blank">${url}</a>` : '<span style="color:var(--dim)">не найдено</span>';
 }
 
-function updateBatchRow(d) {
-  const r = d.result;
-  const found = r && r.recommendedPrice && Number(r.recommendedPrice) > 0;
-  const recEl = document.getElementById('b-rec-' + d.index);
-  const cntEl = document.getElementById('b-cnt-' + d.index);
-  const stEl  = document.getElementById('b-st-'  + d.index);
-  if (recEl) recEl.textContent = found ? fmt(r.recommendedPrice) + ' ₽' : '—';
-  if (cntEl) cntEl.textContent = r ? ((r.cityCompetitorCount || 0) + (r.siberiaCompetitorCount || 0)) : '—';
-  if (stEl)  stEl.innerHTML =
-    d.status === 'done'     ? '<span class="tag tag-done">Готово</span>' :
-    d.status === 'notFound' ? '<span class="tag tag-none">Не найдено</span>' :
-    d.status === 'error'    ? '<span class="tag tag-err">Ошибка</span>'   : '';
-}
+// ── Single ──
+$('s-btn').onclick = () => {
+  const oem = $('s-oem').value.trim();
+  if (!oem) { $('s-status').textContent = 'Введите OEM'; return; }
+  const body = new URLSearchParams({ oem, catalogPrice: $('s-price').value || '0', company: $('s-company').value.trim() });
+  $('s-btn').disabled = true; $('s-status').textContent = 'Анализ идёт…'; $('s-result').style.display = 'none';
+  sse('/api/v1/catalog-item/stream', body, {
+    result: d => {
+      const r = JSON.parse(d);
+      $('s-title').innerHTML = `<span class="badge c-${r.color}">${COLORS[r.color]}</span>`;
+      $('s-counts').textContent = `Барнаул: ${r.barnaulCount} конкурентов   •   Сибирь: ` +
+        (r.searchedSiberia ? r.siberiaCount + ' конкурентов' : 'не искали (в Барнауле ≥ 10)');
+      $('s-note').textContent = r.status || '';
+      $('s-link').innerHTML = 'Моё объявление: ' + linkHtml(r.myListingUrl);
+      $('s-result').style.display = 'block';
+      $('s-status').textContent = 'Готово'; $('s-btn').disabled = false;
+    },
+    error: d => { $('s-status').textContent = 'Ошибка: ' + d; $('s-btn').disabled = false; }
+  }).catch(e => { $('s-status').textContent = 'Ошибка: ' + e; $('s-btn').disabled = false; });
+};
 
-function selectBatchRow(index) {
-  document.querySelectorAll('#b-tbody tr').forEach(tr => tr.classList.remove('selected'));
-  const tr = document.getElementById('b-row-' + index);
-  if (tr) tr.classList.add('selected');
-  selectedRow = index;
-  const d = batchResults[index];
-  if (d && d.result) showBatchDetail(d);
-  else document.getElementById('b-detail').innerHTML =
-    '<span class="hint">Данные ещё не получены — строка ещё анализируется</span>';
-}
-
-function showBatchDetail(d) {
-  const r = d.result;
-  if (!r) return;
-  const confStyle = confColor(r.aiConfidence);
-  const confHtml  = r.aiConfidence
-    ? `<span class="confidence" style="${confStyle}">уверенность: ${esc(r.aiConfidence)}</span>` : '';
-  const sibHtml = (r.siberiaItems && r.siberiaItems.length)
-    ? `<div class="section-title">Конкуренты в Новосибирске</div>
-       <div class="tbl-wrap"><table>
-         <colgroup><col style="width:90px"><col style="width:340px"><col style="width:140px"><col style="width:120px"><col></colgroup>
-         <thead><tr><th class="num">Цена, ₽</th><th>Название</th><th>Продавец</th><th>Дата</th><th>URL</th></tr></thead>
-         <tbody>${compTbody(r.siberiaItems)}</tbody></table></div>` : '';
-
-  document.getElementById('b-detail').innerHTML = `
-    <div class="price-row">
-      <span class="rec-price" style="font-size:28px">${r.recommendedPrice ? fmt(r.recommendedPrice) + ' ₽' : '—'}</span>
-      ${confHtml}
-    </div>
-    <div class="stats-line">Город: ${r.cityCompetitorCount ?? 0}  •  НСК: ${r.siberiaCompetitorCount ?? 0}  •
-      Мин: ${fmt(r.minPrice)} ₽  •  Макс: ${fmt(r.maxPrice)} ₽  •  Ср: ${fmt(r.avgPrice)} ₽  •  Медиана: ${fmt(r.medianPrice)} ₽</div>
-    <div class="market-note">${esc(r.marketNote || '')}</div>
-    <div class="section-title">Обоснование AI</div>
-    <div class="ai-reason">${esc(r.aiReason || '')}</div>
-    <div class="section-title">Конкуренты в городе</div>
-    <div class="tbl-wrap"><table>
-      <colgroup><col style="width:90px"><col style="width:340px"><col style="width:140px"><col style="width:120px"><col></colgroup>
-      <thead><tr><th class="num">Цена, ₽</th><th>Название</th><th>Продавец</th><th>Дата</th><th>URL</th></tr></thead>
-      <tbody>${compTbody(r.items)}</tbody></table></div>
-    ${sibHtml}`;
-  document.getElementById('b-detail').scrollTop = 0;
-}
-
-// ══════════════════════════════════════════════════════════════
-// Восстановление состояния при загрузке страницы
-// ══════════════════════════════════════════════════════════════
-
-function restoreState() {
-  // Форма одиночного анализа
-  const fields = { 's-oem': '', 's-url': '', 's-price': '' };
-  Object.keys(fields).forEach(id => {
-    const v = LS.load(id, '');
-    if (v) document.getElementById(id).value = v;
-  });
-  const sRegion = LS.load('s-region', '');
-  if (sRegion) document.getElementById('s-region').value = sRegion;
-
-  // Форма пакетного анализа
-  const bCompany = LS.load('b-company', '');
-  if (bCompany) document.getElementById('b-company').value = bCompany;
-  const bLimit = LS.load('b-limit', '');
-  if (bLimit) document.getElementById('b-limit').value = bLimit;
-  const bRegion = LS.load('b-region', '');
-  if (bRegion) document.getElementById('b-region').value = bRegion;
-
-  // Последний результат одиночного анализа
-  const sResult = LS.load('s_result', null);
-  if (sResult) showSingleResult(sResult);
-
-  // Пакетная таблица из сохранённых данных
-  const bDisplay  = LS.load('b_display', null);
-  const bSaved    = LS.load('b_results', null);
-  const bCsvName  = LS.load('b_csv_name', null);
-  if (bDisplay && bDisplay.length) {
-    populateBatchTableFromSaved(bDisplay);
-    batchResults = bSaved && bSaved.length === bDisplay.length ? bSaved : new Array(bDisplay.length).fill(null);
-    batchResults.forEach(d => { if (d) updateBatchRow(d); });
-
-    const done = batchResults.filter(d => d && (d.status === 'done' || d.status === 'notFound')).length;
-    if (bCsvName) document.getElementById('b-file-name').textContent = bCsvName;
-    setStatus('b-status', 'warn', `Данные прошлого сеанса: ${done} / ${bDisplay.length} позиций. Выберите файл для повторного запуска.`);
-    // Кнопка "Запустить" остаётся disabled — нужен файл
-  }
-
-  // Активная вкладка
-  const tab = LS.load('tab', 'single');
-  if (tab === 'batch') showTab('batch');
-}
-
-// Сохранение полей формы при вводе
-function bindInputPersist() {
-  ['s-oem', 's-url', 's-price'].forEach(id =>
-    document.getElementById(id).addEventListener('input', e => LS.save(id, e.target.value)));
-  ['s-region', 'b-region'].forEach(id =>
-    document.getElementById(id).addEventListener('input', e => LS.save(id, e.target.value)));
-  ['b-company', 'b-limit'].forEach(id =>
-    document.getElementById(id).addEventListener('input', e => LS.save(id, e.target.value)));
-}
-
-// Enter → запустить одиночный анализ
-document.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && document.getElementById('tab-single').classList.contains('active'))
-    if (!document.getElementById('s-btn').disabled) runSingle();
-});
-
-// Инициализация
-document.addEventListener('DOMContentLoaded', () => {
-  bindInputPersist();
-  restoreState();
-  loadServerInfo().then(() => {
-    // Если публичный URL ещё не готов — продолжаем опрашивать
-    if (document.getElementById('url-pub-val').textContent === 'определяется…') {
-      pollUntilPublicUrl();
-    }
-  });
-});
+// ── Batch ──
+let bIndex = 0;
+$('b-btn').onclick = () => {
+  const f = $('b-file').files[0];
+  if (!f) { $('b-status').textContent = 'Выберите CSV-файл'; return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  fd.append('company', $('b-company').value.trim());
+  fd.append('limit', $('b-limit').value || '0');
+  $('b-btn').disabled = true; $('b-tbody').innerHTML = ''; bIndex = 0;
+  $('b-status').textContent = 'Запуск…';
+  let total = 0, done = 0;
+  sse('/api/v1/batch/stream', fd, {
+    total: d => { total = +d; $('b-status').textContent = `0 / ${total}`; },
+    row: d => {
+      const p = JSON.parse(d);
+      const r = p.result;
+      const tr = document.createElement('tr');
+      if (r) tr.className = r.color;
+      const color = r ? r.color : 'NONE';
+      tr.innerHTML = `<td>${++bIndex}</td><td>${p.oem||''}</td><td>${p.partName||''}</td>` +
+        `<td>${r ? r.barnaulCount : '—'}</td>` +
+        `<td>${r && r.searchedSiberia ? r.siberiaCount : '—'}</td>` +
+        `<td>${p.status==='error' ? 'Ошибка' : `<span class="badge c-${color}">${(r&&r.status)||''}</span>`}</td>` +
+        `<td>${r ? linkHtml(r.myListingUrl) : ''}</td>`;
+      $('b-tbody').appendChild(tr);
+      done++; $('b-status').textContent = `${done} / ${total}`;
+    },
+    error: d => { $('b-status').textContent = 'Ошибка: ' + d; $('b-btn').disabled = false; },
+    done: d => { $('b-status').textContent = `Готово (${done} / ${total})`; $('b-btn').disabled = false; }
+  }).catch(e => { $('b-status').textContent = 'Ошибка: ' + e; $('b-btn').disabled = false; });
+};
 </script>
 </body>
 </html>

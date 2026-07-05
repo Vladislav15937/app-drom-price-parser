@@ -7,49 +7,46 @@ import org.apache.poi.xssf.usermodel.XSSFCellStyle;
 import org.apache.poi.xssf.usermodel.XSSFColor;
 import org.apache.poi.xssf.usermodel.XSSFFont;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import ru.retail.service.dto.AggregationResult;
+import ru.retail.service.dto.AvailabilityResult;
 
 import java.io.FileOutputStream;
 import java.math.BigDecimal;
 import java.nio.file.Path;
 
 /**
- * Пишет отчёт по анализу каталога в .xlsx, строка за строкой, с пересохранением файла
+ * Пишет отчёт анализа наличия/плотности рынка в .xlsx, строка за строкой, с пересохранением файла
  * после КАЖДОЙ детали (данные не теряются при обрыве прогона).
- * Цвет строки по сравнению моей цены с рекомендованной (рыночной):
- *   зелёный — совпадает (±допуск), красный — ВЫШЕ рынка, синий — НИЖЕ рынка.
+ * Цвет строки по разреженности рынка:
+ *   красный — Барнаул<4 и Сибирь<10; фиолетовый — Сибирь<10; жёлтый — Барнаул<4; без заливки — иначе.
  */
 @Slf4j
 public class ExcelReport {
 
     private static final String[] HEADERS = {
-            "№", "OEM", "Запчасть", "Авто", "Цена на сайте", "Рекоменд.", "Δ к рынку, %",
-            "Состояние", "Уверенность", "Барнаул, позиций", "Ссылка на объявление", "Причина"
+            "№", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан",
+            "Барнаул, конк.", "Сибирь, конк.", "Ссылка на моё объявление", "Статус"
     };
 
     private final Path file;
-    private final double tolerance;          // напр. 0.02 = ±2%
     private final XSSFWorkbook wb;
     private final Sheet sheet;
     private int rowNum = 0;
     private int dataCount = 0;
 
-    private final CellStyle headerStyle, greenStyle, redStyle, blueStyle, greyStyle, purpleStyle;
+    private final CellStyle headerStyle, plainStyle, yellowStyle, purpleStyle, redStyle;
 
-    public ExcelReport(Path file, double tolerance) {
+    public ExcelReport(Path file) {
         this.file = file;
-        this.tolerance = tolerance;
         this.wb = new XSSFWorkbook();
-        this.sheet = wb.createSheet("Цены");
+        this.sheet = wb.createSheet("Наличие");
 
         headerStyle = base(0xD9D9D9, 0x000000, true);
-        greenStyle  = base(0xC6EFCE, 0x006100, false);   // совпадает
-        redStyle    = base(0xFFC7CE, 0x9C0006, false);   // выше рынка
-        blueStyle   = base(0xBDD7EE, 0x1F4E78, false);   // ниже рынка
-        greyStyle   = base(0xF2F2F2, 0x808080, false);   // нет данных
-        purpleStyle = base(0xE9D5FF, 0x6B21A8, false);   // <5 позиций в Барнауле (мало данных)
+        plainStyle  = base(0xFFFFFF, 0x000000, false);   // без заливки — конкуренции достаточно
+        yellowStyle = base(0xFFEB9C, 0x9C6500, false);   // мало в Барнауле (<4)
+        purpleStyle = base(0xE9D5FF, 0x6B21A8, false);   // мало по Сибири (<10)
+        redStyle    = base(0xFFC7CE, 0x9C0006, false);   // дефицит: Барнаул<4 и Сибирь<10
 
-        int[] widths = {1500, 5200, 11000, 9000, 3400, 3400, 3400, 5200, 3200, 3400, 16000, 18000};
+        int[] widths = {1500, 5200, 14000, 9000, 3400, 5000, 3600, 3600, 16000, 14000};
         for (int i = 0; i < widths.length; i++) sheet.setColumnWidth(i, widths[i]);
         sheet.createFreezePane(0, 1);
 
@@ -84,55 +81,34 @@ public class ExcelReport {
     }
 
     /** Добавляет строку по одной детали и сразу сохраняет файл. Потокобезопасно (вызов из потока анализа). */
-    public synchronized void append(String oem, String partName, String car,
-                                    BigDecimal catalogPrice, AggregationResult r) {
-        BigDecimal rec = (r == null) ? null : r.getRecommendedPrice();
-        boolean found = rec != null && rec.compareTo(BigDecimal.ZERO) > 0;
-
-        BigDecimal sitePrice = (r == null) ? null : r.getMyListingPrice();
-        String url = (r == null) ? null : r.getMyListingUrl();
-        // Состояние считаем по ЦЕНЕ НА САЙТЕ vs рекомендованной; если сайт не спарсился — по цене из каталога
-        BigDecimal cmp = (sitePrice != null && sitePrice.signum() > 0) ? sitePrice : catalogPrice;
-
-        String state;
-        CellStyle style;
-        Double diffPct = null;
-
-        if (!found) {
-            state = "нет данных";
-            style = greyStyle;
-        } else if (cmp == null || cmp.signum() <= 0) {
-            state = "цена не указана";
-            style = greyStyle;
-        } else {
-            double my = cmp.doubleValue();
-            double rc = rec.doubleValue();
-            double diff = (my - rc) / rc;
-            diffPct = diff * 100.0;
-            if (Math.abs(diff) <= tolerance) { state = "совпадает с рынком"; style = greenStyle; }
-            else if (my > rc)                { state = "выше рынка";        style = redStyle; }
-            else                             { state = "ниже рынка";        style = blueStyle; }
-        }
-
-        // <5 позиций по детали в Барнауле — мало данных: вся строка фиолетовая (поверх статуса выше/ниже).
-        if (found && r != null && r.getCityCompetitorCount() < 5) style = purpleStyle;
+    public synchronized void append(String oem, String partName, String auto,
+                                    BigDecimal price, String created, AvailabilityResult r) {
+        CellStyle style = styleFor(r);
 
         Row row = sheet.createRow(rowNum++);
         int col = 0;
         set(row, col++, ++dataCount, style);
         set(row, col++, oem, style);
         set(row, col++, partName, style);
-        set(row, col++, car, style);
-        set(row, col++, sitePrice != null && sitePrice.signum() > 0 ? sitePrice.toPlainString() : "", style);
-        set(row, col++, found ? rec.toPlainString() : "", style);
-        set(row, col++, diffPct == null ? "" : String.format("%+.1f", diffPct), style);
-        set(row, col++, state, style);
-        set(row, col++, r == null ? "" : nz(r.getAiConfidence()), style);
-        set(row, col++, r == null ? "" : String.valueOf(r.getCityCompetitorCount()), style);
-        setLink(row, col++, url, style);
-        set(row, col,   r == null ? "" : nz(r.getAiReason()), style);
+        set(row, col++, auto, style);
+        set(row, col++, price != null && price.signum() > 0 ? price.toPlainString() : "", style);
+        set(row, col++, created == null ? "" : created, style);
+        set(row, col++, r == null ? "" : String.valueOf(r.getBarnaulCount()), style);
+        set(row, col++, r == null || !r.isSearchedSiberia() ? "" : String.valueOf(r.getSiberiaCount()), style);
+        setLink(row, col++, r == null ? null : r.getMyListingUrl(), style);
+        set(row, col, r == null ? "" : nz(r.getStatus()), style);
 
         save();
+    }
+
+    private CellStyle styleFor(AvailabilityResult r) {
+        if (r == null || r.getColor() == null) return plainStyle;
+        return switch (r.getColor()) {
+            case RED    -> redStyle;
+            case PURPLE -> purpleStyle;
+            case YELLOW -> yellowStyle;
+            case NONE   -> plainStyle;
+        };
     }
 
     /** Ячейка-гиперссылка на объявление (кликабельная в Excel). */

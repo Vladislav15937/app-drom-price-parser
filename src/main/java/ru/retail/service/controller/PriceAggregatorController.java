@@ -9,7 +9,8 @@ import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import jakarta.servlet.http.HttpServletResponse;
-import ru.retail.service.dto.AggregationResult;
+import ru.retail.service.dto.AvailabilityResult;
+import ru.retail.service.service.CatalogLoader;
 import ru.retail.service.service.PriceAnalyzer;
 import ru.retail.service.service.TunnelService;
 
@@ -23,6 +24,10 @@ import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * REST/SSE-фасад над анализом наличия (без ИИ). Все эндпоинты работают по OEM и возвращают
+ * {@link AvailabilityResult} (счётчики конкурентов Барнаул/Сибирь + цвет + ссылка на наше объявление).
+ */
 @Slf4j
 @RestController
 @RequestMapping("/api/v1")
@@ -45,12 +50,10 @@ public class PriceAggregatorController {
         return t;
     });
 
-    // ── Хранилище заданий для polling-архитектуры ───────────────
     record JobResult(String status, Object result, String error, long createdAt) {}
     private final ConcurrentHashMap<String, JobResult> jobs = new ConcurrentHashMap<>();
 
     {
-        // Очистка завершённых заданий старше 30 минут
         keepAliveScheduler.scheduleAtFixedRate(() -> {
             long cutoff = System.currentTimeMillis() - 30 * 60 * 1000L;
             jobs.entrySet().removeIf(e -> e.getValue().createdAt() < cutoff);
@@ -61,58 +64,18 @@ public class PriceAggregatorController {
 
     @GetMapping("/info")
     public Map<String, String> info() {
-        Map<String, String> map = new java.util.LinkedHashMap<>();
+        Map<String, String> map = new LinkedHashMap<>();
         map.put("localUrl",  tunnelService.getLocalUrl() != null ? tunnelService.getLocalUrl() : "");
         map.put("publicUrl", tunnelService.getPublicUrl() != null ? tunnelService.getPublicUrl() : "");
         return map;
     }
 
-    // ── Одиночный анализ (SSE) ──────────────────────────────
-
-    @PostMapping(value = "/analyze/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter analyzeStream(
-            @RequestParam String oem,
-            @RequestParam String region,
-            @RequestParam String myListingUrl,
-            @RequestParam(required = false, defaultValue = "0") BigDecimal myPrice,
-            HttpServletResponse response) {
-
-        response.setHeader("X-Accel-Buffering", "no");
-        response.setHeader("Cache-Control", "no-cache");
-        SseEmitter emitter = new SseEmitter(0L);   // 0 = без таймаута на уровне Tomcat
-        AtomicBoolean done = new AtomicBoolean(false);
-        emitter.onCompletion(() -> done.set(true));
-        emitter.onTimeout(() -> done.set(true));
-        emitter.onError(e -> done.set(true));
-
-        // keep-alive каждые 25 с — не даём соединению упасть по idle-timeout
-        ScheduledFuture<?> ping = keepAliveScheduler.scheduleAtFixedRate(() -> {
-            if (done.get()) return;
-            send(emitter, "ping", "");
-        }, 25, 25, TimeUnit.SECONDS);
-
-        executor.submit(() -> {
-            try {
-                send(emitter, "status", "Анализ идёт...");
-                AggregationResult result = priceAnalyzer.analyze(oem, region, myListingUrl, myPrice);
-                send(emitter, "result", objectMapper.writeValueAsString(result));
-            } catch (Exception e) {
-                send(emitter, "error", e.getMessage() != null ? e.getMessage() : "Ошибка анализа");
-            } finally {
-                ping.cancel(false);
-                emitter.complete();
-            }
-        });
-        return emitter;
-    }
-
-    // ── Анализ одной позиции из каталога (SSE, без файла) ──
+    // ── Анализ одной позиции по OEM (SSE) ──────────────────
 
     @PostMapping(value = "/catalog-item/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter catalogItemStream(
             @RequestParam String oem,
             @RequestParam(defaultValue = "0") BigDecimal catalogPrice,
-            @RequestParam(defaultValue = "barnaul") String region,
             @RequestParam(defaultValue = "YARD86") String company,
             HttpServletResponse response) {
 
@@ -131,7 +94,8 @@ public class PriceAggregatorController {
 
         executor.submit(() -> {
             try {
-                AggregationResult result = priceAnalyzer.analyzeFromCatalog(oem, catalogPrice, region, company);
+                priceAnalyzer.resetBreakers();
+                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company);
                 send(emitter, "result", objectMapper.writeValueAsString(result));
             } catch (Exception e) {
                 send(emitter, "error", e.getMessage() != null ? e.getMessage() : "Ошибка анализа");
@@ -149,7 +113,6 @@ public class PriceAggregatorController {
     public Map<String, String> submitCatalogItem(
             @RequestParam String oem,
             @RequestParam(defaultValue = "0") BigDecimal catalogPrice,
-            @RequestParam(defaultValue = "barnaul") String region,
             @RequestParam(defaultValue = "YARD86") String company) {
         String jobId = UUID.randomUUID().toString();
         long now = System.currentTimeMillis();
@@ -157,7 +120,7 @@ public class PriceAggregatorController {
         executor.submit(() -> {
             jobs.put(jobId, new JobResult("running", null, null, now));
             try {
-                AggregationResult result = priceAnalyzer.analyzeFromCatalog(oem, catalogPrice, region, company);
+                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company);
                 jobs.put(jobId, new JobResult("done", result, null, now));
             } catch (Exception e) {
                 jobs.put(jobId, new JobResult("error", null,
@@ -183,7 +146,6 @@ public class PriceAggregatorController {
     @PostMapping(value = "/batch/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter batchStream(
             @RequestParam("file") MultipartFile file,
-            @RequestParam(defaultValue = "barnaul") String region,
             @RequestParam(defaultValue = "YARD86") String company,
             @RequestParam(defaultValue = "0") int limit,
             HttpServletResponse response) throws IOException {
@@ -191,13 +153,12 @@ public class PriceAggregatorController {
         response.setHeader("X-Accel-Buffering", "no");
         response.setHeader("Cache-Control", "no-cache");
         byte[] csvBytes = file.getBytes();
-        SseEmitter emitter = new SseEmitter(0L);   // 0 = без таймаута на уровне Tomcat
+        SseEmitter emitter = new SseEmitter(0L);
         AtomicBoolean stopped = new AtomicBoolean(false);
         emitter.onCompletion(() -> stopped.set(true));
         emitter.onTimeout(() -> stopped.set(true));
         emitter.onError(e -> stopped.set(true));
 
-        // keep-alive каждые 25 с
         ScheduledFuture<?> ping = keepAliveScheduler.scheduleAtFixedRate(() -> {
             if (stopped.get()) return;
             send(emitter, "ping", "");
@@ -205,58 +166,46 @@ public class PriceAggregatorController {
 
         executor.submit(() -> {
             try {
-                List<String[]> allRows = parseCsv(csvBytes);
-                // Дедуп по OEM: один и тот же номер в каталоге не обрабатываем повторно
-                // (повторы ели время и давали противоречивые цены при сетевых сбоях).
-                List<String[]> rows = new ArrayList<>();
-                java.util.Set<String> seenOems = new java.util.HashSet<>();
-                int duplicates = 0;
-                for (String[] r : allRows) {
-                    String oemKey = col(r, 4).replaceAll("[^A-Za-z0-9]", "").toUpperCase();
-                    if (oemKey.isBlank()) { rows.add(r); continue; }     // пустой OEM отсеется в цикле
-                    if (seenOems.add(oemKey)) rows.add(r);
-                    else duplicates++;
+                // Каталог: только суппорты старше 6 мес по «Создан». Дедуп по OEM (один номер — один прогон).
+                List<CatalogLoader.CatalogItem> all = CatalogLoader.loadOlderThan6Months(csvBytes);
+                List<CatalogLoader.CatalogItem> items = new ArrayList<>();
+                java.util.Set<String> seen = new java.util.HashSet<>();
+                for (CatalogLoader.CatalogItem it : all) {
+                    String key = it.oem().replaceAll("[^A-Za-z0-9]", "").toUpperCase();
+                    if (key.isBlank() || seen.add(key)) items.add(it);
                 }
-                if (duplicates > 0) log.info("Дедуп каталога: пропущено {} повторных OEM", duplicates);
-                int total = (limit > 0 && limit < rows.size()) ? limit : rows.size();
+                int total = (limit > 0 && limit < items.size()) ? limit : items.size();
                 send(emitter, "total", String.valueOf(total));
 
-                priceAnalyzer.resetBreakers();   // новый прогон — снимаем взвод предохранителей с прошлого раза
+                priceAnalyzer.resetBreakers();
 
                 int processed = 0;
-                for (int i = 0; i < rows.size() && processed < total; i++) {
+                for (int i = 0; i < items.size() && processed < total; i++) {
                     if (stopped.get()) break;
                     if (priceAnalyzer.isProxyDown()) {
-                        log.error("Прокси недоступен — останавливаем батч на позиции {}/{}", processed, total);
                         send(emitter, "error", "Прокси недоступен: батч остановлен. Смените IP/прокси и запустите заново.");
                         break;
                     }
                     if (priceAnalyzer.isCaptchaBlocked()) {
-                        log.error("drom блокирует капчей — останавливаем батч на позиции {}/{}", processed, total);
-                        send(emitter, "error", "drom показывает нерешаемую капчу (IP заблокирован после интенсивного парсинга). Смените IP/прокси или подождите и запустите заново.");
+                        send(emitter, "error", "drom показывает нерешаемую капчу (IP заблокирован). Смените IP/прокси и запустите заново.");
                         break;
                     }
-                    String[] row = rows.get(i);
-                    String oem = col(row, 4);
-                    if (oem.isBlank()) continue;
+                    CatalogLoader.CatalogItem it = items.get(i);
 
-                    BigDecimal catalogPrice = parseBd(col(row, 5));
                     Map<String, Object> progress = new LinkedHashMap<>();
                     progress.put("index", processed);
-                    progress.put("oem", oem);
-                    progress.put("partName", col(row, 3));
-                    progress.put("brand", col(row, 8));
-                    progress.put("model", col(row, 9));
-                    progress.put("catalogPrice", catalogPrice.toPlainString());
+                    progress.put("oem", it.oem());
+                    progress.put("partName", it.name());
+                    progress.put("brand", it.brand());
+                    progress.put("model", it.model());
+                    progress.put("price", it.price() == null ? "" : it.price().toPlainString());
                     progress.put("status", "analyzing");
                     send(emitter, "progress", objectMapper.writeValueAsString(progress));
 
                     try {
-                        AggregationResult result = priceAnalyzer.analyzeFromCatalog(oem, catalogPrice, region, company);
-                        boolean found = result.getRecommendedPrice() != null
-                                && result.getRecommendedPrice().compareTo(BigDecimal.ZERO) > 0;
+                        AvailabilityResult result = priceAnalyzer.analyzeByOem(it.oem(), it.price(), company);
                         progress.put("result", result);
-                        progress.put("status", found ? "done" : "notFound");
+                        progress.put("status", "done");
                     } catch (Exception e) {
                         progress.put("status", "error");
                         progress.put("error", e.getMessage());
@@ -280,50 +229,8 @@ public class PriceAggregatorController {
     private void send(SseEmitter emitter, String event, String data) {
         try {
             emitter.send(SseEmitter.event().name(event).data(data));
-            log.debug("SSE sent OK: event={} dataLen={}", event, data.length());
         } catch (IOException e) {
             log.warn("SSE send FAILED event='{}': {}", event, e.getMessage());
         }
-    }
-
-    private List<String[]> parseCsv(byte[] bytes) throws Exception {
-        List<String[]> result = new ArrayList<>();
-        String content = new String(bytes, "Windows-1251");
-        List<String> row = new ArrayList<>();
-        StringBuilder sb = new StringBuilder();
-        boolean inQuotes = false;
-        boolean firstRow = true;
-
-        for (int i = 0; i < content.length(); i++) {
-            char c = content.charAt(i);
-            if (c == '"') {
-                inQuotes = !inQuotes;
-            } else if (c == ';' && !inQuotes) {
-                row.add(sb.toString().trim()); sb.setLength(0);
-            } else if (c == '\n' && !inQuotes) {
-                row.add(sb.toString().trim()); sb.setLength(0);
-                if (!row.stream().allMatch(String::isEmpty)) {
-                    if (firstRow) firstRow = false;
-                    else result.add(row.toArray(new String[0]));
-                }
-                row = new ArrayList<>();
-            } else if (c != '\r') {
-                sb.append(c);
-            }
-        }
-        if (!sb.isEmpty()) row.add(sb.toString().trim());
-        if (!row.isEmpty() && !row.stream().allMatch(String::isEmpty) && !firstRow)
-            result.add(row.toArray(new String[0]));
-        return result;
-    }
-
-    private String col(String[] row, int i) {
-        if (row == null || i >= row.length || row[i] == null) return "";
-        return row[i].trim();
-    }
-
-    private BigDecimal parseBd(String s) {
-        try { return new BigDecimal(s.replaceAll("[^\\d.]", "")); }
-        catch (Exception e) { return BigDecimal.ZERO; }
     }
 }

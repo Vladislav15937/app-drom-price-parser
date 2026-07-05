@@ -57,22 +57,6 @@ mobileproxy:
     url: https://mobileproxy.space/api.html
     token: 72034cf122d5303fd8d1af82e667b78b
 
-gemini:
-  api:
-    key: sk-nEZGI8KIJKM3iwbvFCiVNw
-    base-url: https://open.blackroute.space/v1/chat/completions
-  vision:
-    model: gemini-2.5-flash-lite   # лёгкая мультимодальная без reasoning (дёшево/быстро); было gemini-3.5-flash
-
-deepseek:
-  api:
-    token: sk-PpuDMrQhruXT1EffEdde7Q   # ds32-$10 (старый ds32-$1 исчерпан); /v1/chat/completions — полный путь, шлюзу нужен он
-    base-url: https://open.blackroute.space/v1/chat/completions
-  text:
-    model: deepseek-chat
-
-#    sk-70c0e9c831ec41568ade1fa9124aeeb8
-
 feign:
   client:
     config:
@@ -89,5 +73,4 @@ logging:
   level:
     ru.retail.service.client: DEBUG
     feign: DEBUG
-    ru.retail.service.service.AIPriceAdvisor: DEBUG
     ru.retail.service.controller: DEBUG
