@@ -111,10 +111,15 @@ public class PriceAnalyzer {
     private AvailabilityResult analyzeOnce(String oem, BigDecimal price, String myCompany, DromParser p, List<String> stopWords) {
         log.info("=== Наличие OEM: {} | Компания: {} ===", oem, myCompany);
 
-        // 1. Барнаул (город): конкуренты + наше объявление. Порог <4.
-        DromParser.RegionScan barnaul = scan(p, oem, HOME_CITY, myCompany);
+        // 1. Барнаул (город): конкуренты (used+present) + наше объявление. Порог <4.
+        DromParser.RegionScan barnaul = scan(p, oem, HOME_CITY, myCompany, true);
         int b = countCompetitors(barnaul.competitors(), oem, stopWords);
         String myUrl = pickUrlByPrice(barnaul.myCandidates(), price);
+        // Наше объявление могло не попасть в used-выдачу (часть наших не помечена «Б/у», напр. диски —
+        // «Контрактная»). Тогда ищем его без used-фильтра (present-only), чтобы не терять ссылку.
+        if (myUrl == null) {
+            myUrl = pickUrlByPrice(scan(p, oem, HOME_CITY, myCompany, false).myCandidates(), price);
+        }
         log.info("Барнаул: конкурентов {} (наших объявлений {})", b, barnaul.myCandidates().size());
 
         // 2. При b<10 — расширяем на всю Сибирь ПО РЕГИОНАМ ЦЕЛИКОМ (все города регионов, вкл. Алтайский край).
@@ -124,7 +129,7 @@ public class PriceAnalyzer {
         if (b < SIBERIA_TRIGGER) {
             searched = true;
             for (String region : SIBERIA_REGIONS) {
-                int c = countCompetitors(scan(p, oem, region, myCompany).competitors(), oem, stopWords);
+                int c = countCompetitors(scan(p, oem, region, myCompany, true).competitors(), oem, stopWords);
                 siberiaTotal += c;
                 log.info("Сибирь [{}]: конкурентов {} (сумма {})", region, c, siberiaTotal);
             }
@@ -147,12 +152,13 @@ public class PriceAnalyzer {
                 .build();
     }
 
-    /** Скан региона через кэш батча (дубли OEM не перезапрашивают drom). Кэшируем только непустой результат. */
-    private DromParser.RegionScan scan(DromParser p, String oem, String region, String myCompany) {
-        String key = normalizeOem(oem) + "|" + region;
+    /** Скан региона через кэш батча (дубли OEM не перезапрашивают drom). Кэшируем только непустой результат.
+     *  used=false — выдача без фильтра «Б/у» (для поиска нашего объявления, если оно не помечено б/у). */
+    private DromParser.RegionScan scan(DromParser p, String oem, String region, String myCompany, boolean used) {
+        String key = normalizeOem(oem) + "|" + region + "|" + used;
         DromParser.RegionScan cached = scanCache.get(key);
         if (cached != null) return cached;
-        DromParser.RegionScan sc = p.scanRegion(oem, region, myCompany);
+        DromParser.RegionScan sc = p.scanRegion(oem, region, myCompany, used);
         if (!sc.competitors().isEmpty() || !sc.myCandidates().isEmpty()) scanCache.put(key, sc);
         return sc;
     }

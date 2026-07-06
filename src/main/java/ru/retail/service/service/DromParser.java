@@ -512,8 +512,13 @@ public class DromParser {
      * Капча не пройдена / ошибка → пустой результат (как и остальные методы).
      */
     public RegionScan scanRegion(String oemNumber, String region, String myCompany) {
-        String searchUrl = buildSearchUrl(oemNumber, region);
-        log.info("Скан наличия [{}] OEM={}: {}", region, oemNumber, searchUrl);
+        return scanRegion(oemNumber, region, myCompany, true);
+    }
+
+    /** {@code used=false} — без фильтра «Б/у» (для поиска НАШЕГО объявления, см. {@link #buildSearchUrl}). */
+    public RegionScan scanRegion(String oemNumber, String region, String myCompany, boolean used) {
+        String searchUrl = buildSearchUrl(oemNumber, region, used);
+        log.info("Скан наличия [{}] OEM={} (used={}): {}", region, oemNumber, used, searchUrl);
 
         BrowserContext ctx = newContext(browser, sessionFile);
         Page page = newPage(ctx);
@@ -1265,12 +1270,20 @@ public class DromParser {
     }
 
     private String buildSearchUrl(String oem, String region) {
-        // condition[]=used — только Б/у (drom убирает магазины новых з/ч; если новых нет — фильтр просто
-        // «неэффективен» и ничего не меняет). goodPresentState[]=present — только «в наличии» (без архива/проданных).
-        // Так подсчёт = реально доступные б/у-конкуренты, а не оптовые новые аналоги.
-        return String.format(
-                "https://baza.drom.ru/%s/sell_spare_parts/?condition%%5B%%5D=used&goodPresentState%%5B%%5D=present&query=%s",
-                region, oem);
+        return buildSearchUrl(oem, region, true);
+    }
+
+    /**
+     * URL поиска. goodPresentState[]=present — только «в наличии» (без архива/проданных), всегда.
+     * condition[]=used (только при {@code used=true}) — только Б/у (для подсчёта конкурентов: убирает
+     * магазины новых з/ч). Для поиска НАШЕГО объявления used выключаем: часть наших объявлений на drom
+     * помечена не как «Б/у» (напр. диски — «Контрактная»), и used их срезал бы → терялась ссылка.
+     */
+    private String buildSearchUrl(String oem, String region, boolean used) {
+        String url = "https://baza.drom.ru/" + region + "/sell_spare_parts/?";
+        if (used) url += "condition%5B%5D=used&";
+        url += "goodPresentState%5B%5D=present&query=" + oem;
+        return url;
     }
 
     /**
