@@ -203,7 +203,7 @@ analysis:
 # auth-url — хост выдачи/рефреша токенов; api-url — методы (external-api v1.0). Токен: логин/пароль external-app.
 bazon:
   auth-url: https://a.baz-on.ru
-  api-url: https://yardt.baz-on.ru/external-api/v1/
+  api-url: https://yardt.baz-on.ru/external-api/v1/    # v1.0: чтение каталога + запись цены (setProducts)
   login: c2226_external_app
   password: QM)3N2NnQQT!AHv
   storage-id: 1        # склад «Ткацкая» — по нему считаем свободный остаток (amount-reserved > 0)

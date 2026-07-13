@@ -97,6 +97,48 @@ public class BazonClient {
         return out;
     }
 
+    // ==================== ИЗМЕНЕНИЕ ЦЕНЫ (external-api v1.0 `setProducts`) ====================
+    // v1.0 умеет запись: POST setProducts {"products":[{"id":..,"fields":[{"field_name":"price","action":"set","value":".."}]}]}.
+    // Массив products за один запрос (батч). Результаты ПОЗИЦИОННЫЕ: {action:"updated"|"error", error, product{price,...}}.
+    // Поле розничной цены — "price" (проверено вживую на товаре 63131). НЕОБРАТИМО — только после подтверждения.
+
+    public record PriceUpdate(int id, long newPrice) {}
+    public record PriceResult(int id, boolean ok, long appliedPrice, String error) {}
+
+    private static final int SET_BATCH = 100;   // товаров на один setProducts-запрос
+
+    /** Батч-установка розничной цены. Отправляет по {@link #SET_BATCH} товаров за запрос; результат — по каждому id. */
+    public synchronized List<PriceResult> setPrices(List<PriceUpdate> updates) {
+        List<PriceResult> out = new ArrayList<>();
+        for (int start = 0; start < updates.size(); start += SET_BATCH) {
+            List<PriceUpdate> chunk = updates.subList(start, Math.min(updates.size(), start + SET_BATCH));
+            out.addAll(setPricesChunk(chunk));
+            if (start + SET_BATCH < updates.size()) sleep(RATE_LIMIT_MS);
+        }
+        return out;
+    }
+
+    private List<PriceResult> setPricesChunk(List<PriceUpdate> chunk) {
+        StringBuilder prods = new StringBuilder();
+        for (PriceUpdate u : chunk) {
+            if (prods.length() > 0) prods.append(',');
+            prods.append("{\"id\":").append(u.id())
+                 .append(",\"fields\":[{\"field_name\":\"price\",\"action\":\"set\",\"value\":\"").append(u.newPrice()).append("\"}]}");
+        }
+        String body = "{\"request\":[{\"method\":\"setProducts\",\"params\":{\"products\":[" + prods + "]}}]}";
+        JsonNode results = call(body).path("response").path(0).path("result").path("results");
+        List<PriceResult> out = new ArrayList<>();
+        for (int i = 0; i < chunk.size(); i++) {
+            PriceUpdate u = chunk.get(i);
+            JsonNode r = results.path(i);   // порядок результатов = порядку запроса
+            boolean ok = "updated".equals(r.path("action").asText());
+            long applied = r.path("product").path("price").asLong(-1);
+            if (!ok) log.warn("Bazon setProducts id={} → {}", u.id(), preview(r.toString()));
+            out.add(new PriceResult(u.id(), ok, applied, ok ? "" : r.path("error").asText("нет результата")));
+        }
+        return out;
+    }
+
     /** Полный скан «старой» части каталога: ВСЕ контрактные старше порога, свободные на «Ткацкой» (любой тип). */
     private List<CachedPart> loadAllContract(LocalDateTime olderThan) {
         List<CachedPart> out = new ArrayList<>();

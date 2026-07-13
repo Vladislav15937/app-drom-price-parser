@@ -76,6 +76,7 @@ public class MainWindow extends JFrame {
     private JButton batchAnalyzeBtn;
     private JButton batchStopBtn;
     private JButton bazonBtn;
+    private JButton bazonRepriceBtn;
     private JLabel batchStatusLabel;
     private DefaultTableModel batchModel;
     private JTable batchTable;
@@ -356,9 +357,16 @@ public class MainWindow extends JFrame {
         batchStopBtn.setPreferredSize(new Dimension(80, 34));
         batchStopBtn.setEnabled(false);
         batchStopBtn.addActionListener(e -> { batchStopped = true; batchStopBtn.setEnabled(false); });
+        bazonRepriceBtn = new JButton("−10% в Bazon (переоценка)");
+        bazonRepriceBtn.setPreferredSize(new Dimension(230, 34));
+        bazonRepriceBtn.setEnabled(false);
+        bazonRepriceBtn.setToolTipText("Снизить цену на 10% (округл. до 10 ₽) для деталей с Переоценка=true. Запись в Bazon, необратимо.");
+        bazonRepriceBtn.addActionListener(e -> applyReprice());
         btnRow.add(batchAnalyzeBtn);
         btnRow.add(Box.createHorizontalStrut(8));
         btnRow.add(batchStopBtn);
+        btnRow.add(Box.createHorizontalStrut(8));
+        btnRow.add(bazonRepriceBtn);
         btnRow.add(Box.createHorizontalStrut(14));
         batchStatusLabel = new JLabel("Загрузите файл каталога (CSV или XLSX)");
         batchStatusLabel.setForeground(DIM);
@@ -718,8 +726,166 @@ public class MainWindow extends JFrame {
                 analyzeBtn.setEnabled(true);
                 batchStatusLabel.setText((batchStopped ? "Остановлено" : "Анализ завершён") + reportInfo);
                 batchStatusLabel.setForeground(batchStopped ? YELLOW : GREEN);
+                bazonRepriceBtn.setEnabled(repriceCount() > 0);
             });
         });
+    }
+
+    /** План переоценки одной детали: строка таблицы, id Bazon, OEM, старая/новая цена, категория, ошибка. */
+    private record RepricePlan(int rowIdx, int id, String oem, long oldPrice, long newPrice, int categoryId, String err) {}
+
+    /** Сколько проанализированных деталей помечены на переоценку (reprice=true). */
+    private int repriceCount() {
+        int n = 0;
+        for (AvailabilityResult r : batchResults) if (r != null && r.isReprice()) n++;
+        return n;
+    }
+
+    /**
+     * Снижает цену на 10% (округление до 10 ₽) для деталей с Переоценка=true — запись в Bazon.
+     * Сначала DRY-RUN: перечитывает актуальную цену из Bazon, считает новую, сохраняет превью в файл
+     * и показывает подтверждение. Только после «Да» пишет через {@link BazonClient#setProductPrice}.
+     * Всё выполняется в фоне; каждая запись логируется в файл-отчёт reprice-applied_*.csv.
+     */
+    private void applyReprice() {
+        // Собираем цели: индексы строк с reprice=true и валидным «Номер товара» (id Bazon).
+        List<Integer> targets = new ArrayList<>();
+        for (int i = 0; i < batchResults.size() && i < catalogItems.size(); i++) {
+            AvailabilityResult r = batchResults.get(i);
+            String num = catalogItems.get(i).itemNumber();
+            if (r != null && r.isReprice() && num != null && num.trim().matches("\\d+")) targets.add(i);
+        }
+        if (targets.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Нет деталей с Переоценка=true и валидным «Номер товара».",
+                    "Переоценка", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        // Тестовый режим: сколько ПЕРВЫХ деталей обработать (0/пусто = все).
+        String in = JOptionPane.showInputDialog(this,
+                "На скольких первых деталях применить переоценку?\n"
+                        + "Всего кандидатов (Переоценка=true): " + targets.size() + "\n"
+                        + "0 или пусто = все. Для теста укажите, например, 2.",
+                "Переоценка — тестовый режим", JOptionPane.QUESTION_MESSAGE);
+        if (in == null) return;   // отмена
+        int n;
+        try { n = in.trim().isEmpty() ? 0 : Integer.parseInt(in.trim()); }
+        catch (NumberFormatException ex) {
+            JOptionPane.showMessageDialog(this, "Нужно число.", "Переоценка", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        final List<Integer> sel = (n > 0 && n < targets.size())
+                ? new ArrayList<>(targets.subList(0, n)) : targets;
+        final boolean testMode = sel.size() < targets.size();
+
+        bazonRepriceBtn.setEnabled(false);
+        batchAnalyzeBtn.setEnabled(false);
+        new Thread(() -> {
+            // ── DRY-RUN: из каталожной цены (= текущая розничная price) считаем новую (−10%, округл. до 10 ₽). Без сети. ──
+            List<RepricePlan> plans = new ArrayList<>();
+            for (int k = 0; k < sel.size(); k++) {
+                int i = sel.get(k);
+                int id = Integer.parseInt(catalogItems.get(i).itemNumber().trim());
+                String oem = catalogItems.get(i).oem();
+                java.math.BigDecimal pr = catalogItems.get(i).price();
+                long cur = pr == null ? 0 : pr.longValue();
+                long np = roundTo10(Math.round(cur * 0.9));
+                plans.add(new RepricePlan(i, id, oem, cur, np, 0, cur <= 0 ? "нет цены" : null));
+            }
+
+            Path preview = writeRepricePreview(plans);
+            long ok = plans.stream().filter(p -> p.err() == null && p.newPrice() > 0 && p.newPrice() < p.oldPrice()).count();
+            long bad = plans.size() - ok;
+
+            // ── Подтверждение (в EDT) ──
+            final boolean[] go = {false};
+            try {
+                SwingUtilities.invokeAndWait(() -> {
+                    String msg = "<html>" + (testMode ? "<b>ТЕСТ (первые " + sel.size() + " из " + targets.size() + ").</b><br>" : "")
+                            + "Изменить цену <b>" + ok + "</b> деталей в Bazon на <b>−10%</b> (округл. до 10 ₽)?"
+                            + (bad > 0 ? "<br>Пропущено (ошибка/некорректно): " + bad : "")
+                            + "<br>Превью: " + preview.getFileName()
+                            + "<br><br><font color='red'>Действие НЕОБРАТИМО — реальные цены в учётной системе.</font></html>";
+                    go[0] = JOptionPane.showConfirmDialog(this, msg, "Подтверждение переоценки",
+                            JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) == JOptionPane.YES_OPTION;
+                });
+            } catch (Exception ignored) {}
+
+            if (!go[0]) {
+                SwingUtilities.invokeLater(() -> {
+                    batchStatusLabel.setText("Переоценка отменена. Превью: " + preview.getFileName());
+                    batchStatusLabel.setForeground(YELLOW);
+                    bazonRepriceBtn.setEnabled(true);
+                    batchAnalyzeBtn.setEnabled(true);
+                });
+                return;
+            }
+
+            // ── ПРИМЕНЕНИЕ: батч setProducts (external v1.0), лог old→new. Успех = applied==new из ответа. ──
+            List<BazonClient.PriceUpdate> updates = new ArrayList<>();
+            for (RepricePlan p : plans)
+                if (p.err() == null && p.newPrice() > 0 && p.newPrice() < p.oldPrice())
+                    updates.add(new BazonClient.PriceUpdate(p.id(), p.newPrice()));
+
+            SwingUtilities.invokeLater(() -> batchStatusLabel.setText("Переоценка: запись " + updates.size() + " в Bazon…"));
+            java.util.Map<Integer, BazonClient.PriceResult> byId = new java.util.HashMap<>();
+            String applyErr = null;
+            try { for (BazonClient.PriceResult r : bazonClient.setPrices(updates)) byId.put(r.id(), r); }
+            catch (Exception ex) { applyErr = ex.getMessage(); }
+
+            Path applied = repriceReportPath("reprice-applied");
+            int okCnt = 0, errCnt = 0;
+            try (java.io.PrintWriter w = new java.io.PrintWriter(java.nio.file.Files.newBufferedWriter(applied))) {
+                w.println("id;OEM;было;стало;статус");
+                for (RepricePlan p : plans) {
+                    if (p.err() != null || p.newPrice() <= 0 || p.newPrice() >= p.oldPrice()) {
+                        w.println(p.id() + ";" + p.oem() + ";" + p.oldPrice() + ";" + p.newPrice() + ";ПРОПУЩЕНО " + nz(p.err()));
+                        continue;
+                    }
+                    BazonClient.PriceResult r = byId.get(p.id());
+                    if (applyErr != null) {
+                        errCnt++; w.println(p.id() + ";" + p.oem() + ";" + p.oldPrice() + ";" + p.newPrice() + ";ОШИБКА " + applyErr);
+                    } else if (r != null && r.ok() && r.appliedPrice() == p.newPrice()) {
+                        okCnt++; w.println(p.id() + ";" + p.oem() + ";" + p.oldPrice() + ";" + p.newPrice() + ";OK");
+                    } else {
+                        errCnt++; w.println(p.id() + ";" + p.oem() + ";" + p.oldPrice() + ";" + p.newPrice() + ";ОТКАЗ " + (r == null ? "нет ответа" : nz(r.error())));
+                    }
+                }
+            } catch (Exception ex) {
+                System.err.println("Переоценка: не записать отчёт: " + ex.getMessage());
+            }
+
+            final int okF = okCnt, errF = errCnt;
+            SwingUtilities.invokeLater(() -> {
+                batchStatusLabel.setText("Переоценка: изменено " + okF + ", ошибок " + errF + ". Отчёт: " + applied.getFileName());
+                batchStatusLabel.setForeground(errF == 0 ? GREEN : YELLOW);
+                bazonRepriceBtn.setEnabled(true);
+                batchAnalyzeBtn.setEnabled(true);
+            });
+        }, "bazon-reprice").start();
+    }
+
+    /** Округление до ближайших 10 ₽. */
+    private static long roundTo10(long v) { return Math.round(v / 10.0) * 10; }
+
+    private Path repriceReportPath(String prefix) {
+        return Paths.get(prefix + "_" + LocalDateTime.now().format(
+                DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")) + ".csv").toAbsolutePath();
+    }
+
+    private Path writeRepricePreview(List<RepricePlan> plans) {
+        Path p = repriceReportPath("reprice-preview");
+        try (java.io.PrintWriter w = new java.io.PrintWriter(java.nio.file.Files.newBufferedWriter(p))) {
+            w.println("id;OEM;было;станет;примечание");
+            for (RepricePlan pl : plans) {
+                String note = pl.err() != null ? "ОШИБКА " + pl.err()
+                        : (pl.newPrice() <= 0 || pl.newPrice() >= pl.oldPrice() ? "ПРОПУСК (нет цены/не ниже)" : "");
+                w.println(pl.id() + ";" + pl.oem() + ";" + pl.oldPrice() + ";" + pl.newPrice() + ";" + note);
+            }
+        } catch (Exception ex) {
+            System.err.println("Переоценка: не записать превью: " + ex.getMessage());
+        }
+        return p;
     }
 
     private String shortStatus(AvailabilityResult.Color c) {
