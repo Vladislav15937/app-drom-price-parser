@@ -23,8 +23,8 @@ import java.nio.file.Path;
 public class ExcelReport {
 
     private static final String[] HEADERS = {
-            "№", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан",
-            "Барнаул, конк.", "Сибирь, конк.", "Ссылка на моё объявление", "Статус"
+            "№", "Номер товара", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан",
+            "Барнаул, конк.", "Сибирь, конк.", "Ссылка на моё объявление", "Статус", "Переоценка"
     };
 
     private final Path file;
@@ -46,7 +46,7 @@ public class ExcelReport {
         purpleStyle = base(0xE9D5FF, 0x6B21A8, false);   // мало по Сибири (<10)
         redStyle    = base(0xFFC7CE, 0x9C0006, false);   // дефицит: Барнаул<4 и Сибирь<10
 
-        int[] widths = {1500, 5200, 14000, 9000, 3400, 5000, 3600, 3600, 16000, 14000};
+        int[] widths = {1500, 3600, 5200, 14000, 9000, 3400, 5000, 3600, 3600, 16000, 14000, 3600};
         for (int i = 0; i < widths.length; i++) sheet.setColumnWidth(i, widths[i]);
         sheet.createFreezePane(0, 1);
 
@@ -81,13 +81,14 @@ public class ExcelReport {
     }
 
     /** Добавляет строку по одной детали и сразу сохраняет файл. Потокобезопасно (вызов из потока анализа). */
-    public synchronized void append(String oem, String partName, String auto,
+    public synchronized void append(String oem, String itemNumber, String partName, String auto,
                                     BigDecimal price, String created, AvailabilityResult r) {
         CellStyle style = styleFor(r);
 
         Row row = sheet.createRow(rowNum++);
         int col = 0;
         set(row, col++, ++dataCount, style);
+        set(row, col++, itemNumber == null ? "" : itemNumber, style);
         set(row, col++, oem, style);
         set(row, col++, partName, style);
         set(row, col++, auto, style);
@@ -96,7 +97,8 @@ public class ExcelReport {
         set(row, col++, r == null ? "" : String.valueOf(r.getBarnaulCount()), style);
         set(row, col++, r == null || !r.isSearchedSiberia() ? "" : String.valueOf(r.getSiberiaCount()), style);
         setLink(row, col++, r == null ? null : r.getMyListingUrl(), style);
-        set(row, col, r == null ? "" : nz(r.getStatus()), style);
+        set(row, col++, r == null ? "" : nz(r.getStatus()), style);
+        set(row, col, r == null ? "" : (Object) r.isReprice(), style);   // переоценка: true/false
 
         save();
     }
@@ -127,6 +129,7 @@ public class ExcelReport {
     private void set(Row row, int col, Object val, CellStyle style) {
         Cell c = row.createCell(col);
         if (val instanceof Number n) c.setCellValue(n.doubleValue());
+        else if (val instanceof Boolean b) c.setCellValue(b);
         else c.setCellValue(val == null ? "" : val.toString());
         c.setCellStyle(style);
     }

@@ -135,8 +135,9 @@ public class PriceAnalyzer {
             }
         }
 
-        // 3. Цвет и статус.
+        // 3. Цвет, переоценка и статус.
         Color color = computeColor(b, siberiaTotal, searched);
+        boolean reprice = needsRepricing(b, siberiaTotal, searched);
         String status = statusText(color, b, siberiaTotal, searched);
 
         return AvailabilityResult.builder()
@@ -147,6 +148,7 @@ public class PriceAnalyzer {
                 .searchedSiberia(searched)
                 .myListingUrl(myUrl)
                 .color(color)
+                .reprice(reprice)
                 .status(status)
                 .collectedAt(java.time.Instant.now())
                 .build();
@@ -178,6 +180,15 @@ public class PriceAnalyzer {
         if (siberiaLow)               return Color.PURPLE;
         if (barnaulLow)               return Color.YELLOW;
         return Color.NONE;
+    }
+
+    /** Переоценка = деталь останется НЕокрашенной (конкуренции достаточно). Вычисляется из тех же
+     *  порогов, что и {@link #computeColor} (barnaulLow/siberiaLow), а НЕ из готового цвета: строка
+     *  без заливки ⇔ рынок не разрежен ни в Барнауле, ни по Сибири ⇒ true; любой цвет ⇒ false. */
+    private boolean needsRepricing(int barnaul, int siberia, boolean searched) {
+        boolean barnaulLow = barnaul < BARNAUL_MIN;             // < 4
+        boolean siberiaLow = searched && siberia < SIBERIA_MIN; // < 10 (только если искали)
+        return !barnaulLow && !siberiaLow;
     }
 
     private String statusText(Color color, int b, int s, boolean searched) {

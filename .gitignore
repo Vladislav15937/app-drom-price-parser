@@ -40,3 +40,5 @@ build/
 ### Build artifacts ###
 dist-windows/
 .build-cache/
+# Bazon access/refresh токены (секрет, локально)
+bazon-token.json

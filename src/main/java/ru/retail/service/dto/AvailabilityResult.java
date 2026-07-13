@@ -54,6 +54,10 @@ public class AvailabilityResult {
     @Builder.Default
     private Color color = Color.NONE;
 
+    @Schema(description = "Переоценка: true — деталь НЕ окрашена (конкуренции достаточно), false — окрашена (дефицит). "
+            + "Считается по той же пороговой логике, что и цвет, а не по самому цвету")
+    private boolean reprice;
+
     @Schema(description = "Текстовая расшифровка статуса рынка")
     private String status;
 

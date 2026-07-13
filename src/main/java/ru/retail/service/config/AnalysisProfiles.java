@@ -24,8 +24,9 @@ public class AnalysisProfiles {
     @Data
     public static class Profile {
         private String name;
-        private String keyword;
+        private String keyword;                 // фильтр каталога из xlsx (колонка «Запчасть») и drom (query — не исп.)
         private List<String> stopWords = new ArrayList<>();
+        private List<Integer> bazonPartnameIds = new ArrayList<>();  // фильтр каталога из Bazon (partname_id)
     }
 
     /** Имена профилей для выпадающего списка (UI/веб). */

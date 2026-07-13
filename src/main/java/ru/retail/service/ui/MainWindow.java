@@ -2,6 +2,7 @@ package ru.retail.service.ui;
 
 import ru.retail.service.config.AnalysisProfiles;
 import ru.retail.service.dto.AvailabilityResult;
+import ru.retail.service.service.BazonClient;
 import ru.retail.service.service.CatalogLoader;
 import ru.retail.service.service.PriceAnalyzer;
 import ru.retail.service.service.TunnelService;
@@ -45,6 +46,7 @@ public class MainWindow extends JFrame {
     private final PriceAnalyzer priceAnalyzer;
     private final TunnelService tunnelService;
     private final AnalysisProfiles profiles;
+    private final BazonClient bazonClient;
     private JLabel publicUrlLabel;
     private JComboBox<String> profileCombo;        // тип детали (батч)
     private JComboBox<String> singleProfileCombo;  // тип детали (одиночный)
@@ -73,6 +75,7 @@ public class MainWindow extends JFrame {
     private JTextField companyField;
     private JButton batchAnalyzeBtn;
     private JButton batchStopBtn;
+    private JButton bazonBtn;
     private JLabel batchStatusLabel;
     private DefaultTableModel batchModel;
     private JTable batchTable;
@@ -83,10 +86,12 @@ public class MainWindow extends JFrame {
 
     private static final DateTimeFormatter D = DateTimeFormatter.ofPattern("dd.MM.yyyy");
 
-    public MainWindow(PriceAnalyzer priceAnalyzer, TunnelService tunnelService, AnalysisProfiles profiles) {
+    public MainWindow(PriceAnalyzer priceAnalyzer, TunnelService tunnelService,
+                      AnalysisProfiles profiles, BazonClient bazonClient) {
         this.priceAnalyzer = priceAnalyzer;
         this.tunnelService = tunnelService;
         this.profiles = profiles;
+        this.bazonClient = bazonClient;
         buildUI();
     }
 
@@ -305,10 +310,17 @@ public class MainWindow extends JFrame {
         JPanel fileRow = new JPanel(new BorderLayout(6, 0));
         csvPathField = new JTextField();
         csvPathField.setEditable(false);
+        JPanel srcBtns = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        bazonBtn = new JButton("Из Bazon");
+        bazonBtn.setToolTipText("Выгрузить из учётной системы контрактные детали выбранного типа старше 6 мес (склад «Ткацкая»)");
+        bazonBtn.addActionListener(e -> loadFromBazon());
         JButton browseBtn = new JButton("Обзор...");
+        browseBtn.setToolTipText("Загрузить каталог из файла (CSV/XLSX) — запасной вариант");
         browseBtn.addActionListener(e -> browseForCsv());
+        srcBtns.add(bazonBtn);
+        srcBtns.add(browseBtn);
         fileRow.add(csvPathField, BorderLayout.CENTER);
-        fileRow.add(browseBtn, BorderLayout.EAST);
+        fileRow.add(srcBtns, BorderLayout.EAST);
         panel.add(fileRow, fld);
 
         lbl.gridy = 1; panel.add(label("Параметры:"), lbl);
@@ -357,7 +369,7 @@ public class MainWindow extends JFrame {
     }
 
     private JScrollPane buildBatchTableScrollPane() {
-        String[] cols = {"OEM", "Запчасть", "Авто", "Цена, ₽", "Создан", "Барнаул", "Сибирь", "Статус"};
+        String[] cols = {"Номер товара", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан", "Барнаул", "Сибирь", "Статус", "Переоценка"};
         batchModel = new DefaultTableModel(cols, 0) {
             @Override public boolean isCellEditable(int r, int c) { return false; }
         };
@@ -368,7 +380,7 @@ public class MainWindow extends JFrame {
         batchTable.getTableHeader().setReorderingAllowed(false);
         batchTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
 
-        int[] widths = {120, 340, 200, 90, 100, 80, 80, 320};
+        int[] widths = {100, 120, 340, 200, 90, 100, 80, 80, 320, 90};
         for (int i = 0; i < widths.length; i++)
             batchTable.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
 
@@ -546,25 +558,52 @@ public class MainWindow extends JFrame {
             AnalysisProfiles.Profile pr = prof(profileCombo);
             String kw = pr == null ? "" : pr.getKeyword();
             List<String> stops = pr == null ? List.of() : pr.getStopWords();
-            catalogItems = CatalogLoader.loadOlderThan6Months(file, kw, stops);
-            batchModel.setRowCount(0);
-            for (CatalogLoader.CatalogItem it : catalogItems) {
-                batchModel.addRow(new Object[]{
-                        it.oem(), it.name(), auto(it),
-                        it.price() != null && it.price().signum() > 0 ? it.price().toPlainString() : "—",
-                        it.created().format(D), "—", "—", "Ожидает"
-                });
-            }
-            int count = catalogItems.size();
-            batchResults = new ArrayList<>(Collections.nCopies(count, null));
-            batchStatusLabel.setText("Загружено (старше 6 мес): " + count);
-            batchStatusLabel.setForeground(count > 0 ? GREEN : YELLOW);
-            batchAnalyzeBtn.setEnabled(count > 0);
-            setBatchLink(null);
+            populateCatalog(CatalogLoader.loadOlderThan6Months(file, kw, stops), "файла");
         } catch (Exception ex) {
             batchStatusLabel.setText("Ошибка чтения файла: " + ex.getMessage());
             batchStatusLabel.setForeground(RED);
         }
+    }
+
+    /** Выгрузка каталога из Bazon: контрактные детали выбранного типа старше 6 мес, свободные на «Ткацкой». */
+    private void loadFromBazon() {
+        AnalysisProfiles.Profile pr = prof(profileCombo);
+        if (pr == null) return;
+        bazonBtn.setEnabled(false);
+        batchStatusLabel.setText("Загрузка из Bazon (" + pr.getName() + ")…");
+        batchStatusLabel.setForeground(DIM);
+        executor.submit(() -> {
+            try {
+                List<CatalogLoader.CatalogItem> items = bazonClient.fetchContractParts(
+                        pr.getBazonPartnameIds(), LocalDateTime.now().minusMonths(6));
+                SwingUtilities.invokeLater(() -> { populateCatalog(items, "Bazon"); bazonBtn.setEnabled(true); });
+            } catch (Exception ex) {
+                SwingUtilities.invokeLater(() -> {
+                    batchStatusLabel.setText("Ошибка Bazon: " + ex.getMessage());
+                    batchStatusLabel.setForeground(RED);
+                    bazonBtn.setEnabled(true);
+                });
+            }
+        });
+    }
+
+    /** Заполняет таблицу каталога (общий код для файла и Bazon). */
+    private void populateCatalog(List<CatalogLoader.CatalogItem> items, String src) {
+        catalogItems = items;
+        batchModel.setRowCount(0);
+        for (CatalogLoader.CatalogItem it : catalogItems) {
+            batchModel.addRow(new Object[]{
+                    it.itemNumber(), it.oem(), it.name(), auto(it),
+                    it.price() != null && it.price().signum() > 0 ? it.price().toPlainString() : "—",
+                    it.created().format(D), "—", "—", "Ожидает", "—"
+            });
+        }
+        int count = catalogItems.size();
+        batchResults = new ArrayList<>(Collections.nCopies(count, null));
+        batchStatusLabel.setText("Загружено из " + src + " (старше 6 мес): " + count);
+        batchStatusLabel.setForeground(count > 0 ? GREEN : YELLOW);
+        batchAnalyzeBtn.setEnabled(count > 0);
+        setBatchLink(null);
     }
 
     private static String auto(CatalogLoader.CatalogItem it) {
@@ -592,9 +631,10 @@ public class MainWindow extends JFrame {
         analyzeBtn.setEnabled(false);
 
         for (int i = 0; i < batchModel.getRowCount(); i++) {
-            batchModel.setValueAt("—", i, 5);
             batchModel.setValueAt("—", i, 6);
-            batchModel.setValueAt("Ожидает", i, 7);
+            batchModel.setValueAt("—", i, 7);
+            batchModel.setValueAt("Ожидает", i, 8);
+            batchModel.setValueAt("—", i, 9);
         }
         batchResults = new ArrayList<>(Collections.nCopies(catalogItems.size(), null));
         setBatchLink(null);
@@ -636,28 +676,29 @@ public class MainWindow extends JFrame {
 
                         final CatalogLoader.CatalogItem it = catalogItems.get(idx);
                         final int rowIdx = idx;
-                        SwingUtilities.invokeLater(() -> batchModel.setValueAt("Анализ (L" + laneId + ")...", rowIdx, 7));
+                        SwingUtilities.invokeLater(() -> batchModel.setValueAt("Анализ (L" + laneId + ")...", rowIdx, 8));
 
                         try {
                             AvailabilityResult res = priceAnalyzer.analyzeCatalogLane(
                                     it.oem(), it.price(), company, laneId, stops);
                             if (report != null)
-                                report.append(it.oem(), it.name(), auto(it), it.price(),
+                                report.append(it.oem(), it.itemNumber(), it.name(), auto(it), it.price(),
                                         it.created().format(D), res);
                             final int d = done.incrementAndGet();
                             SwingUtilities.invokeLater(() -> {
                                 batchResults.set(rowIdx, res);
-                                batchModel.setValueAt(res.getBarnaulCount(), rowIdx, 5);
-                                batchModel.setValueAt(res.isSearchedSiberia() ? res.getSiberiaCount() : "—", rowIdx, 6);
-                                batchModel.setValueAt(shortStatus(res.getColor()), rowIdx, 7);
+                                batchModel.setValueAt(res.getBarnaulCount(), rowIdx, 6);
+                                batchModel.setValueAt(res.isSearchedSiberia() ? res.getSiberiaCount() : "—", rowIdx, 7);
+                                batchModel.setValueAt(shortStatus(res.getColor()), rowIdx, 8);
+                                batchModel.setValueAt(res.isReprice(), rowIdx, 9);
                                 batchStatusLabel.setText("Готово " + d + " / " + total + " (дорожек: " + lanes + ")");
                                 batchStatusLabel.setForeground(BLUE);
                                 batchTable.repaint();
                             });
                         } catch (Exception ex) {
-                            if (report != null) report.append(it.oem(), it.name(), auto(it), it.price(),
+                            if (report != null) report.append(it.oem(), it.itemNumber(), it.name(), auto(it), it.price(),
                                     it.created().format(D), null);
-                            SwingUtilities.invokeLater(() -> batchModel.setValueAt("Ошибка", rowIdx, 7));
+                            SwingUtilities.invokeLater(() -> batchModel.setValueAt("Ошибка", rowIdx, 8));
                         }
                     }
                 });

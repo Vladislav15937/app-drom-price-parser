@@ -210,6 +210,7 @@ public class PriceAggregatorController {
 
                     Map<String, Object> progress = new LinkedHashMap<>();
                     progress.put("index", processed);
+                    progress.put("itemNumber", it.itemNumber());
                     progress.put("oem", it.oem());
                     progress.put("partName", it.name());
                     progress.put("brand", it.brand());

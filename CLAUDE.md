@@ -1,16 +1,18 @@
 # CLAUDE.md
 
-Гайд для Claude Code (claude.ai/code) и любого, кто работает с этим репозиторием. Описывает каждый аспект проекта: архитектуру, поток данных, ИИ-логику, антибот-механику, отчётность, конфигурацию и эксплуатационные реалии.
+Гайд для Claude Code (claude.ai/code) и любого, кто работает с этим репозиторием. Описывает каждый аспект проекта: архитектуру, поток данных, профили типов деталей, интеграцию с учётной системой Bazon, антибот-механику, отчётность, конфигурацию и эксплуатационные реалии.
+
+> **Ветка `not-ii`.** Проект отделён от `master` и переделан **полностью без ИИ**. Вместо ИИ-рекомендации цены приложение стало **анализатором наличия/плотности рынка** по OEM: считает, сколько конкурентов б/у торгуют той же деталью в Барнауле и по Сибири, и красит строку отчёта по «разреженности» рынка. `master` описывает старую ИИ-версию — не путать.
 
 ## О проекте
 
-**drom-price-parser** — Spring Boot приложение для конкурентного анализа цен на автозапчасти (тормозные суппорты) с baza.drom.ru. По OEM-номеру из каталога находит наше объявление (компания **YARD86**), парсит **всех** конкурентов по детали в **одном регионе (Барнаул)** через Playwright, оценивает фото и классифицирует конкурентов через ИИ и рекомендует конкурентную цену. Итог — Excel-отчёт с рекомендацией и обоснованием по каждой детали.
+**drom-price-parser** — Spring Boot приложение для анализа наличия автозапчастей (компания **YARD86**) относительно рынка б/у на baza.drom.ru. По каждой нашей контрактной запчасти определённого типа (суппорт/капот/бампер/ступица/тормозной диск) старше 6 месяцев считает число конкурентов б/у в наличии — сначала в Барнауле, при разреженном рынке по всей Сибири — и красит строку Excel-отчёта: где конкуренции мало (дефицит — можно поднимать цену), где много — оставить. К каждой строке — ссылка на наше объявление на drom.
 
-> **Решение заказчика (2026-06), заложено в коде:** проценим ТОЛЬКО по Барнаулу и по ВСЕМ объявлениям детали (не топ-5). Регион НСК (Новосибирск) из расчёта убран (`siberiaPrices` всегда пуст, но двухрегиональный каркас в коде сохранён — см. ниже). Деталь с живой ценой на сайте < 600 ₽ не проценивается и в отчёт не попадает (`MIN_LISTING_PRICE`). В расчёт идут только суппорты в сборе.
+**Цель бизнеса:** найти позиции с малой конкуренцией б/у (дефицит) для повышения цен.
 
-Два способа использования из одного процесса:
-- **Десктоп (основной рабочий режим)** — Swing-окно (`MainWindow`), пакетный прогон каталога на пуле IP с записью Excel.
-- **Веб (REST + SSE)** — `PriceAggregatorController` на :8081 для одиночного/потокового анализа, Swagger UI.
+Два входа из одного процесса:
+- **Десктоп (основной режим)** — Swing-окно (`MainWindow`): выбор типа детали → загрузка каталога (из **Bazon** или файла) → пакетный прогон на пуле IP → цветной Excel.
+- **Веб (REST + SSE)** — `PriceAggregatorController` на :8081 для одиночного/потокового анализа по OEM, Swagger UI.
 
 ## Сборка и запуск
 
@@ -18,207 +20,149 @@
 mvn compile
 mvn spring-boot:run
 ```
-
-- Стек: **Spring Boot 3.3.0**, **Java 21** (`<java.version>21</java.version>` в pom; собирается и на новее), **Playwright 1.44.0**, **Apache POI 5.2.5** (xlsx), **FlatLaf 3.4.1** (тёмная тема Swing), springdoc/OpenAPI 2.5.0.
-- **Легаси-зависимости в pom, фактически не используемые:** `webdrivermanager` + свойство `selenium.version` (парсинг давно на Playwright) и `com.theokanning.openai-gpt3-java` (ИИ-вызовы идут через сырой `HttpClient`, не через эту либу; слово `openai` в коде — только в дефолтном URL совместимого шлюза). Можно удалить при чистке.
-- Порт: **8081**. Swagger UI: http://localhost:8081/swagger-ui.html
+- Стек: **Spring Boot 3.3.0**, **Java 21**, **Playwright 1.44** (headless Chromium), **Apache POI 5.2.5** (xlsx), **FlatLaf 3.4.1** (тёмная тема Swing), springdoc/OpenAPI 2.5.0. `HttpClient` (java.net.http) для Bazon/HTTP. ИИ-библиотек нет.
+- Порт **8081**, Swagger UI: http://localhost:8081/swagger-ui.html
 - `Main` стартует с `setHeadless(false)` → поднимается И веб-сервер, И десктоп-окно: `DesktopUILauncher` на `ApplicationReadyEvent` запускает `TunnelService` (публичный URL) и открывает `MainWindow`.
-- Если в окружении нет `mvn`/`mvnw` — используется бандл IntelliJ: `/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn -q -o compile`.
-- **Сборка Windows-дистрибутива**: профиль `windows-dist` (launch4j-maven-plugin) на фазе `verify` заворачивает jar в `target/DromPriceParser.exe` (`-Xmx512m`, кодировка UTF-8, `-Dplaywright.browsers.path=%EXEDIR%\browsers`, ждёт JRE 21 в `./jre`). Запуск: `mvn -Pwindows-dist verify`.
+- Нет `mvn`/`mvnw` → бандл IntelliJ: `/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn -q -o compile`.
+- **Windows-дистрибутив:** профиль `windows-dist` (launch4j) на фазе `verify` → `target/DromPriceParser.exe` (ждёт JRE 21 в `./jre`, браузеры Playwright в `./browsers`). Запуск: `mvn -Pwindows-dist verify`.
+- **Легаси-зависимости в pom (не используются):** `webdrivermanager`/`selenium.version` (парсинг давно на Playwright). Можно удалить при чистке.
 
 ## Архитектура
 
 ```
-                         ┌─ PriceAggregatorController (REST/SSE, веб)
-точка входа ─────────────┤
-                         └─ MainWindow (Swing, десктоп-батч)
+                    ┌─ MainWindow (Swing, десктоп-батч)  ── выбор типа детали (профиль)
+точка входа ────────┤                                        ├─ «Из Bazon»  → BazonClient (каталог)
+                    └─ PriceAggregatorController (REST/SSE)   └─ «Обзор…»    → CatalogLoader (CSV/XLSX)
                                    ↓
-                         PriceAnalyzer  (оркестрация + статистика + кэш + повтор-OEM)
-                            ├─ DromParser           (Playwright: моё объявление + конкуренты)
-                            │     └─ DromParserPool  (N дорожек = N IP для параллельного батча)
-                            │           └─ MobileProxyService (change-IP ссылки для ротации)
-                            └─ AIPriceAdvisor        (vision-оценка фото + классификатор + математика цены)
+                         PriceAnalyzer  (оркестрация: Барнаул + регионы Сибири, цвет, кэш, повтор-OEM)
+                            └─ DromParser           (Playwright: конкуренты + наше объявление со стр. поиска)
+                                  └─ DromParserPool  (N дорожек = N мобильных IP для параллельного батча)
+                                        └─ MobileProxyService (change-IP ссылки для ротации)
                                    ↓
-                         ExcelReport (POI, построчная запись .xlsx)
+                         ExcelReport (POI, построчная запись .xlsx с окраской)
 ```
 
-### Поток одной детали (`PriceAnalyzer.analyzeFromCatalogOnce`)
-1. **Город (Барнаул)**: одна загрузка страницы поиска `parseCityWithMyListing(OEM, region, CITY_LIMIT=100, company, catalogPrice)` → URL нашего объявления (по компании+цене) + **ВСЕ** конкуренты по детали (лимит 100 с запасом перекрывает страницу поиска). Результат кэшируется на батч (см. кэш ниже).
-2. Если наше объявление не найдено → `aiConfidence="нет данных"`, выход.
-3. `parseMyListing(url)` → полная карточка нашего объявления (описание, состояние, производитель, фото, цена). Если цена каталога расходится с живой >15% — WARN (возможна уценка), в расчёте используется каталожная.
-4. **Порог цены**: если живая цена на сайте < `MIN_LISTING_PRICE` (600 ₽) → возвращается результат с `belowMinPrice=true`, `aiConfidence="не проценивается"`; в отчёт MainWindow такую деталь НЕ включает.
-5. **НСК убран**: `siberiaPrices = Collections.emptyList()` (жёстко пусто; отдельная страница поиска НСК не грузится).
-6. `AIPriceAdvisor.analyze(...)` → рекомендация (цена + уверенность + причина + заметка о фото).
-7. Статистика по рынку Барнаула: min/max/avg/median → `AggregationResult`.
+### Поток анализа одной детали (`PriceAnalyzer.analyzeOnce`)
+1. **Барнаул (город)**: `DromParser.scanRegion(oem, "barnaul", "YARD86", used=true)` → за ОДНУ загрузку страницы поиска (без детальных страниц) конкуренты (чужие компании) + наши объявления. `b` = число конкурентов после `filterAssemblies` (стоп-слова профиля + совпадение OEM). Ссылка на наше объявление — `pickUrlByPrice`.
+2. **Ссылка на наше объявление**: если в used-выдаче нашего нет (наши контрактные, `condition=used` их срезает) → доп. скан Барнаула **без `used`** (present-only).
+3. **Сибирь**: если `b < 10` → скан по **10 регионам ЦЕЛИКОМ** (см. `SIBERIA_REGIONS`), сумма конкурентов `S` (Алтайский край уже покрывает Барнаул, поэтому `S` считаем строго по регионам).
+4. **Цвет** (`computeColor`, приоритет сверху вниз):
 
-> В коде есть и второй вход `PriceAnalyzer.analyze(oem, region, myListingUrl, myPriceOverride)` — веб/одиночный путь по уже известному URL нашего объявления (тот же порог 600 ₽, та же однорегиональная логика).
+| Цвет | Условие | Смысл |
+|---|---|---|
+| 🔴 RED | `b<4` И `S<10` | дефицит и дома, и по Сибири |
+| 🟣 PURPLE | `S<10` (искали), `b≥4` | дома есть, по Сибири мало |
+| 🟡 YELLOW | `b<4`, `S≥10` | мало в Барнауле |
+| ⚪ NONE | иначе | конкуренция достаточная |
 
-## DromParser (~1400 строк — ядро парсинга)
+Пороги: `BARNAUL_MIN=4`, `SIBERIA_TRIGGER=10`, `SIBERIA_MIN=10`.
 
-- **Headless Chromium** через Microsoft Playwright. Два конструктора: Spring-бин (одиночная дорожка для веб/одиночного анализа, сессия `drom-session.json`) и ручной (для дорожек пула: свой прокси, своя сессия `drom-session-{i}.json`, своё имя `L{i}`, своя change-IP ссылка).
-- Один браузер на дорожку (`init()`/`destroy()`), отдельный `BrowserContext` на запрос.
-- **Антибот**: фиксированный User-Agent на весь сеанс дорожки (случайный из 5 при старте), скрытие `navigator.webdriver`, задержки. Контекст блокирует загрузку картинок/CSS/шрифтов/медиа (`ctx.route`) — фото берём из HTML-атрибутов, не из сети.
-- **Ключевые методы**:
-  - `parseMyListing(url)` → `MyListingInfo`.
-  - `parseParts(oem, region[, limit][, excludeUrls])` → конкуренты (по умолчанию `limit=10`; в каталожном батче вызывается с `CITY_LIMIT=100`, т.е. фактически «все»).
-  - `findMyListingUrl(oem, region, company)` → URL нашего объявления по имени компании на странице поиска.
-  - `parseCityWithMyListing(oem, region, limit, myCompany, myPrice)` → `CityParseResult(myListingUrl, competitors, myCandidates)` за ОДНУ загрузку страницы поиска (заменяет `findMyListingUrl`+`parseParts` в каталожном пути).
-  - `parsePartsBackground(...)` — НСК через отдельную сессию `drom-session-nsk.json`. **Сейчас не вызывается** (НСК убран из расчёта), но метод и NSK-браузер/сессия в коде остались.
-  - Записи: `CityParseResult`, `MyListingCandidate(url, price)`, `SearchEntry`.
-- **Извлечение фото** (без расширений в URL — нельзя фильтровать по `*.jpg`): `data-image-info` JSON → `static.baza.drom.ru` img → `og:image`.
-- **Дата публикации**: селектор `.viewbull-actual-date`.
-- `detailCache` — общий (static) кэш карточек на все дорожки, TTL 30 мин.
-- **Константы**: `NAV_TIMEOUT_MS=30_000`, `DEFAULT_DETAIL_LIMIT=Integer.MAX_VALUE` (решение заказчика 2026-06: открываем ВСЕ детальные страницы конкурентов, не топ-6), `CACHE_TTL_MS=30 мин`, `PROXY_DOWN_THRESHOLD=5`, `CAPTCHA_BLOCK_THRESHOLD=3`, `MAX_ROTATIONS_NO_PROGRESS=4`, `ROTATE_APPLY_WAIT_MS=8000`.
+## Профили типов деталей (`AnalysisProfiles`, `application.yml → analysis.profiles`)
 
-### Капча и навигация
-- **Капча drom — собственный чекбокс на `/verify`** (`label:has-text('Я не робот')` → `input[type='submit']`, ждём ухода с `/verify`). Это НЕ reCAPTCHA, поэтому 2captcha бесполезен (см. ниже). Решается кликом `tryClickDromCheckbox()`; если CSS не сработал → JS-клик.
-- `navigateWithRetry`: тайм-аут 30 с вместо 90. `ERR_TUNNEL_CONNECTION_FAILED` (мобильный прокси «мигает») повторяется до 3 раз — поглощает кратковременные провалы IP. **Стойкий non-tunnel тайм-аут** (залип IP) → один раз `rotateIp()` и одна доп. попытка на свежем IP.
-- **Реактивная ротация IP** (`noteCaptchaBlocked()` → `rotateIp()`): при нерешаемой капче дорожка крутит IP мобильного прокси через change-IP ссылку (фолбэк-хосты `aproxy.site`, `81.200.155.214`), удаляет сессию (куки привязаны к старому IP), ждёт `ROTATE_APPLY_WAIT_MS`. Жёсткий стоп дорожки — только после `MAX_ROTATIONS_NO_PROGRESS` ротаций без единой успешной страницы. Любая успешная загрузка (`proxyOk()`) сбрасывает счётчики.
-- `rotationCount()` — монотонный счётчик удачных смен IP; на нём построен повтор-OEM в `PriceAnalyzer`.
+Тип детали — **параметр**. В UI/вебе — выпадающий список; новый тип = правка конфига, без кода. Каждый профиль несёт три «ключа» под три назначения:
 
-## DromParserPool / MobileProxyService
-
-- `DromParserPool` поднимает по дорожке на каждый прокси из `drom.proxies` (пусто → одна дорожка из `drom.proxy.url`). Дорожка = свой Playwright+браузер + свой IP + своя сессия + свои предохранители.
-- На старте `MobileProxyService.changeIpUrlsByPort()` дёргает `GET mobileproxy.space/api.html?command=get_my_proxy` (Bearer-токен) → карта `порт → change-IP ссылка`. Пул сопоставляет дорожку со ссылкой по порту из URL прокси. Лог: «получено change-IP ссылок: N», у дорожки «ротация IP: вкл/выкл».
-- Если `mobileproxy.api.token` пуст → ротация выключена, старое поведение (стоп по `CAPTCHA_BLOCK_THRESHOLD`).
-
-## AIPriceAdvisor (~1090 строк — ИИ + математика цены)
-
-Единый шлюз `open.blackroute.space` обслуживает И текст (DeepSeek), И vision (Gemini). Шлюз чувствителен к **конкурентности** запросов → общий `Semaphore gatewayLimiter` (`GATEWAY_MAX_CONCURRENT=2`, fair) держит число одновременных обращений по обоим маршрутам. `photoExecutor` — пул из 3 потоков. Всё в одном Spring-бине → лимиты глобальные на все дорожки. `temperature=0` везде.
-
-### Агент 1 — Vision-оценка фото (Gemini)
-- Активен только при непустом `gemini.api.key`; иначе нейтральный коэф. **0.80** без обращения к API.
-- **Селективно** (`evaluatePhotosSelective`): vision гоняется только для конкурентов с ценой ≤ моей × 1.10 и с фото — экономия. Необоценённым/без фото ставится нейтральный коэф. = коэф. моих фото (разница 0.0 → не даёт ложный «better»). Пустые фото = деталь не догрузилась, а НЕ «продавец без фото» — не штрафуем.
-- Возвращает `{condition, defects, coefficient 0.5–1.0}`. До 2 фото на деталь (base64), `max_tokens=2500`.
-
-### Агент 2 — Попарный классификатор конкурентов (DeepSeek text)
-- Для каждого конкурента строит попарное сравнение с нашим объявлением (описание, производитель, состояние, и фото — если vision активен и **наше** фото оценилось; иначе сравнение по тексту).
-- **Классификация ЧАНКАМИ** (`CLASSIFY_CHUNK=12`): ответ классификатора растёт линейно с числом конкурентов и на ~34+ переполнял `max_tokens` → обрезанный JSON. Чанки держат каждый ответ в бюджете токенов, при этом классифицируются ВСЕ конкуренты. На чанк: `CLASSIFY_MAX_ATTEMPTS=8` (потолок попыток при не-троттл сбое), `CLASSIFY_BUDGET_MS=180_000` (потолок времени, чтобы дорожка не висла при затяжном троттле).
-- **Детерминированные правила перебивают LLM** (`forceWorse[]` → строго `worse`):
-  - **Аналог против нашего оригинала** (`ANALOG_TOKENS`: febest, masterkit/master kit/master-kit, lynx, nagamochi, masuma, narichin, trust auto/trustauto, sat-st, ` sat `, tabc/tabp, ta-tab).
-  - **Другая сторона/позиция** (левый/правый, передний/задний — `isSideMismatch`/`isPositionMismatch`).
-- **Фото сравнивается по КАТЕГОРИИ состояния** (`conditionRank`: отличн/хорош=2, удовлетвор=1, плох=0, неизвестно=−1), а не по сырому коэффициенту: 0.88 vs 0.90 — одна категория, это `similar`, а не `better/worse` (разница коэф. часто = качество съёмки).
-- **Кэш классификации** по набору конкурентов (ключ: моё объявление + отсортированные id конкурентов + режим vision, TTL 30 мин) → один и тот же набор даёт один вердикт → одну цену (детерминизм). Кэшируется только **полноценный** непустой результат (деградированный фолбэк не кэшируется — на следующем прогоне того же набора можно получить настоящую классификацию).
-- Принимает только узлы в сборе — ремкомплекты/компоненты отфильтрованы в `PriceAnalyzer.filterAssemblies()`.
-
-### Контракт-сегментация рынка (`isContract`/`filterContract`)
-Перед классификацией: если НАША деталь контрактная («контракт» в состоянии/названии/описании) и среди конкурентов есть ДРУГИЕ контрактные — сравниваем и проценим **только по контрактным** (не-контрактные выкидываются из набора). Если контрактных конкурентов нет — сравнение по всему рынку. Прежнего наценочного пола ×1.10 над не-контрактным рынком **больше нет**: на drom «контракт» — слабый признак (почти весь б/у-импорт), пол лишь задирал цену выше реального рынка. Цена — строго по сопоставимому рынку.
-
-### Математика цены (`computeCompetitivePrice` → `strategyForMarket`)
-Рынок = ВСЕ конкуренты по детали в Барнауле (НСК-часть всегда пуста, но `computeCompetitivePrice`/`mergeClassifications` сохраняют двухрегиональный каркас — просто с пустым вторым регионом). Цель — попасть в рынок и продать (без надбавок над рынком). `FAST_SALE_FACTOR=0.95`, `MIN_RELIABLE_COMPETITORS=3`.
-
-| Ситуация | Цена |
+| Поле | Назначение |
 |---|---|
-| `similar` есть, мы лучше большинства (`worse > better`) | **медиана аналогов** (на рынке, без надбавки) |
-| `similar` есть, иначе | **медиана аналогов × 0.95** (−5%, уклон в быструю продажу), не ниже `min(similar)` |
-| только `worse` (аналогов нет) | `min(worse) × 1.20` (премия) |
-| только `better` (аналогов нет) | `min(better) × 0.80` (скидка) |
-| аналогов/конкурентов нет | цена не меняется |
-| смешанный (есть better и worse, нет similar) | `медиана × (1 + 0.15·net)`, net=(worse−better)/(worse+better) ∈ [−1;+1] |
+| `keyword` | фильтр каталога из **файла** (колонка «Запчасть» содержит keyword) |
+| `bazon-partname-ids` | фильтр каталога из **Bazon** (точный `partname_id`) |
+| `stop-words` | отсев **ложных конкурентов на drom** (в названии есть смежная деталь с тем же OEM) |
 
-- **Фото-дисконт** (`applyPhotoDiscount`): коэф. моих фото < 0.70 → масштаб цены пропорционально (до −30%).
-- **Границы** (`applyBounds`): потолок = `max` рынка; пол = `min × 0.80`; если мы уже на минимуме рынка — не подрезаем себя ниже.
-- **Тонкие данные**: сопоставимых (`reliableCount`) < 3 → уверенность «низкая» + флаг `[мало сопоставимых данных (N): … проверить вручную]`. Рекомендация НЕ подгоняется под текущую цену (иначе аудит порочно круговой) — остаётся оценка по рынку в коридоре `applyBounds`.
-- **Уверенность**: «высокая» если total≥4 в similar-ветках, «средняя»/«низкая» иначе; смешанный рынок и тонкие данные → «низкая».
+Текущие профили: **Суппорты** (суппорт / 1254), **Капоты** (капот / 305), **Бампера** (бампер / 252), **Ступицы** (ступиц / 611), **Диски тормозные** (`диск тормозн` составной / 869).
 
-### Устойчивость к сбоям шлюза
-- **Троттл** (HTTP 429 ИЛИ тело с «too many/concurrent/rate limit» при HTTP 200) НЕ сдаём — ждём с эскалацией (1.2→…→15 с + джиттер), сколько нужно: потеря классификации = ложное «аналогов нет».
-- **Реальные** ошибки (битый/пустой ответ, сеть) ограничены: текст `TEXT_MAX_HARD_ERRORS=6`, vision `VISION_MAX_CONTENT_ERRORS=3` → затем нейтральный фолбэк.
+**Два класса деталей по «переплетённости» OEM** (важно для стоп-слов):
+- *Капоты, бампера* — OEM специфичен, ложных мало (у бамперов на плотных рынках всплывают «усилитель/накладка/решётка/фара/двигатель» — разборщики вешают OEM бампера на чужую деталь).
+- *Суппорты, ступицы, диски* — OEM **пересекается** со смежными (суппорт↔ступица/диск; ступица↔кулак/цапфа; диск↔суппорт/колодка) → стоп-слова обязательны и реально режут ложное (напр. Nissan Teana: OEM делится между ступицей и кулаком/цапфой поровну).
+- **Калибровать стоп-слова на ПЛОТНЫХ примерах** (много объявлений), а не на дефицитных — на дефицитных выдача чистая.
+- «Продаём по одному» (диски): пара/комплект — не конкурент → в профиле Диски стоп-слова `комплект`, `пара`.
 
-## PriceAnalyzer (~410 строк — оркестрация)
+## Источники каталога
 
-- `CITY_LIMIT=100` — берём ВСЕ объявления детали со страницы поиска (не топ-5). `MIN_LISTING_PRICE=600` ₽ — порог: деталь с живой ценой ниже не проценивается и не попадает в отчёт (`belowMinResult` → `belowMinPrice=true`).
-- **Один регион**: НСК из расчёта убран (`siberiaPrices` всегда пуст, `searchedSiberia=false`, `siberiaCompetitorCount=0`). Отдельной «логики Сибири» / `FALLBACK_REGION` / `TOP_N` в коде больше нет.
-- **Повтор OEM** (`MAX_OEM_ATTEMPTS=3`): `analyzeFromCatalog` обёрнут в цикл; если за прогон OEM счётчик ротаций вырос (была капча со сменой IP) → OEM прогоняется заново на свежем IP. Стоп: успех без ротации / `isCaptchaBlocked()` / лимит попыток. Работает и для пула (`analyzeCatalogLane`), и для одиночной дорожки (`analyzeFromCatalog`).
-- **Кэш конкурентов на батч** (`cityCache` типа `CityMarket(candidates, competitors)`, ключ `OEM+регион`, общий на дорожки, чистится в `resetBreakers()`): дубли OEM = разные наши объявления, но рынок конкурентов один → не грузим страницу поиска повторно. Кэшируем **только успех** (наше объявление найдено) — капчевую пустышку нельзя, иначе ломается повтор-на-свежем-IP. `parseMyListing` всё равно зовётся под каждую строку (своя цена). Поле `nskCache` формально ещё объявлено, но не используется.
-- `filterAssemblies` — выкидывает не-узлы (`NON_ASSEMBLY_KEYWORDS`: ремкомплект, ремонтный комплект, поршень, направляющ, пыльник, скоба, уплотнитель, манжет, прокладк, комплект направляющ, болт, пружин, шплинт) и объявления с НЕ совпадающим OEM.
-- `pickUrlByPrice` — выбор нашего объявления из кандидатов по близости цены к каталожной (точное — приоритет).
-- `isOlderThan6Months` — парсит русские форматы дат: «вчера»/«сегодня»/«назад» → false; «15 ноября 2024» и «dd.MM.yyyy» → сравнение с порогом 6 мес.
-- Предохранители: `isProxyDown(lane)`, `isCaptchaBlocked(lane)`, `laneCount()`, `resetBreakers()`.
+### Bazon (учётная система YARD86) — основной. `BazonClient` (~291 строк)
+Тянет каталог наших запчастей напрямую (кнопка «Из Bazon»). См. память [[bazon-integration]].
+- **Авторизация:** хост `a.baz-on.ru`. `POST /login/user {login,password}` → `{AT, RT, access_token_ttl}` (AT ~4 дня, RT ~год). `POST /refresh/user {RT}` → новая пара. Токены в запросах методов — заголовок `Authorization: Bearer <AT>`.
+- **Авторефреш + персистентность:** токен хранится в `bazon-token.json` (gitignore). При старте читается с диска, обновляется по RT (`/refresh/user`, без пароля → без капчи). `login` вызывается только если RT протух. **Важно:** `/login/user` защищён анти-брутфорсом (`need_captcha` после частых логинов) — поэтому НЕ логиниться на каждый старт.
+- **Методы:** хост `yardt.baz-on.ru/external-api/v1/`, POST batch `{"request":[{"method":..,"params":..}]}`. Каталог — `getPartsWithChars`: поля `mfrnumber`(OEM), `name`, `carsrc_mark/model`, `price`, `created_at`, `used`("contract"/"new"/…), `partname_id`, `by_storages`[{storage_id,amount,reserved}].
+- **Фильтр наших деталей** (`fetchContractParts`): `used=="contract"` + `created_at` старше 6 мес + свободный остаток на складе «Ткацкая» (`storage_id=1`, amount−reserved>0) + тип профиля (`partname_id`).
+- **Баги alpha-API (обойдены):** `min/max_created_at` → HTTP 500; `offset=0` → «Invalid params» (опускаем на 1-й странице); **фильтров по типу/состоянию нет** (`partname_id`/`used`/`where` игнорируются). → идём `order=asc` (старые первыми), стоп на границе 6 мес; тип фильтруем клиентски.
+- **Кэш:** из-за отсутствия серверных фильтров первая выгрузка сканирует всю «старую» часть каталога (~90k позиций, ~9 мин, rate-limit ~1 rps). Поэтому `BazonClient` кэширует ВСЕ контрактные старше порога (любой тип) за один скан → фильтр по типу профиля потом **мгновенный** (переключение типов не пере-сканирует).
 
-## Десктоп-батч (`MainWindow`, ~1040 строк)
+### Файл (CSV/XLSX) — резервный. `CatalogLoader` (~210 строк)
+Экспорт из учётной системы. Формат определяется по сигнатуре (ZIP «PK» → xlsx, иначе CSV Windows-1251, `;`, кавычки). Первая строка — именованная шапка; колонки по ИМЕНИ (`Создан`, `Номер производителя`, `Наименование`, `Запчасть`, `Марка`, `Модель`, `Цена`; опционально `Состояние`, `Ткацкая (свободно)`). `loadOlderThan6Months(bytes, keyword, stopWords)`: строки, где название содержит keyword и не содержит стоп-слов, и `Создан` старше 6 мес. **Если в файле есть колонки `Состояние`/`Ткацкая (свободно)` — дополнительно требуем `Состояние=Контракт` и свободный остаток > 0**, повторяя фильтр пути Bazon → оба источника дают одинаковый набор (зарезервированные, свободно=0, не берём). XLSX читается через POI.
 
-- Загрузка CSV-каталога → таблица 1:1 с `catalogRows` (индексы строк не разъезжаются). При загрузке строки фильтруются ОДИН раз: `isAssemblyRow` (название содержит «суппорт», т.е. только суппорты в сборе, вкл. «Уценка!») И `inStock` (`Ткацкая(свободно)>0`). Статус: «Загружено: N (пропущено не-суппортов: X, нет на складе: Y)».
-- **Дедупа по OEM НЕТ**: дубли OEM — это разные наши объявления (один OEM, разные качество/цена); деталь = компания(YARD86)+OEM+цена.
-- **Формат CSV каталога**: Windows-1251, разделитель `;`. Колонки (0-idx, константы `COL_*`): 0 Номер товара, 1 Запчасть (`COL_PART`), 2 Цена (`COL_PRICE`), 3 Номер производителя = OEM (`COL_OEM`), 4 Ткацкая(свободно, остаток — `COL_STOCK`), 5-6 Ткацкая, 7-9 «54 YARD». Марок/моделей авто в формате нет → колонка «Авто» пустая.
-- Поле компании по умолчанию `YARD86` (частичное совпадение, без учёта регистра). Регион выбирается из списка (`barnaul`, `novosibirsk`, `omsk`, …), по умолчанию Барнаул.
-- `runBatchAnalysis`: диспетчер в фоновом потоке поднимает пул из `laneCount()` воркеров (1 IP на воркера), задания раздаются через общий курсор (`AtomicInteger`). **Предохранитель на каждый IP отдельно**: сбойная дорожка останавливается, остальные работают.
-- После анализа КАЖДОЙ детали строка дописывается в `.xlsx` и файл пересохраняется (`ExcelReport.append` + `save`, потокобезопасно) — данные не теряются при обрыве/капче. Детали с `belowMinPrice` в отчёт не пишутся.
-- Кнопка Stop (`batchStopped`), статус прогресса по дорожкам.
-- **Вестигиальный UI**: в окне остались секции/статус «Конкуренты в Новосибирске» и «Город: N • Новосибирск: M», хотя НСК больше не парсится (там всегда 0/пусто).
+Общий DTO обоих источников — `CatalogLoader.CatalogItem(oem, name, brand, model, price, created)`.
 
-### Excel-отчёт (`ExcelReport`, ~175 строк)
-Файл `price-report_<дата>.xlsx` в рабочей папке, **12 колонок**:
-`№, OEM, Запчасть, Авто, Цена на сайте, Рекоменд., Δ к рынку, %, Состояние, Уверенность, Барнаул, позиций, Ссылка на объявление, Причина`.
-- «Цена на сайте» и «Ссылка» — живые из `AggregationResult.myListingPrice/myListingUrl`; ссылка кликабельная (Hyperlink). «Авто» в текущем формате каталога пустая. «Барнаул, позиций» = `cityCompetitorCount`.
-- Состояние считается по **цене на сайте** vs рекомендованной (если сайт не спарсился — по цене каталога).
-- **Δ к рынку % = (цена на сайте − рекомендованная) / рекомендованная.** Та же величина определяет «Состояние» и цвет строки:
-  - **зелёный** «совпадает с рынком» — |Δ| ≤ 2% (допуск `createReport()` = 0.02)
-  - **красный** «выше рынка» — цена на сайте ВЫШЕ рекомендации
-  - **синий** «ниже рынка» — НИЖЕ рекомендации
-  - **серый** «нет данных» / «цена не указана»
-  - **фиолетовый** — найдено, но `< 5` позиций по детали в Барнауле (мало данных); красится поверх выше/ниже.
-- Шапка заморожена (`createFreezePane`).
+## DromParser (~1480 строк — ядро парсинга)
+
+- Headless Chromium через Playwright. Два конструктора: Spring-бин (одиночная дорожка, веб/одиночный анализ, сессия `drom-session.json`) и ручной (дорожка пула: свой прокси, сессия `drom-session-{i}.json`, имя `L{i}`, change-IP ссылка).
+- Антибот: фиксированный User-Agent на сеанс (из 5), скрытие `navigator.webdriver`, блок картинок/CSS/шрифтов (фото из HTML-атрибутов).
+- **`scanRegion(oem, region, company[, used])`** → `RegionScan(myCandidates, competitors)` за ОДНУ загрузку страницы поиска, **без детальных страниц** (быстро, меньше капчи). Конкуренты — «лёгкие» `PartPrice` со страницы поиска.
+- **`buildSearchUrl(oem, region[, used])`**: `goodPresentState[]=present` (в наличии) всегда; `condition[]=used` (б/у) при `used=true`. Для **конкурентов** — used+present; для **нашего объявления** — present-only (наши контрактные не помечены б/у, `condition=used` их срезает → терялась бы ссылка).
+- **Отсечение примеси других городов/регионов** (`SearchEntry.otherCity`, метка `.bull-delivery__city`): когда локальных мало, drom добивает выдачу до ~50 объявлениями из других городов. Отсекаем по **предлогу**: метка «**в** Улан-Удэ»/«**во** Владивостоке» → чужой регион (отсекаем); метка города без предлога («Барнаул», «Новоалтайск») или без метки → свой (оставляем). Работает и для поиска по городу, и по региону.
+- **Потолок ~50 объявлений на страницу** (пагинацию не листаем — для порогов 4/10 хватает).
+- Селекторы страницы поиска: `tr.bull-list-item-js`, `a[data-role="bulletin-link"]`, дилер `.ellipsis-text__left-side`, цена `[data-role="price"]`, OEM-сниппет `.searchSnippet/.searchMatchHilight`.
+- **Капча drom** — свой чекбокс `/verify` («Я не робот»), НЕ reCAPTCHA (2captcha бесполезен). Решается кликом; при нерешаемой — **реактивная ротация IP** мобильного прокси (change-IP ссылка, фолбэк-хосты `aproxy.site`/`81.200.155.214`), удаление сессии, пауза `ROTATE_APPLY_WAIT_MS`.
+- Константы: `NAV_TIMEOUT_MS=30_000`, `CAPTCHA_BLOCK_THRESHOLD=3`, `MAX_ROTATIONS_NO_PROGRESS=4`, `PROXY_DOWN_THRESHOLD=5`. `rotationCount()` — монотонный счётчик смен IP (на нём повтор-OEM).
+
+## PriceAnalyzer (~229 строк — оркестрация)
+
+- **Регионы:** `HOME_CITY="barnaul"` (город, порог 4). `SIBERIA_REGIONS` — 10 geo-slug **регионов ЦЕЛИКОМ** (drom по слагу региона показывает все его города): `altai-resp, altaiskii-krai, irkutskaya-obl, kemerovskaya-obl, krasnoyarskii-krai, novosibirskaya-obl, omskaya-obl, khakasiya-resp, tomskaya-obl, tyva-resp` (область=`-obl`, край=`-krai`, республика=`-resp`).
+- **Подсчёт конкурентов** (`countCompetitors`→`filterAssemblies`): целевая деталь = не содержит стоп-слов профиля И совпадает OEM (нормализованный). Б/у — на стороне drom (`condition=used`).
+- **Повтор OEM** (`MAX_OEM_ATTEMPTS=3`): если за прогон OEM дорожка сменила IP из-за капчи → OEM прогоняется заново на свежем IP.
+- **Кэш сканов на батч** (`scanCache`, ключ `OEM|регион|used`): дубли OEM не перезапрашивают drom. Кэшируем только непустой результат. Чистится в `resetBreakers()`.
+- Входы: `analyzeByOem(oem, price, company, stopWords)` (веб/одиночный, одиночная дорожка), `analyzeCatalogLane(oem, price, company, lane, stopWords)` (батч, дорожка пула).
+- Результат — `AvailabilityResult`: `barnaulCount`, `siberiaCount`, `searchedSiberia`, `myListingUrl`, `color` (NONE/YELLOW/PURPLE/RED), `reprice`, `status`.
+- **Переоценка** (`needsRepricing`): `true` для НЕокрашенных строк (конкуренции достаточно), `false` для окрашенных. Считается из тех же порогов `barnaulLow`/`siberiaLow`, что и `computeColor` (не из готового цвета): `reprice = !barnaulLow && !siberiaLow` ⇔ `color==NONE` (сверено на всех комбинациях).
+
+## Excel-отчёт (`ExcelReport`, ~151 строк)
+Файл `availability-report_<дата>.xlsx` (или `bazon-run_…` из тестов), **12 колонок**:
+`№, Номер товара, OEM, Запчасть, Авто, Цена, Создан, Барнаул конк., Сибирь конк., Ссылка на моё объявление, Статус, Переоценка`.
+- «Номер товара» — внутренний id Bazon (поле `id` в `getPartsWithChars`; в файле колонка «Номер товара»). «Переоценка» — булева ячейка `true/false` (`AvailabilityResult.reprice`).
+- Цвет строки по `AvailabilityResult.color`: 🔴 `FFC7CE`, 🟣 `E9D5FF`, 🟡 `FFEB9C`, ⚪ белый.
+- «Ссылка» — кликабельная (Hyperlink). «Сибирь» пусто, если не искали. Шапка заморожена.
+- Запись **построчная** с пересохранением после каждой детали (данные не теряются при обрыве/капче).
+
+## Десктоп-батч (`MainWindow`, ~758 строк)
+- Выбор **типа детали** (профиль) + компания (`YARD86`). Источник каталога: кнопка **«Из Bazon»** (`bazonClient.fetchContractParts(profile.bazonPartnameIds, now−6мес)`) или **«Обзор…»** (файл, резерв). Оба заполняют таблицу через `populateCatalog`.
+- `runBatchAnalysis`: пул из `laneCount()` воркеров (1 IP на воркера), общий курсор (`AtomicInteger`). Предохранитель на каждый IP отдельно. После каждой детали строка дописывается в `.xlsx`. Цвет строк таблицы — по результату. Кнопка Stop.
 
 ## REST API (`PriceAggregatorController`, :8081/api/v1)
-- `GET /info` — local/public URL (туннель).
-- `POST /analyze/stream` (SSE) — одиночный анализ.
-- `POST /catalog-item/stream` (SSE) и `/catalog-item/submit` + `GET /job/{jobId}` — анализ по OEM из каталога (потоковый и polling).
-- `POST /batch/stream` (SSE) — пакетный анализ.
-- Задания (`jobs`) живут 30 мин, keep-alive по SSE. `TunnelService` отдаёт публичный URL.
+- `GET /info` — local/public URL; `GET /profiles` — имена профилей.
+- `POST /catalog-item/stream` (SSE) и `/catalog-item/submit`+`GET /job/{id}` — анализ по OEM (параметры `oem, catalogPrice, company, profile`).
+- `POST /batch/stream` (SSE) — батч по файлу (multipart) + `profile`. Каталог через `CatalogLoader`, дедуп по OEM. Стримит `AvailabilityResult`.
+- `static/index.html` — SPA: выбор профиля (`/profiles`), анализ по OEM и батч по файлу, цветные бейджи + ссылка.
 
-## Ключевые DTO
-- `MyListingInfo` — наше объявление: title, description, condition, manufacturer, oem, city, publishedDate, photoUrls, price.
-- `PartPrice` — объявление конкурента: title, price, url, location, dealer, publishedDate, photoUrls, oem, description.
-- `AggregationResult` — итог: totalFound, статистика (min/max/avg/median), cityCompetitorCount, siberiaCompetitorCount (всегда 0), searchedSiberia (всегда false), recommendedPrice, aiConfidence, aiReason, myPhotoAssessment, myListingDate/Url/Price, marketNote, `belowMinPrice` (цена < 600 ₽ — в отчёт не включается), items/siberiaItems (siberiaItems всегда пуст), collectedAt.
-- `DromListingItem`, `RunActorRequest`, `RunResponse` — DTO Apify-интеграции (`apify.enabled=false`).
-
-## Вспомогательные сервисы
-- `MobileProxyService` — change-IP ссылки по account-токену (см. выше).
-- `LocalSocksProxy` — мост HTTP CONNECT → SOCKS5 (Chromium не умеет SOCKS5 с авторизацией напрямую).
-- `TunnelService` — публичный URL для веб-доступа к десктоп-инстансу.
-- `CaptchaSolverService` — 2captcha; **фактически не используется** (`twocaptcha.enabled=false`): капча drom без sitekey, `solve()` всегда false. Капчу проходит чекбокс + ротация IP.
-- `ApifyDromService` — альтернативный парсинг через Apify-актор (`apify.enabled=false` по умолчанию; Playwright — основной путь).
+## Пул прокси / капча / вспомогательные сервисы
+- `DromParserPool` — по дорожке на каждый прокси из `drom.proxies` (пусто → 1 дорожка из `drom.proxy.url`). Дорожка = свой Playwright+браузер+IP+сессия+предохранители.
+- `MobileProxyService` — на старте тянет change-IP ссылки по портам (`GET mobileproxy.space/api.html?command=get_my_proxy`, Bearer-токен) для реактивной ротации.
+- `LocalSocksProxy` — мост HTTP CONNECT → SOCKS5. `TunnelService` — публичный URL. `CaptchaSolverService` — 2captcha, **не используется** (капча drom без sitekey). `ApifyDromService` — альтернативный парсинг (`apify.enabled=false`).
 
 ## Конфигурация (`application.yml`)
 
 | Параметр | Назначение |
 |---|---|
-| `drom.headless` | `true` для продакшена (пул headless-браузеров); `false` для отладки |
-| `drom.proxies` | Список прокси пула через запятую (каждый = свой IP = воркер); пусто → 1 дорожка |
-| `drom.proxy.url` | Прокси одиночной дорожки (веб/одиночный анализ) |
-| `mobileproxy.api.token` / `.url` | Account-токен mobileproxy.space для авто-дискавери change-IP ссылок (ротация). Пусто → ротация выкл |
-| `gemini.api.key` | Ключ Gemini для vision (пусто → vision выключен, нейтральный коэф.) |
-| `gemini.api.base-url` / `gemini.vision.model` | Шлюз и модель vision (`gemini-2.5-flash-lite`) |
-| `deepseek.api.token` / `.base-url` / `deepseek.text.model` | Ключ, шлюз и модель текста (`deepseek-chat`) |
-| `twocaptcha.enabled` / `.api-key` | Выключено — на капчу drom не работает |
-| `apify.enabled` | Использовать Apify вместо Playwright (default `false`) |
+| `drom.headless` / `drom.proxies` / `drom.proxy.url` | headless; список прокси пула (каждый = свой IP); прокси одиночной дорожки |
+| `mobileproxy.api.token` / `.url` | account-токен mobileproxy для авто-дискавери change-IP ссылок (пусто → ротация выкл) |
+| `analysis.profiles` | типы деталей: `name` + `keyword` + `bazon-partname-ids` + `stop-words` |
+| `bazon.auth-url` / `.api-url` / `.login` / `.password` / `.storage-id` / `.token-file` | Bazon: хосты, креды external-app, склад «Ткацкая» (=1), файл токена |
+| `twocaptcha.enabled` / `apify.enabled` | выключены |
 
-**Прокси (mproxy.site) имеют срок годности** — он в комментариях `application.yml` рядом с портами. Сейчас в пуле **3 прокси**: порты `11992`, `12051`, `13078` (до 14-07-2026). Порт `21115` (истекал 16-06-2026) уже удалён из `drom.proxies`. Одиночная дорожка (`drom.proxy.url`) — порт `11992`. При истечении дорожка отвалится — обновить креды в `drom.proxies` и `drom.proxy.url`.
+**Прокси (mproxy.site) имеют срок годности** (в комментариях yml рядом с портами): сейчас 3 прокси `11992/12051/13078` (до 14-07-2026). При истечении дорожка отвалится — обновить креды.
 
-**ИИ-баланс** проверяется по шлюзу: `GET https://open.blackroute.space/key/info` с `Authorization: Bearer <ключ>` → JSON с `spend`/`max_budget` (LiteLLM). Лимит каждого ключа сейчас $10.
+**`bazon-token.json`** (в `.gitignore`) — access+refresh токены. Обновить свежим из браузера при протухании RT (~год) или логином (если капча снята).
 
 ## Точки расширения
-- **Порог мало сопоставимых** → `AIPriceAdvisor.MIN_RELIABLE_COMPETITORS` (3).
-- **Уклон в быструю продажу** → `AIPriceAdvisor.FAST_SALE_FACTOR` (0.95); смешанный рынок — коэф. `0.15` в `strategyForMarket()`.
-- **Премия/скидка без аналогов** → `×1.20` / `×0.80` в `strategyForMarket()`.
-- **Фильтр нецелевых товаров** → `PriceAnalyzer.NON_ASSEMBLY_KEYWORDS` (парсер) и `MainWindow.isAssemblyRow` («суппорт» в каталоге).
-- **Бренды аналогов** → `AIPriceAdvisor.ANALOG_TOKENS`.
-- **Порог минимальной цены детали** → `PriceAnalyzer.MIN_LISTING_PRICE` (600 ₽).
-- **Лимит конкурентов со страницы поиска** → `PriceAnalyzer.CITY_LIMIT` (100 = «все»); открытие детальных страниц → `DromParser.DEFAULT_DETAIL_LIMIT` (`Integer.MAX_VALUE`).
-- **Размер чанка классификатора** → `AIPriceAdvisor.CLASSIFY_CHUNK` (12); попытки/бюджет → `CLASSIFY_MAX_ATTEMPTS` (8) / `CLASSIFY_BUDGET_MS` (180 с).
-- **Конкурентность шлюза** → `AIPriceAdvisor.GATEWAY_MAX_CONCURRENT` (2).
-- **Тайм-ауты/ротация прокси** → `DromParser.NAV_TIMEOUT_MS`, `MAX_ROTATIONS_NO_PROGRESS`, `ROTATE_APPLY_WAIT_MS`, `CAPTCHA_BLOCK_THRESHOLD`.
-- **CSS-селекторы парсера** → `DromParser` (`extractPartFromPage`, `parseMyListing`, извлечение фото/даты).
-- **Допуск «совпадает»** → `0.02` в `MainWindow.createReport()`.
+- **Новый тип детали** → профиль в `application.yml` (`name`+`keyword`+`bazon-partname-ids`+`stop-words`). Точный `partname_id` — из Bazon `getPartnames`. Стоп-слова калибровать на плотных примерах. Убирать конфликтные стоп-слова (напр. «диск» нельзя при анализе тормозных дисков — там keyword `диск тормозн`).
+- **Пороги цвета** → `PriceAnalyzer.BARNAUL_MIN/SIBERIA_TRIGGER/SIBERIA_MIN`.
+- **Регионы Сибири** → `PriceAnalyzer.SIBERIA_REGIONS`.
+- **Тайм-ауты/ротация** → `DromParser.NAV_TIMEOUT_MS`, `MAX_ROTATIONS_NO_PROGRESS`, `ROTATE_APPLY_WAIT_MS`, `CAPTCHA_BLOCK_THRESHOLD`.
+- **Селекторы парсера** → `DromParser` (`collectSearchEntries`, извлечение цены/дилера/OEM/метки города).
+- **Допуск «совпадает» / фильтры drom** → `DromParser.buildSearchUrl` (used/present).
 
-## Эксплуатационные реалии (выяснено на живых прогонах)
-
-- **Пустые строки ≈ реальные пробелы рынка, не прокси.** На прогоне 255 деталей (ещё в двухрегиональном режиме): 94% строк получили ≥3 конкурента, «рынок = 0» — лишь ~4%, и большинство — редкие OEM, которых нет в продаже. Масштабирование IP их НЕ закроет. Транзитный промах прокси отличается тем, что тот же OEM нашёлся в другой строке (дубль) — его подбирает повтор-на-свежем-IP. Не записывать «нет данных» автоматически в «проблему прокси». (После перехода на один регион Барнаул доля пустых строк может быть выше — часть деталей была только в НСК.)
-- **Прокси — лимит пропускной способности/времени, а не качества данных.** При больших объёмах (тысячи деталей за прогон) узкое место — капча/тайм-ауты и длительность, а не дыры в данных.
-- **Стоимость ИИ**: vision (`gemini-2.5-flash-lite`) ≈ $0.0013/деталь, текст ≈ $0.0005/деталь → ~$0.0019/деталь, ~$0.33 за 255-деталь прогон. Vision — основная статья и кончается первым.
-- **Главный бизнес-вывод отчётов**: ~70% объявлений YARD86 стоят выше конкурентного уровня (Состояние «выше рынка», красный) — основной материал для снижения цен. Выбросы Δ>+100% проверять вручную.
-- **Распределение уверенности типичного прогона**: ~77% «высокая», ~18% «низкая» (тонкие данные/смешанный рынок). Низкие и «нет данных» — в ручную проверку, не в автоприменение.
+## Эксплуатационные реалии
+- **Дефицит по типам** (доля RED+YELLOW+PURPLE): бампера ~77% (крупногабарит, дорогая межгородская доставка → разреженный рынок б/у), капоты ~17%, суппорты/ступицы ~18–19%, тормозные диски — плотно (дешёвый ходовой расходник, много на разборах). Приоритет — красные (дефицит и дома, и по Сибири).
+- **Позиции у порога 10** (Сибирь 7–13) естественно колеблются RED↔YELLOW между прогонами — реальное изменение наличия на drom, не ошибка подсчёта; смотреть по тренду.
+- **Пустые строки ≈ реальные пробелы рынка**, не прокси (на прогоне 255 деталей ~4% «рынок=0» — редкие OEM). Прокси — лимит скорости/капчи, не полноты данных.
+- Все 5 типов деталей и полный пайплайн Bazon→drom→Excel **проверены вживую** (сверка независимыми прогонами сходится до единицы).
 
 ## Память проекта
-Долгоживущие факты и решения — в `/Users/vladislav/.claude/projects/-Users-vladislav-IdeaProjects-app-drom-price-parser/memory/` (индекс `MEMORY.md`): **решение 2026-06 «один регион Барнаул + все объявления + порог 600₽»**, анти-бот/капча, пул прокси, реактивная ротация IP, стоимость ИИ, идентичность объявления и кэш, «пустые строки = реальные пробелы», «оставлять ИИ-оценки». Свериться там перед изменениями в парсере/прокси/ценовой логике.
+Долгоживущие факты — в `/Users/vladislav/.claude/projects/-Users-vladislav-IdeaProjects-app-drom-price-parser/memory/` (индекс `MEMORY.md`): **решение 2026-06 (один регион/все объявления/тип-профиль)**, фильтры поиска drom (used/present, отсечение примеси по предлогу, регионы, keyword-vs-стоп-слова), интеграция Bazon (авторефреш, баги API, кэш), анти-бот/капча, пул прокси, реактивная ротация IP, идентичность объявления и кэш, «пустые строки = реальные пробелы». Свериться там перед изменениями в парсере/прокси/каталоге/анализе.

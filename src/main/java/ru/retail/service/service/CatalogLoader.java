@@ -38,7 +38,7 @@ public final class CatalogLoader {
 
     /** Одна позиция каталога после разбора шапки. */
     public record CatalogItem(String oem, String name, String brand, String model,
-                              BigDecimal price, LocalDateTime created) {}
+                              BigDecimal price, LocalDateTime created, String itemNumber) {}
 
     private static final DateTimeFormatter DT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter D  = DateTimeFormatter.ofPattern("yyyy-MM-dd");
@@ -66,6 +66,11 @@ public final class CatalogLoader {
         int iBrand   = col(h, "Марка");
         int iModel   = col(h, "Модель");
         int iPrice   = col(h, "Цена");
+        // Необязательные колонки — при их наличии повторяем фильтр пути Bazon:
+        // только контрактные детали со свободным остатком на «Ткацкой» > 0 (зарезервированные продать нельзя).
+        int iState   = col(h, "Состояние");
+        int iFree    = col(h, "Ткацкая (свободно)");
+        int iItem    = col(h, "Номер товара");   // внутренний id Bazon
 
         if (iCreated < 0 || iOem < 0) {
             log.error("Каталог: не найдены обязательные колонки «Создан»/«Номер производителя». Шапка: {}", h.keySet());
@@ -74,7 +79,7 @@ public final class CatalogLoader {
 
         LocalDateTime threshold = LocalDateTime.now().minusMonths(6);
         List<CatalogItem> out = new ArrayList<>();
-        int skippedFresh = 0, skippedPart = 0, skippedDate = 0, skippedOem = 0;
+        int skippedFresh = 0, skippedPart = 0, skippedDate = 0, skippedOem = 0, skippedState = 0, skippedStock = 0;
 
         for (int r = 1; r < rows.size(); r++) {
             String[] row = rows.get(r);
@@ -89,18 +94,29 @@ public final class CatalogLoader {
             if (created == null) { skippedDate++; continue; }
             if (!created.isBefore(threshold)) { skippedFresh++; continue; }   // свежее 6 мес — пропуск
 
+            // Контрактные + свободный остаток на «Ткацкой» > 0 (как в пути Bazon), если колонки есть в файле.
+            if (iState >= 0 && !"контракт".equalsIgnoreCase(get(row, iState).trim())) { skippedState++; continue; }
+            if (iFree >= 0 && parseIntSafe(get(row, iFree)) <= 0) { skippedStock++; continue; }
+
             out.add(new CatalogItem(
                     oem,
                     name.isBlank() ? partType : name,
                     get(row, iBrand),
                     get(row, iModel),
                     parsePrice(get(row, iPrice)),
-                    created));
+                    created,
+                    get(row, iItem)));
         }
 
-        log.info("Каталог [{}]: отобрано {} (старше 6 мес). Пропущено: свежих {}, нецелевых {}, без даты {}, без OEM {}.",
-                keyword, out.size(), skippedFresh, skippedPart, skippedDate, skippedOem);
+        log.info("Каталог [{}]: отобрано {} (старше 6 мес). Пропущено: свежих {}, нецелевых {}, без даты {}, без OEM {}, не контракт {}, без свободного остатка {}.",
+                keyword, out.size(), skippedFresh, skippedPart, skippedDate, skippedOem, skippedState, skippedStock);
         return out;
+    }
+
+    /** Целое из строки («0», «1», пусто) — 0 при неразборе. */
+    private static int parseIntSafe(String s) {
+        if (s == null) return 0;
+        try { return Integer.parseInt(s.trim().replaceAll("[^\\d-]", "")); } catch (Exception e) { return 0; }
     }
 
     /** Целевая деталь: название/тип содержит keyword и не содержит ни одного стоп-слова. */
