@@ -208,7 +208,8 @@ public class BazonClient {
                 p.path("carsrc_model").asText(""),
                 price,
                 created,
-                p.path("id").asText(""));   // «Номер товара» (внутренний id Bazon)
+                p.path("id").asText(""),    // «Номер товара» (внутренний id Bazon)
+                null);                      // «Цена изменена в» — в external-api Bazon поля нет (только файл-экспорт)
     }
 
     // ==================== HTTP + ТОКЕНЫ ====================

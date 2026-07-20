@@ -377,7 +377,7 @@ public class MainWindow extends JFrame {
     }
 
     private JScrollPane buildBatchTableScrollPane() {
-        String[] cols = {"Номер товара", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан", "Барнаул", "Сибирь", "Статус", "Переоценка"};
+        String[] cols = {"Номер товара", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан", "Изменено в", "Барнаул", "Сибирь", "Статус", "Переоценка"};
         batchModel = new DefaultTableModel(cols, 0) {
             @Override public boolean isCellEditable(int r, int c) { return false; }
         };
@@ -388,7 +388,7 @@ public class MainWindow extends JFrame {
         batchTable.getTableHeader().setReorderingAllowed(false);
         batchTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
 
-        int[] widths = {100, 120, 340, 200, 90, 100, 80, 80, 320, 90};
+        int[] widths = {100, 120, 340, 200, 90, 100, 100, 80, 80, 320, 90};
         for (int i = 0; i < widths.length; i++)
             batchTable.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
 
@@ -603,7 +603,9 @@ public class MainWindow extends JFrame {
             batchModel.addRow(new Object[]{
                     it.itemNumber(), it.oem(), it.name(), auto(it),
                     it.price() != null && it.price().signum() > 0 ? it.price().toPlainString() : "—",
-                    it.created().format(D), "—", "—", "Ожидает", "—"
+                    it.created().format(D),
+                    it.priceChanged() != null ? it.priceChanged().format(D) : "—",
+                    "—", "—", "Ожидает", "—"
             });
         }
         int count = catalogItems.size();
@@ -639,10 +641,10 @@ public class MainWindow extends JFrame {
         analyzeBtn.setEnabled(false);
 
         for (int i = 0; i < batchModel.getRowCount(); i++) {
-            batchModel.setValueAt("—", i, 6);
             batchModel.setValueAt("—", i, 7);
-            batchModel.setValueAt("Ожидает", i, 8);
-            batchModel.setValueAt("—", i, 9);
+            batchModel.setValueAt("—", i, 8);
+            batchModel.setValueAt("Ожидает", i, 9);
+            batchModel.setValueAt("—", i, 10);
         }
         batchResults = new ArrayList<>(Collections.nCopies(catalogItems.size(), null));
         setBatchLink(null);
@@ -684,29 +686,29 @@ public class MainWindow extends JFrame {
 
                         final CatalogLoader.CatalogItem it = catalogItems.get(idx);
                         final int rowIdx = idx;
-                        SwingUtilities.invokeLater(() -> batchModel.setValueAt("Анализ (L" + laneId + ")...", rowIdx, 8));
+                        SwingUtilities.invokeLater(() -> batchModel.setValueAt("Анализ (L" + laneId + ")...", rowIdx, 9));
 
                         try {
                             AvailabilityResult res = priceAnalyzer.analyzeCatalogLane(
                                     it.oem(), it.price(), company, laneId, stops);
                             if (report != null)
                                 report.append(it.oem(), it.itemNumber(), it.name(), auto(it), it.price(),
-                                        it.created().format(D), res);
+                                        it.created().format(D), it.priceChanged() != null ? it.priceChanged().format(D) : "", res);
                             final int d = done.incrementAndGet();
                             SwingUtilities.invokeLater(() -> {
                                 batchResults.set(rowIdx, res);
-                                batchModel.setValueAt(res.getBarnaulCount(), rowIdx, 6);
-                                batchModel.setValueAt(res.isSearchedSiberia() ? res.getSiberiaCount() : "—", rowIdx, 7);
-                                batchModel.setValueAt(shortStatus(res.getColor()), rowIdx, 8);
-                                batchModel.setValueAt(res.isReprice(), rowIdx, 9);
+                                batchModel.setValueAt(res.getBarnaulCount(), rowIdx, 7);
+                                batchModel.setValueAt(res.isSearchedSiberia() ? res.getSiberiaCount() : "—", rowIdx, 8);
+                                batchModel.setValueAt(shortStatus(res.getColor()), rowIdx, 9);
+                                batchModel.setValueAt(res.isReprice(), rowIdx, 10);
                                 batchStatusLabel.setText("Готово " + d + " / " + total + " (дорожек: " + lanes + ")");
                                 batchStatusLabel.setForeground(BLUE);
                                 batchTable.repaint();
                             });
                         } catch (Exception ex) {
                             if (report != null) report.append(it.oem(), it.itemNumber(), it.name(), auto(it), it.price(),
-                                    it.created().format(D), null);
-                            SwingUtilities.invokeLater(() -> batchModel.setValueAt("Ошибка", rowIdx, 8));
+                                    it.created().format(D), it.priceChanged() != null ? it.priceChanged().format(D) : "", null);
+                            SwingUtilities.invokeLater(() -> batchModel.setValueAt("Ошибка", rowIdx, 9));
                         }
                     }
                 });

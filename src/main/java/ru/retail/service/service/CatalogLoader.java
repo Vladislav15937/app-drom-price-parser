@@ -38,7 +38,8 @@ public final class CatalogLoader {
 
     /** Одна позиция каталога после разбора шапки. */
     public record CatalogItem(String oem, String name, String brand, String model,
-                              BigDecimal price, LocalDateTime created, String itemNumber) {}
+                              BigDecimal price, LocalDateTime created, String itemNumber,
+                              LocalDateTime priceChanged) {}
 
     private static final DateTimeFormatter DT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter D  = DateTimeFormatter.ofPattern("yyyy-MM-dd");
@@ -70,7 +71,8 @@ public final class CatalogLoader {
         // только контрактные детали со свободным остатком на «Ткацкой» > 0 (зарезервированные продать нельзя).
         int iState   = col(h, "Состояние");
         int iFree    = col(h, "Ткацкая (свободно)");
-        int iItem    = col(h, "Номер товара");   // внутренний id Bazon
+        int iItem    = col(h, "Номер товара");        // внутренний id Bazon
+        int iPriceCh = col(h, "Цена изменена в");     // дата последней смены цены — берём только «застоявшиеся» (>6 мес)
 
         if (iCreated < 0 || iOem < 0) {
             log.error("Каталог: не найдены обязательные колонки «Создан»/«Номер производителя». Шапка: {}", h.keySet());
@@ -79,7 +81,7 @@ public final class CatalogLoader {
 
         LocalDateTime threshold = LocalDateTime.now().minusMonths(6);
         List<CatalogItem> out = new ArrayList<>();
-        int skippedFresh = 0, skippedPart = 0, skippedDate = 0, skippedOem = 0, skippedState = 0, skippedStock = 0;
+        int skippedFresh = 0, skippedPart = 0, skippedDate = 0, skippedOem = 0, skippedState = 0, skippedStock = 0, skippedPriceFresh = 0;
 
         for (int r = 1; r < rows.size(); r++) {
             String[] row = rows.get(r);
@@ -98,6 +100,11 @@ public final class CatalogLoader {
             if (iState >= 0 && !"контракт".equalsIgnoreCase(get(row, iState).trim())) { skippedState++; continue; }
             if (iFree >= 0 && parseIntSafe(get(row, iFree)) <= 0) { skippedStock++; continue; }
 
+            // Цену не меняли > 6 мес (застоялась). Если колонка есть и дата свежее порога — пропуск.
+            // Пустая/непарсимая «Цена изменена в» = цену не трогали → берём (это и есть застой).
+            LocalDateTime priceChanged = iPriceCh >= 0 ? parseDate(get(row, iPriceCh)) : null;
+            if (iPriceCh >= 0 && priceChanged != null && !priceChanged.isBefore(threshold)) { skippedPriceFresh++; continue; }
+
             out.add(new CatalogItem(
                     oem,
                     name.isBlank() ? partType : name,
@@ -105,11 +112,12 @@ public final class CatalogLoader {
                     get(row, iModel),
                     parsePrice(get(row, iPrice)),
                     created,
-                    get(row, iItem)));
+                    get(row, iItem),
+                    priceChanged));
         }
 
-        log.info("Каталог [{}]: отобрано {} (старше 6 мес). Пропущено: свежих {}, нецелевых {}, без даты {}, без OEM {}, не контракт {}, без свободного остатка {}.",
-                keyword, out.size(), skippedFresh, skippedPart, skippedDate, skippedOem, skippedState, skippedStock);
+        log.info("Каталог [{}]: отобрано {} (старше 6 мес). Пропущено: свежих {}, нецелевых {}, без даты {}, без OEM {}, не контракт {}, без свободного остатка {}, цена менялась <6мес {}.",
+                keyword, out.size(), skippedFresh, skippedPart, skippedDate, skippedOem, skippedState, skippedStock, skippedPriceFresh);
         return out;
     }
 

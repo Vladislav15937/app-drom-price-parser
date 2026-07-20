@@ -23,7 +23,7 @@ import java.nio.file.Path;
 public class ExcelReport {
 
     private static final String[] HEADERS = {
-            "№", "Номер товара", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан",
+            "№", "Номер товара", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан", "Изменено в",
             "Барнаул, конк.", "Сибирь, конк.", "Ссылка на моё объявление", "Статус", "Переоценка"
     };
 
@@ -46,7 +46,7 @@ public class ExcelReport {
         purpleStyle = base(0xE9D5FF, 0x6B21A8, false);   // мало по Сибири (<10)
         redStyle    = base(0xFFC7CE, 0x9C0006, false);   // дефицит: Барнаул<4 и Сибирь<10
 
-        int[] widths = {1500, 3600, 5200, 14000, 9000, 3400, 5000, 3600, 3600, 16000, 14000, 3600};
+        int[] widths = {1500, 3600, 5200, 14000, 9000, 3400, 5000, 5000, 3600, 3600, 16000, 14000, 3600};
         for (int i = 0; i < widths.length; i++) sheet.setColumnWidth(i, widths[i]);
         sheet.createFreezePane(0, 1);
 
@@ -82,7 +82,7 @@ public class ExcelReport {
 
     /** Добавляет строку по одной детали и сразу сохраняет файл. Потокобезопасно (вызов из потока анализа). */
     public synchronized void append(String oem, String itemNumber, String partName, String auto,
-                                    BigDecimal price, String created, AvailabilityResult r) {
+                                    BigDecimal price, String created, String priceChanged, AvailabilityResult r) {
         CellStyle style = styleFor(r);
 
         Row row = sheet.createRow(rowNum++);
@@ -94,6 +94,7 @@ public class ExcelReport {
         set(row, col++, auto, style);
         set(row, col++, price != null && price.signum() > 0 ? price.toPlainString() : "", style);
         set(row, col++, created == null ? "" : created, style);
+        set(row, col++, priceChanged == null ? "" : priceChanged, style);
         set(row, col++, r == null ? "" : String.valueOf(r.getBarnaulCount()), style);
         set(row, col++, r == null || !r.isSearchedSiberia() ? "" : String.valueOf(r.getSiberiaCount()), style);
         setLink(row, col++, r == null ? null : r.getMyListingUrl(), style);

@@ -41,10 +41,10 @@ apify:
 drom:
   headless: true   # пул воркеров работает в headless (4 браузера без окон)
   # Пул прокси: каждый порт = свой мобильный IP = отдельный параллельный воркер (через запятую, без пробелов)
-  # 11992/12051/13078 — до 14-07-2026; 21115 — до 16-06-2026 (истекает первым)
-  proxies: http://ad3DES:Yv5aV4Ek1zac@mproxy.site:11992,http://BYpyD9:cyW6nyj7APpe@mproxy.site:12051,http://ur8uH8:RYSen1yMet4y@mproxy.site:13078
+  # 20257 (Щербинка) / 20258 (Москва) / 20260 (Казань), beeline — до 19-08-2026
+  proxies: http://FuZ6GY:SUd4CEYAmug7@mproxy.site:20257,http://AVUmYs:ysKUQzABUk9C@mproxy.site:20258,http://aP8suu:Yz5REGUvUpAG@mproxy.site:20260
   proxy:
-    url: http://ad3DES:Yv5aV4Ek1zac@mproxy.site:11992   # одиночная дорожка (веб/одиночный анализ)
+    url: http://FuZ6GY:SUd4CEYAmug7@mproxy.site:20257   # одиночная дорожка (веб/одиночный анализ)
 
 twocaptcha:
   enabled: false  # капча drom — свой чекбокс /verify (без sitekey), 2captcha тут не работает; решает tryClickDromCheckbox + ротация IP
