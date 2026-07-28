@@ -77,7 +77,7 @@ mvn spring-boot:run
 
 ## Источники каталога
 
-### Bazon (учётная система YARD86) — основной. `BazonClient` (~291 строк)
+### Bazon (учётная система YARD86) — основной. `BazonClient` (~335 строк)
 Тянет каталог наших запчастей напрямую (кнопка «Из Bazon»). См. память [[bazon-integration]].
 - **Авторизация:** хост `a.baz-on.ru`. `POST /login/user {login,password}` → `{AT, RT, access_token_ttl}` (AT ~4 дня, RT ~год). `POST /refresh/user {RT}` → новая пара. Токены в запросах методов — заголовок `Authorization: Bearer <AT>`.
 - **Авторефреш + персистентность:** токен хранится в `bazon-token.json` (gitignore). При старте читается с диска, обновляется по RT (`/refresh/user`, без пароля → без капчи). `login` вызывается только если RT протух. **Важно:** `/login/user` защищён анти-брутфорсом (`need_captcha` после частых логинов) — поэтому НЕ логиниться на каждый старт.
@@ -87,12 +87,12 @@ mvn spring-boot:run
 - **Кэш:** из-за отсутствия серверных фильтров первая выгрузка сканирует всю «старую» часть каталога (~90k позиций, ~9 мин, rate-limit ~1 rps). Поэтому `BazonClient` кэширует ВСЕ контрактные старше порога (любой тип) за один скан → фильтр по типу профиля потом **мгновенный** (переключение типов не пере-сканирует).
 - **Запись цены (external-api v1.0 `setProducts`).** Наш `/external-api/v1/` = v1.0 — умеет запись. Смена цены: `{"request":[{"method":"setProducts","params":{"products":[{"id":<id>,"fields":[{"field_name":"price","action":"set","value":"<цена>"}]}]}}]}`. Поле розничной цены — **`price`** (не `price_1`). Массив `products` — **батч** (чанк 100). Результаты позиционные: `{"action":"updated","product":{...,"price":<новая>}}` — эхо-цена, проверяем `product.price==new`. Текущую цену для −10% берём из каталога (`getPartsWithChars.price`). Методы `BazonClient.PriceUpdate/PriceResult/setPrices`. Право записи у API-пользователя **подтверждено вживую**. См. [[bazon-integration]].
 
-### Файл (CSV/XLSX) — резервный. `CatalogLoader` (~210 строк)
+### Файл (CSV/XLSX) — резервный. `CatalogLoader` (~234 строк)
 Экспорт из учётной системы. Формат определяется по сигнатуре (ZIP «PK» → xlsx, иначе CSV Windows-1251, `;`, кавычки). Первая строка — именованная шапка; колонки по ИМЕНИ (`Создан`, `Номер производителя`, `Наименование`, `Запчасть`, `Марка`, `Модель`, `Цена`; опционально `Состояние`, `Ткацкая (свободно)`). `loadOlderThan6Months(bytes, keyword, stopWords)`: строки, где название содержит keyword и не содержит стоп-слов, и `Создан` старше 6 мес. **Если в файле есть колонки `Состояние`/`Ткацкая (свободно)` — дополнительно требуем `Состояние=Контракт` и свободный остаток > 0** (повторяет фильтр пути Bazon; зарезервированные, свободно=0, не берём). **Если есть колонка `Цена изменена в` — берём только те, у кого цена НЕ менялась > 6 мес** (застоялась; пустая дата = не трогали → берём). XLSX читается через POI. ⚠️ Фильтр по `Цена изменена в` доступен ТОЛЬКО из файла: в external-api Bazon этого поля нет, а frontend-api (где был `priceEditedAt`) Bazon закрыл (2026-07) → путь «Из Bazon» этот фильтр применить не может.
 
 Общий DTO обоих источников — `CatalogLoader.CatalogItem(oem, name, brand, model, price, created, itemNumber, priceChanged)`. `itemNumber` — id Bazon; `priceChanged` — «Цена изменена в» (только из файла, из Bazon API = null). Оба показываются в таблице десктопа (колонки «Номер товара», «Изменено в»).
 
-## DromParser (~1480 строк — ядро парсинга)
+## DromParser (~1481 строк — ядро парсинга)
 
 - Headless Chromium через Playwright. Два конструктора: Spring-бин (одиночная дорожка, веб/одиночный анализ, сессия `drom-session.json`) и ручной (дорожка пула: свой прокси, сессия `drom-session-{i}.json`, имя `L{i}`, change-IP ссылка).
 - Антибот: фиксированный User-Agent на сеанс (из 5), скрытие `navigator.webdriver`, блок картинок/CSS/шрифтов (фото из HTML-атрибутов).
@@ -104,7 +104,7 @@ mvn spring-boot:run
 - **Капча drom** — свой чекбокс `/verify` («Я не робот»), НЕ reCAPTCHA (2captcha бесполезен). Решается кликом; при нерешаемой — **реактивная ротация IP** мобильного прокси (change-IP ссылка, фолбэк-хосты `aproxy.site`/`81.200.155.214`), удаление сессии, пауза `ROTATE_APPLY_WAIT_MS`.
 - Константы: `NAV_TIMEOUT_MS=30_000`, `CAPTCHA_BLOCK_THRESHOLD=3`, `MAX_ROTATIONS_NO_PROGRESS=4`, `PROXY_DOWN_THRESHOLD=5`. `rotationCount()` — монотонный счётчик смен IP (на нём повтор-OEM).
 
-## PriceAnalyzer (~229 строк — оркестрация)
+## PriceAnalyzer (~240 строк — оркестрация)
 
 - **Регионы:** `HOME_CITY="barnaul"` (город, порог 4). `SIBERIA_REGIONS` — 10 geo-slug **регионов ЦЕЛИКОМ** (drom по слагу региона показывает все его города): `altai-resp, altaiskii-krai, irkutskaya-obl, kemerovskaya-obl, krasnoyarskii-krai, novosibirskaya-obl, omskaya-obl, khakasiya-resp, tomskaya-obl, tyva-resp` (область=`-obl`, край=`-krai`, республика=`-resp`).
 - **Подсчёт конкурентов** (`countCompetitors`→`filterAssemblies`): целевая деталь = не содержит стоп-слов профиля И совпадает OEM (нормализованный). Б/у — на стороне drom (`condition=used`).
@@ -114,21 +114,21 @@ mvn spring-boot:run
 - Результат — `AvailabilityResult`: `barnaulCount`, `siberiaCount`, `searchedSiberia`, `myListingUrl`, `color` (NONE/YELLOW/PURPLE/RED), `reprice`, `status`.
 - **Переоценка** (`needsRepricing`): `true` для НЕокрашенных строк (конкуренции достаточно), `false` для окрашенных. Считается из тех же порогов `barnaulLow`/`siberiaLow`, что и `computeColor` (не из готового цвета): `reprice = !barnaulLow && !siberiaLow` ⇔ `color==NONE` (сверено на всех комбинациях).
 
-## Excel-отчёт (`ExcelReport`, ~151 строк)
-Файл `availability-report_<дата>.xlsx` (или `bazon-run_…` из тестов), **13 колонок**:
-`№, Номер товара, OEM, Запчасть, Авто, Цена, Создан, Изменено в, Барнаул конк., Сибирь конк., Ссылка на моё объявление, Статус, Переоценка`.
+## Excel-отчёт (`ExcelReport`, ~155 строк)
+Файл `availability-report_<дата>.xlsx`, **13 колонок** (разделитель · — сами подписи содержат запятые):
+`№ · Номер товара · OEM · Запчасть · Авто · Цена, ₽ · Создан · Изменено в · Барнаул, конк. · Сибирь, конк. · Ссылка на моё объявление · Статус · Переоценка`.
 - «Номер товара» — внутренний id Bazon (поле `id` в `getPartsWithChars`; в файле колонка «Номер товара»). «Изменено в» — «Цена изменена в» (только из файла-экспорта, из Bazon API пусто). «Переоценка» — булева ячейка `true/false` (`AvailabilityResult.reprice`).
 - Цвет строки по `AvailabilityResult.color`: 🔴 `FFC7CE`, 🟣 `E9D5FF`, 🟡 `FFEB9C`, ⚪ белый.
 - «Ссылка» — кликабельная (Hyperlink). «Сибирь» пусто, если не искали. Шапка заморожена.
 - Запись **построчная** с пересохранением после каждой детали (данные не теряются при обрыве/капче).
 
-## Десктоп-батч (`MainWindow`, ~758 строк)
+## Десктоп-батч (`MainWindow`, ~928 строк)
 - Выбор **типа детали** (профиль) + компания (`YARD86`). Источник каталога: кнопка **«Из Bazon»** (`bazonClient.fetchContractParts(profile.bazonPartnameIds, now−6мес)`) или **«Обзор…»** (файл, резерв). Оба заполняют таблицу через `populateCatalog`.
 - `runBatchAnalysis`: пул из `laneCount()` воркеров (1 IP на воркера), общий курсор (`AtomicInteger`). Предохранитель на каждый IP отдельно. После каждой детали строка дописывается в `.xlsx`. Цвет строк таблицы — по результату. Кнопка Stop.
 - **Кнопка «−10% в Bazon (переоценка)»** (`applyReprice`, активна после батча): для строк `reprice=true` с числовым «Номер товара» берёт текущую цену **из каталога** (`getPartsWithChars.price`, без доп. чтений), считает `new = round(price×0.9)` до 10 ₽ (half-up: 6345→6350), сохраняет **DRY-RUN** `reprice-preview_*.csv`; после диалога подтверждения пишет цену **одним батчем** (`bazonClient.setPrices` → external v1.0 `setProducts`, чанк 100), лог `reprice-applied_*.csv` (`id;OEM;было;стало;статус`). Успех строки = `product.price==new` из эхо-ответа. Необратимо — запускает пользователь. **Тест-режим:** перед запуском спрашивает «первые N» (0/пусто = все) — обкатать на 1–2 позициях. Право записи у API-пользователя подтверждено вживую; полный прогон 92 суппортов применён и сверен (−10%, суммарно −28 969 ₽).
   - Отчёты — CSV; для показа заказчику превью удобно пересобрать в xlsx (шапка, суммы, «Снижение %» как настоящий процент, не доля).
 
-## REST API (`PriceAggregatorController`, :8081/api/v1)
+## REST API (`PriceAggregatorController`, ~259 строк, :8081/api/v1)
 - `GET /info` — local/public URL; `GET /profiles` — имена профилей.
 - `POST /catalog-item/stream` (SSE) и `/catalog-item/submit`+`GET /job/{id}` — анализ по OEM (параметры `oem, catalogPrice, company, profile`).
 - `POST /batch/stream` (SSE) — батч по файлу (multipart) + `profile`. Каталог через `CatalogLoader`, дедуп по OEM. Стримит `AvailabilityResult`.
