@@ -92,8 +92,29 @@
   </div>
   <div class="row">
     <button id="b-btn">Запустить анализ</button>
+    <button id="b-stop" style="background:#7a1f1f" disabled>Стоп</button>
+    <button id="b-report" style="background:#15803d; display:none">Скачать результат (.xlsx)</button>
+    <button id="b-reprice" style="background:#b45309; display:none">−10% в Bazon (переоценка)</button>
     <span class="status" id="b-status"></span>
   </div>
+  <!-- Переоценка: два шага — расчёт (dry-run) и подтверждение записи в Bazon -->
+  <div id="rp-panel" style="display:none; margin:12px 0; padding:12px 14px; border:1px solid #b45309;
+       border-radius:6px; background:#2a1f12">
+    <div class="row" style="margin-bottom:8px">
+      <label>Применить к первым N деталям (0 = ко всем):</label>
+      <input type="number" id="rp-limit" value="0" style="width:90px">
+      <button id="rp-calc">Посчитать</button>
+      <button id="rp-close" style="background:#444">Закрыть</button>
+    </div>
+    <div id="rp-summary" style="font-size:13px; line-height:1.6"></div>
+    <div id="rp-confirm" style="display:none; margin-top:10px">
+      <div style="color:#fca5a5; font-weight:600; margin-bottom:8px">
+        Действие НЕОБРАТИМО — меняются реальные цены в учётной системе.
+      </div>
+      <button id="rp-apply" style="background:#b91c1c">Применить −10% в Bazon</button>
+    </div>
+  </div>
+
   <div style="color:var(--dim); font-size:12px; margin-top:6px">
     Цвета: <span class="badge c-RED">дефицит</span> Барнаул&lt;4 и Сибирь&lt;10 ·
     <span class="badge c-PURPLE">Сибирь&lt;10</span> · <span class="badge c-YELLOW">Барнаул&lt;4</span>
@@ -101,8 +122,9 @@
   <div style="max-height:60vh; overflow:auto">
     <table>
       <thead><tr>
-        <th>#</th><th>OEM</th><th>Запчасть</th><th>Барнаул</th><th>Сибирь</th>
-        <th>Статус</th><th>Моё объявление</th>
+        <th>#</th><th>Номер товара</th><th>OEM</th><th>Запчасть</th><th>Авто</th><th>Цена, ₽</th>
+        <th>Создан</th><th>Изменено в</th><th>Барнаул</th><th>Сибирь</th>
+        <th>Статус</th><th>Моё объявление</th><th>Переоценка</th>
       </tr></thead>
       <tbody id="b-tbody"></tbody>
     </table>
@@ -193,38 +215,208 @@ $('s-btn').onclick = () => {
 };
 
 // ── Batch ──
-let bIndex = 0;
-$('b-btn').onclick = () => {
+// Каталог показываем сразу после выбора файла (как в десктоп-UI), результаты дописываем в те же строки.
+// Прогон живёт на сервере: перезагрузка страницы (и второй браузер) подхватывают состояние,
+// а пока анализ идёт, повторный запуск отбивает сам сервер (409).
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const dash = s => (s == null || s === '') ? '—' : esc(s);
+let lastDone = 0;        // строки 0..lastDone-1 уже окончательные — их повторно не запрашиваем
+let polling = null;
+
+function renderCatalog(items) {
+  const tb = $('b-tbody');
+  tb.innerHTML = '';
+  items.forEach((p, i) => {
+    const tr = document.createElement('tr');
+    tr.id = 'b-row-' + i;
+    const auto = [p.brand, p.model].filter(Boolean).join(' ');
+    tr.innerHTML =
+      `<td>${i + 1}</td><td>${dash(p.itemNumber)}</td><td>${esc(p.oem)}</td><td>${esc(p.partName)}</td>` +
+      `<td>${dash(auto)}</td><td>${dash(p.price)}</td><td>${dash(p.created)}</td><td>${dash(p.priceChanged)}</td>` +
+      `<td class="c-barnaul">—</td><td class="c-siberia">—</td>` +
+      `<td class="c-status" style="color:var(--dim)">Ожидает</td><td class="c-link"></td><td class="c-reprice">—</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+/** Дописывает результаты в уже отрисованные строки таблицы. */
+function applyRows(rows) {
+  (rows || []).forEach(p => {
+    const tr = $('b-row-' + p.index);
+    if (!tr) return;
+    const st = tr.querySelector('.c-status');
+    if (p.status === 'analyzing') {
+      st.textContent = 'Анализ' + (p.lane ? ' (' + p.lane + ')' : '') + '…';
+      st.style.color = 'var(--blue)';
+      return;
+    }
+    const r = p.result;
+    tr.className = r ? r.color : '';
+    tr.querySelector('.c-barnaul').textContent = r ? r.barnaulCount : '—';
+    tr.querySelector('.c-siberia').textContent = (r && r.searchedSiberia) ? r.siberiaCount : '—';
+    st.style.color = '';
+    st.innerHTML = p.status === 'error'
+      ? `<span style="color:var(--red)">Ошибка: ${esc(p.error)}</span>`
+      : `<span class="badge c-${r ? r.color : 'NONE'}">${esc(r && r.status)}</span>`;
+    tr.querySelector('.c-link').innerHTML = r ? linkHtml(r.myListingUrl) : '';
+    tr.querySelector('.c-reprice').textContent = r ? (r.reprice ? 'да' : 'нет') : '—';
+  });
+}
+
+/** Пока идёт прогон — ввод и запуск заблокированы, доступен только «Стоп». */
+function setRunning(on) {
+  $('b-btn').disabled = on || $('b-tbody').children.length === 0;
+  $('b-stop').disabled = !on;
+  ['b-file', 'b-profile', 'b-company', 'b-limit'].forEach(id => $(id).disabled = on);
+}
+
+function applyState(st, withItems) {
+  if (withItems && st.items) renderCatalog(st.items);
+  applyRows(st.rows);
+  lastDone = st.syncFrom != null ? st.syncFrom : (st.done || 0);
+  const running = st.status === 'running';
+  setRunning(running);
+  // отчёт и переоценка доступны, когда прогон закончен (или остановлен) и есть что выгружать
+  const finished = !running && st.done > 0;
+  $('b-report').style.display  = finished ? '' : 'none';
+  $('b-reprice').style.display = finished ? '' : 'none';
+  if (!finished) { $('rp-panel').style.display = 'none'; rpToken = null; }
+
+  const counts = `${st.done} / ${st.total}`;
+  if (st.status === 'idle')          $('b-status').textContent = 'Выберите файл каталога (CSV/XLSX)';
+  else if (st.status === 'loaded')   $('b-status').textContent = `Загружено из файла (старше 6 мес): ${st.catalogSize}`;
+  else if (running)                  $('b-status').textContent = `Анализ: ${counts} (дорожек: ${st.lanes})`;
+  else if (st.status === 'done')     $('b-status').textContent = `Готово (${counts})`;
+  else if (st.status === 'stopped')  $('b-status').textContent = `Остановлено (${counts})`;
+  else if (st.status === 'error')    $('b-status').textContent = `Ошибка: ${st.error || ''} (${counts})`;
+
+  if (running) startPolling(); else stopPolling();
+}
+
+/** Состояние с сервера: withItems=true — вместе с каталогом (при загрузке страницы и после выбора файла). */
+async function refresh(withItems) {
+  const r = await fetch('/api/v1/batch/state?since=' + (withItems ? 0 : lastDone));
+  applyState(await r.json(), withItems);
+}
+
+function startPolling() { if (!polling) polling = setInterval(() => refresh(false).catch(() => {}), 2000); }
+function stopPolling()  { if (polling) { clearInterval(polling); polling = null; } }
+
+async function loadCatalogPreview() {
   const f = $('b-file').files[0];
-  if (!f) { $('b-status').textContent = 'Выберите CSV-файл'; return; }
+  if (!f) return;
+  const fd = new FormData();
+  fd.append('file', f);
+  fd.append('profile', $('b-profile').value);
+  $('b-status').textContent = 'Чтение файла…';
+  try {
+    const r = await fetch('/api/v1/catalog/preview', { method:'POST', body: fd });
+    const j = await r.json();
+    if (r.status === 409) { applyState(j, true); $('b-status').textContent = j.error; return; }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    applyState(j, true);
+  } catch (e) {
+    $('b-status').textContent = 'Ошибка чтения файла: ' + e;
+  }
+}
+
+$('b-file').onchange = loadCatalogPreview;
+$('b-profile').onchange = () => { if ($('b-file').files[0]) loadCatalogPreview(); };
+
+$('b-btn').onclick = async () => {
+  const f = $('b-file').files[0];
+  if (!f) { $('b-status').textContent = 'Выберите файл каталога (CSV/XLSX)'; return; }
+  setRunning(true);
+  $('b-status').textContent = 'Запуск…';
   const fd = new FormData();
   fd.append('file', f);
   fd.append('company', $('b-company').value.trim());
   fd.append('limit', $('b-limit').value || '0');
   fd.append('profile', $('b-profile').value);
-  $('b-btn').disabled = true; $('b-tbody').innerHTML = ''; bIndex = 0;
-  $('b-status').textContent = 'Запуск…';
-  let total = 0, done = 0;
-  sse('/api/v1/batch/stream', fd, {
-    total: d => { total = +d; $('b-status').textContent = `0 / ${total}`; },
-    row: d => {
-      const p = JSON.parse(d);
-      const r = p.result;
-      const tr = document.createElement('tr');
-      if (r) tr.className = r.color;
-      const color = r ? r.color : 'NONE';
-      tr.innerHTML = `<td>${++bIndex}</td><td>${p.oem||''}</td><td>${p.partName||''}</td>` +
-        `<td>${r ? r.barnaulCount : '—'}</td>` +
-        `<td>${r && r.searchedSiberia ? r.siberiaCount : '—'}</td>` +
-        `<td>${p.status==='error' ? 'Ошибка' : `<span class="badge c-${color}">${(r&&r.status)||''}</span>`}</td>` +
-        `<td>${r ? linkHtml(r.myListingUrl) : ''}</td>`;
-      $('b-tbody').appendChild(tr);
-      done++; $('b-status').textContent = `${done} / ${total}`;
-    },
-    error: d => { $('b-status').textContent = 'Ошибка: ' + d; $('b-btn').disabled = false; },
-    done: d => { $('b-status').textContent = `Готово (${done} / ${total})`; $('b-btn').disabled = false; }
-  }).catch(e => { $('b-status').textContent = 'Ошибка: ' + e; $('b-btn').disabled = false; });
+  try {
+    const r = await fetch('/api/v1/batch/start', { method:'POST', body: fd });
+    const j = await r.json();
+    applyState(j, true);
+    if (r.status === 409) $('b-status').textContent = j.error;
+  } catch (e) {
+    $('b-status').textContent = 'Ошибка: ' + e;
+    setRunning(false);
+  }
 };
+
+$('b-stop').onclick = async () => {
+  $('b-stop').disabled = true;
+  $('b-status').textContent = 'Останавливаем (текущая деталь дойдёт до конца)…';
+  try { applyState(await (await fetch('/api/v1/batch/stop', { method:'POST' })).json(), false); }
+  catch (e) { $('b-status').textContent = 'Ошибка: ' + e; }
+};
+
+$('b-report').onclick = () => { window.location = '/api/v1/batch/report'; };
+
+// ── Переоценка −10% в Bazon (как кнопка в десктопе) ──
+let rpToken = null;
+
+$('b-reprice').onclick = () => {
+  $('rp-panel').style.display = '';
+  $('rp-summary').innerHTML = '';
+  $('rp-confirm').style.display = 'none';
+  rpToken = null;
+};
+$('rp-close').onclick = () => { $('rp-panel').style.display = 'none'; rpToken = null; };
+
+$('rp-calc').onclick = async () => {
+  $('rp-calc').disabled = true;
+  $('rp-confirm').style.display = 'none';
+  $('rp-summary').textContent = 'Считаем…';
+  try {
+    const r = await fetch('/api/v1/reprice/preview?limit=' + ($('rp-limit').value || '0'), { method:'POST' });
+    const j = await r.json();
+    if (!r.ok || j.error) { $('rp-summary').innerHTML = `<span style="color:var(--red)">${esc(j.error || 'HTTP ' + r.status)}</span>`; return; }
+    rpToken = j.token;
+    const sample = (j.rows || []).slice(0, 10).map(p =>
+      `<tr><td>${p.id}</td><td>${esc(p.oem)}</td><td>${p.oldPrice}</td><td>${p.newPrice}</td><td>${esc(p.note)}</td></tr>`).join('');
+    $('rp-summary').innerHTML =
+      (j.testMode ? `<b>ТЕСТ: первые ${j.selected} из ${j.candidates}.</b><br>` : '') +
+      `Кандидатов («Переоценка=true»): <b>${j.candidates}</b> · будет изменено: <b>${j.willChange}</b>` +
+      (j.skipped ? ` · пропущено (нет цены/не ниже): ${j.skipped}` : '') +
+      `<br>Превью: <code>${esc(j.previewFile)}</code> — ` +
+      `<a href="/api/v1/reprice/preview.csv" download>скачать CSV</a>` +
+      `<div style="max-height:220px; overflow:auto; margin-top:8px"><table>` +
+      `<thead><tr><th>id</th><th>OEM</th><th>было</th><th>станет</th><th>примечание</th></tr></thead>` +
+      `<tbody>${sample}</tbody></table>` +
+      (j.rows.length > 10 ? `<div style="color:var(--dim); font-size:12px">…и ещё ${j.rows.length - 10} — полный список в превью-файле</div>` : '') +
+      `</div>`;
+    if (j.willChange > 0) $('rp-confirm').style.display = '';
+  } catch (e) {
+    $('rp-summary').innerHTML = `<span style="color:var(--red)">Ошибка: ${esc(e)}</span>`;
+  } finally {
+    $('rp-calc').disabled = false;
+  }
+};
+
+$('rp-apply').onclick = async () => {
+  if (!rpToken) return;
+  $('rp-apply').disabled = true;
+  $('rp-summary').textContent = 'Пишем цены в Bazon…';
+  try {
+    const r = await fetch('/api/v1/reprice/apply?token=' + encodeURIComponent(rpToken), { method:'POST' });
+    const j = await r.json();
+    rpToken = null;
+    $('rp-confirm').style.display = 'none';
+    $('rp-summary').innerHTML = r.ok && !j.error
+      ? `Готово: изменено <b>${j.changed}</b>, ошибок <b>${j.errors}</b>.` +
+        `<br>Отчёт: <code>${esc(j.appliedFile)}</code> — ` +
+        `<a href="/api/v1/reprice/applied.csv" download>скачать CSV</a>`
+      : `<span style="color:var(--red)">${esc(j.error || 'HTTP ' + r.status)}</span>`;
+  } catch (e) {
+    $('rp-summary').innerHTML = `<span style="color:var(--red)">Ошибка: ${esc(e)}</span>`;
+  } finally {
+    $('rp-apply').disabled = false;
+  }
+};
+
+// Восстановление после перезагрузки страницы: каталог и прогресс берём с сервера
+refresh(true).catch(() => {});
 </script>
 </body>
 </html>

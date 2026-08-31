@@ -9,6 +9,8 @@ import jakarta.annotation.PreDestroy;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -28,8 +30,13 @@ public class TunnelService {
     @Getter
     private String localUrl;
 
-    private Process tunnelProcess;
+    private volatile Process tunnelProcess;
     private final CountDownLatch urlReady = new CountDownLatch(1);
+
+    /** Сколько ждём URL от одного провайдера, прежде чем перейти к следующему. */
+    private static final long PROVIDER_WAIT_MS = 25_000;
+    /** Общее ожидание URL для потребителей (3 провайдера × PROVIDER_WAIT_MS + запас). */
+    private static final long TOTAL_WAIT_MS = 90_000;
 
     // Порядок попыток: serveo → localhost.run → cloudflared
     private static final List<TunnelProvider> PROVIDERS = List.of(
@@ -71,13 +78,20 @@ public class TunnelService {
         }
         log.info("Локальный адрес (сеть): {}", localUrl);
 
-        for (TunnelProvider provider : PROVIDERS) {
-            if (tryProvider(provider)) return;
-        }
-        log.warn("Ни один туннель не запустился. Доступен только локальный адрес: {}", localUrl);
-        urlReady.countDown();
+        // Перебор провайдеров — в фоне: каждый ждёт URL до PROVIDER_WAIT_MS,
+        // старт приложения и открытие окна на это не завязываем.
+        Thread starter = new Thread(() -> {
+            for (TunnelProvider provider : PROVIDERS) {
+                if (tryProvider(provider)) return;
+            }
+            log.warn("Ни один туннель не запустился. Доступен только локальный адрес: {}", localUrl);
+            urlReady.countDown();
+        }, "tunnel-starter");
+        starter.setDaemon(true);
+        starter.start();
     }
 
+    /** @return true, если провайдер выдал публичный URL. */
     private boolean tryProvider(TunnelProvider provider) {
         List<String> cmd = provider.cmdTemplate().stream()
                 .map(s -> s.replace("{port}", String.valueOf(port)))
@@ -94,14 +108,19 @@ public class TunnelService {
 
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
-            tunnelProcess = pb.start();
+            Process proc = pb.start();
+            tunnelProcess = proc;
 
-            CountDownLatch started = new CountDownLatch(1);
+            // Последние строки вывода — чтобы показать причину, если URL не пришёл
+            List<String> tail = Collections.synchronizedList(new ArrayList<>());
+            CountDownLatch gotUrl = new CountDownLatch(1);
             Thread reader = new Thread(() -> {
-                try (BufferedReader br = new BufferedReader(new InputStreamReader(tunnelProcess.getInputStream()))) {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
                     String line;
                     while ((line = br.readLine()) != null) {
-                        log.trace("[{}] {}", provider.name(), line);
+                        log.debug("[{}] {}", provider.name(), line);
+                        tail.add(line);
+                        if (tail.size() > 10) tail.remove(0);
                         if (publicUrl == null) {
                             Matcher m = provider.urlPattern().matcher(line);
                             if (m.find()) {
@@ -110,29 +129,38 @@ public class TunnelService {
                                 log.info("╔════════════════════════════════════════════════════════╗");
                                 log.info("║  Публичный адрес: {}  ║", publicUrl);
                                 log.info("╚════════════════════════════════════════════════════════╝");
+                                gotUrl.countDown();
                                 urlReady.countDown();
                             }
                         }
                     }
                 } catch (Exception ignored) {}
-                started.countDown();
-                urlReady.countDown();
+                gotUrl.countDown();   // поток вывода закрылся — процесс умер, ждать нечего
             }, provider.name() + "-reader");
             reader.setDaemon(true);
             reader.start();
 
             log.info("{} запущен, ожидаем публичный URL...", provider.name());
-            return true;
+            gotUrl.await(PROVIDER_WAIT_MS, TimeUnit.MILLISECONDS);
+            if (publicUrl != null) return true;
+
+            // URL не пришёл (провайдер лёг / ssh отвалился) — гасим и пробуем следующий
+            log.warn("{}: публичный URL не получен за {} с, пробуем следующий туннель. Вывод: {}",
+                    provider.name(), PROVIDER_WAIT_MS / 1000,
+                    tail.isEmpty() ? "(пусто)" : String.join(" | ", tail));
+            proc.destroy();
+            if (!proc.waitFor(5, TimeUnit.SECONDS)) proc.destroyForcibly();
+            return false;
 
         } catch (Exception e) {
-            log.debug("{} недоступен: {}", provider.name(), e.getMessage());
+            log.warn("{} недоступен: {}", provider.name(), e.getMessage());
             return false;
         }
     }
 
     public String waitForPublicUrl() {
         try {
-            urlReady.await(40, TimeUnit.SECONDS);
+            urlReady.await(TOTAL_WAIT_MS, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

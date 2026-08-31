@@ -173,7 +173,23 @@
       "Bash(awk '/parseCsvFile/{f=1} f{print NR\": \"$0} f&&/^    }/{c++; if\\(c>=1 && /return/\\) {}} f&&/return rows|return result|return list/{}' src/main/java/ru/retail/service/ui/MainWindow.java)",
       "Bash(sed -n '317,450p' service/AIPriceAdvisor.java)",
       "Bash(sed -n '843,895p' service/AIPriceAdvisor.java)",
-      "Bash(iconv -f WINDOWS-1251 -t UTF-8 \"catalog_05-07-26_20-43.csv\")"
+      "Bash(iconv -f WINDOWS-1251 -t UTF-8 \"catalog_05-07-26_20-43.csv\")",
+      "Bash(ssh -V)",
+      "Bash(timeout 25 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -R 80:localhost:8081 serveo.net)",
+      "Bash(echo \"---exit:$?\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(ps -eo pid,ppid,etime,command)",
+      "Bash(grep -iE \"\\\\.csv$|\\\\.xlsx$\")",
+      "Bash(\"/Applications/IntelliJ IDEA.app/Contents/plugins/maven/lib/maven3/bin/mvn\" -q -o dependency:build-classpath -Dmdep.outputFile=/private/tmp/claude-501/-Users-vladislav-IdeaProjects-app-drom-price-parser/29e6badf-870d-44a7-aa62-fda32b869ed8/scratchpad/cp.txt)",
+      "Bash(node --check /private/tmp/claude-501/-Users-vladislav-IdeaProjects-app-drom-price-parser/29e6badf-870d-44a7-aa62-fda32b869ed8/scratchpad/page.js)",
+      "Read(//System/Volumes/Preboot/Cryptexes/OS/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/**)",
+      "Bash(/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc /private/tmp/claude-501/-Users-vladislav-IdeaProjects-app-drom-price-parser/29e6badf-870d-44a7-aa62-fda32b869ed8/scratchpad/page.js)",
+      "Bash(pkill -f \"mock.py\")",
+      "Bash(git -C /Users/vladislav/IdeaProjects/app-drom-price-parser status --short)",
+      "Bash(/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc page.js)",
+      "Bash(awk -F/ '{print $1}')",
+      "Bash(echo \"COMPILE_EXIT=$?\")",
+      "Bash(git status *)"
     ]
   }
 }

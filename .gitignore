@@ -42,3 +42,17 @@ dist-windows/
 .build-cache/
 # Bazon access/refresh токены (секрет, локально)
 bazon-token.json
+
+### Рабочие файлы прогона (генерируются приложением, в историю не нужны) ###
+# Сессии drom: куки привязаны к конкретному мобильному IP, при смене прокси протухают
+drom-session*.json
+# Отчёты переоценки и анализа
+reprice-preview_*.csv
+reprice-applied_*.csv
+availability-report_*.xlsx
+# Логи и отладочные снимки
+app.log
+app-err.log
+debug.png
+# Сохранённые страницы drom в корне (руками, для разбора вёрстки)
+/*.html

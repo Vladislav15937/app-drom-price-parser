@@ -44,16 +44,35 @@ public final class CatalogLoader {
     private static final DateTimeFormatter DT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter D  = DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
+    /** Сколько ждать после НАШЕЙ автопереоценки, прежде чем позиция снова попадёт в отчёт. */
+    private static final int OWN_REPRICE_COOLDOWN_MONTHS = 1;
+
     public static List<CatalogItem> loadOlderThan6Months(File file, String keyword, List<String> stopWords) throws Exception {
-        return loadOlderThan6Months(Files.readAllBytes(file.toPath()), keyword, stopWords);
+        return loadOlderThan6Months(Files.readAllBytes(file.toPath()), keyword, stopWords, null);
+    }
+
+    public static List<CatalogItem> loadOlderThan6Months(File file, String keyword, List<String> stopWords,
+                                                         String apiUser) throws Exception {
+        return loadOlderThan6Months(Files.readAllBytes(file.toPath()), keyword, stopWords, apiUser);
+    }
+
+    public static List<CatalogItem> loadOlderThan6Months(byte[] bytes, String keyword, List<String> stopWords) {
+        return loadOlderThan6Months(bytes, keyword, stopWords, null);
     }
 
     /**
      * Разбирает CSV/XLSX и оставляет только позиции целевого типа (название содержит {@code keyword}
      * и НЕ содержит ни одного из {@code stopWords}), у которых «Создан» старше 6 месяцев.
      * Нераспарсенные даты и нецелевые строки пропускаются (с логом статистики).
+     *
+     * @param apiUser логин API-пользователя Bazon ({@code bazon.login}), которым парсер пишет цены.
+     *                Позиция, чью цену последним менял ОН сам и уже больше
+     *                {@link #OWN_REPRICE_COOLDOWN_MONTHS} мес назад, снова идёт в переоценку: ждать
+     *                полные 6 месяцев после нашего же −10% незачем. Чужие (людские) правки цены
+     *                по-прежнему держат позицию вне отчёта 6 месяцев. {@code null} → правило выключено.
      */
-    public static List<CatalogItem> loadOlderThan6Months(byte[] bytes, String keyword, List<String> stopWords) {
+    public static List<CatalogItem> loadOlderThan6Months(byte[] bytes, String keyword, List<String> stopWords,
+                                                         String apiUser) {
         String kw = keyword == null ? "" : keyword.toLowerCase();
         List<String> stops = stopWords == null ? List.of() : stopWords;
         List<String[]> rows = looksLikeXlsx(bytes) ? parseXlsx(bytes) : parseCsv(bytes);
@@ -73,6 +92,7 @@ public final class CatalogLoader {
         int iFree    = col(h, "Ткацкая (свободно)");
         int iItem    = col(h, "Номер товара");        // внутренний id Bazon
         int iPriceCh = col(h, "Цена изменена в");     // дата последней смены цены — берём только «застоявшиеся» (>6 мес)
+        int iPriceBy = col(h, "Кто изменил цену");    // автор последней смены цены: наш api-пользователь или человек
 
         if (iCreated < 0 || iOem < 0) {
             log.error("Каталог: не найдены обязательные колонки «Создан»/«Номер производителя». Шапка: {}", h.keySet());
@@ -80,8 +100,12 @@ public final class CatalogLoader {
         }
 
         LocalDateTime threshold = LocalDateTime.now().minusMonths(6);
+        // Порог для позиций, чью цену последним менял САМ парсер: после нашего −10% ждём не 6 мес, а месяц.
+        LocalDateTime ownThreshold = LocalDateTime.now().minusMonths(OWN_REPRICE_COOLDOWN_MONTHS);
+        String api = apiUser == null ? "" : apiUser.trim().toLowerCase();
         List<CatalogItem> out = new ArrayList<>();
         int skippedFresh = 0, skippedPart = 0, skippedDate = 0, skippedOem = 0, skippedState = 0, skippedStock = 0, skippedPriceFresh = 0;
+        int takenOwnReprice = 0;   // взято по «нашей» ветке: цену менял парсер больше месяца назад
 
         for (int r = 1; r < rows.size(); r++) {
             String[] row = rows.get(r);
@@ -102,8 +126,15 @@ public final class CatalogLoader {
 
             // Цену не меняли > 6 мес (застоялась). Если колонка есть и дата свежее порога — пропуск.
             // Пустая/непарсимая «Цена изменена в» = цену не трогали → берём (это и есть застой).
+            // Исключение: последним цену менял САМ парсер (api-пользователь Bazon) — тогда порог месяц,
+            // чтобы наши же позиции возвращались в автопереоценку, не дожидаясь полугода.
             LocalDateTime priceChanged = iPriceCh >= 0 ? parseDate(get(row, iPriceCh)) : null;
-            if (iPriceCh >= 0 && priceChanged != null && !priceChanged.isBefore(threshold)) { skippedPriceFresh++; continue; }
+            boolean ownPriceEdit = !api.isEmpty() && iPriceBy >= 0
+                    && get(row, iPriceBy).toLowerCase().contains(api);
+            LocalDateTime priceLimit = ownPriceEdit ? ownThreshold : threshold;
+            if (iPriceCh >= 0 && priceChanged != null && !priceChanged.isBefore(priceLimit)) { skippedPriceFresh++; continue; }
+            if (ownPriceEdit && priceChanged != null && priceChanged.isBefore(ownThreshold)
+                    && !priceChanged.isBefore(threshold)) takenOwnReprice++;   // взято именно по «нашей» ветке
 
             out.add(new CatalogItem(
                     oem,
@@ -116,8 +147,10 @@ public final class CatalogLoader {
                     priceChanged));
         }
 
-        log.info("Каталог [{}]: отобрано {} (старше 6 мес). Пропущено: свежих {}, нецелевых {}, без даты {}, без OEM {}, не контракт {}, без свободного остатка {}, цена менялась <6мес {}.",
-                keyword, out.size(), skippedFresh, skippedPart, skippedDate, skippedOem, skippedState, skippedStock, skippedPriceFresh);
+        log.info("Каталог [{}]: отобрано {} (старше 6 мес; из них по нашей автопереоценке >{} мес назад: {}). "
+                        + "Пропущено: свежих {}, нецелевых {}, без даты {}, без OEM {}, не контракт {}, без свободного остатка {}, цена менялась <6мес {}.",
+                keyword, out.size(), OWN_REPRICE_COOLDOWN_MONTHS, takenOwnReprice,
+                skippedFresh, skippedPart, skippedDate, skippedOem, skippedState, skippedStock, skippedPriceFresh);
         return out;
     }
 

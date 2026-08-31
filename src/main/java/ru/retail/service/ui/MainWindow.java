@@ -105,6 +105,11 @@ public class MainWindow extends JFrame {
         return profiles == null ? null : profiles.byName((String) combo.getSelectedItem());
     }
 
+    /** Логин API-пользователя Bazon — его правки цены считаются «нашей» автопереоценкой. */
+    private String apiUser() {
+        return bazonClient == null ? null : bazonClient.login();
+    }
+
     // ═══════════════════════════════════════════════════════
     // BUILD
     // ═══════════════════════════════════════════════════════
@@ -566,7 +571,8 @@ public class MainWindow extends JFrame {
             AnalysisProfiles.Profile pr = prof(profileCombo);
             String kw = pr == null ? "" : pr.getKeyword();
             List<String> stops = pr == null ? List.of() : pr.getStopWords();
-            populateCatalog(CatalogLoader.loadOlderThan6Months(file, kw, stops), "файла");
+            // apiUser — чтобы позиции, которым цену менял сам парсер >1 мес назад, снова шли в переоценку
+            populateCatalog(CatalogLoader.loadOlderThan6Months(file, kw, stops, apiUser()), "файла");
         } catch (Exception ex) {
             batchStatusLabel.setText("Ошибка чтения файла: " + ex.getMessage());
             batchStatusLabel.setForeground(RED);
