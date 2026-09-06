@@ -96,6 +96,13 @@ public class ExcelReport {
     /** Добавляет строку по одной детали и сразу сохраняет файл. Потокобезопасно (вызов из потока анализа). */
     public synchronized void append(String oem, String itemNumber, String partName, String auto,
                                     BigDecimal price, String created, String priceChanged, AvailabilityResult r) {
+        append(oem, itemNumber, partName, auto, price, created, priceChanged, r, null);
+    }
+
+    /** {@code rowPartType} — тип детали этой строки; null → общий тип отчёта (прогон одной категории). */
+    public synchronized void append(String oem, String itemNumber, String partName, String auto,
+                                    BigDecimal price, String created, String priceChanged,
+                                    AvailabilityResult r, String rowPartType) {
         CellStyle style = styleFor(r);
 
         Row row = sheet.createRow(rowNum++);
@@ -103,7 +110,7 @@ public class ExcelReport {
         set(row, col++, ++dataCount, style);
         setItemNumber(row, col++, itemNumber, style);   // кликабельно, если задан шаблон ссылки на Bazon
         set(row, col++, oem, style);
-        set(row, col++, partType, style);
+        set(row, col++, rowPartType == null || rowPartType.isBlank() ? partType : rowPartType, style);
         set(row, col++, partName, style);
         set(row, col++, auto, style);
         set(row, col++, price != null && price.signum() > 0 ? price.toPlainString() : "", style);
