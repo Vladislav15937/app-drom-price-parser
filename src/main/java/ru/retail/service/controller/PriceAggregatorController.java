@@ -679,6 +679,8 @@ public class PriceAggregatorController {
         m.put("model", it.model());
         m.put("price", it.price() == null ? "" : it.price().toPlainString());
         m.put("created", it.created() == null ? "" : it.created().format(DATE));
+        m.put("ageMonths", it.created() == null ? ""
+                : java.time.temporal.ChronoUnit.MONTHS.between(it.created().toLocalDate(), java.time.LocalDate.now()));
         m.put("priceChanged", it.priceChanged() == null ? "" : it.priceChanged().format(DATE));
         return m;
     }

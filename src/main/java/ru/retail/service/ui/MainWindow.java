@@ -390,7 +390,7 @@ public class MainWindow extends JFrame {
     }
 
     private JScrollPane buildBatchTableScrollPane() {
-        String[] cols = {"Номер товара", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан", "Изменено в", "Барнаул", "Сибирь", "Статус", "Переоценка"};
+        String[] cols = {"Номер товара", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан", "Возраст, мес", "Изменено в", "Барнаул", "Сибирь", "Статус", "Переоценка"};
         batchModel = new DefaultTableModel(cols, 0) {
             @Override public boolean isCellEditable(int r, int c) { return false; }
         };
@@ -401,7 +401,7 @@ public class MainWindow extends JFrame {
         batchTable.getTableHeader().setReorderingAllowed(false);
         batchTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
 
-        int[] widths = {100, 120, 340, 200, 90, 100, 100, 80, 80, 320, 90};
+        int[] widths = {100, 120, 340, 200, 90, 100, 90, 100, 80, 80, 320, 90};
         for (int i = 0; i < widths.length; i++)
             batchTable.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
 
@@ -618,6 +618,7 @@ public class MainWindow extends JFrame {
                     it.itemNumber(), it.oem(), it.name(), auto(it),
                     it.price() != null && it.price().signum() > 0 ? it.price().toPlainString() : "—",
                     it.created().format(D),
+                    java.time.temporal.ChronoUnit.MONTHS.between(it.created().toLocalDate(), java.time.LocalDate.now()),
                     it.priceChanged() != null ? it.priceChanged().format(D) : "—",
                     "—", "—", "Ожидает", "—"
             });
@@ -657,10 +658,10 @@ public class MainWindow extends JFrame {
         analyzeBtn.setEnabled(false);
 
         for (int i = 0; i < batchModel.getRowCount(); i++) {
-            batchModel.setValueAt("—", i, 7);
             batchModel.setValueAt("—", i, 8);
-            batchModel.setValueAt("Ожидает", i, 9);
-            batchModel.setValueAt("—", i, 10);
+            batchModel.setValueAt("—", i, 9);
+            batchModel.setValueAt("Ожидает", i, 10);
+            batchModel.setValueAt("—", i, 11);
         }
         batchResults = new ArrayList<>(Collections.nCopies(catalogItems.size(), null));
         setBatchLink(null);
@@ -703,7 +704,7 @@ public class MainWindow extends JFrame {
 
                         final CatalogLoader.CatalogItem it = catalogItems.get(idx);
                         final int rowIdx = idx;
-                        SwingUtilities.invokeLater(() -> batchModel.setValueAt("Анализ (L" + laneId + ")...", rowIdx, 9));
+                        SwingUtilities.invokeLater(() -> batchModel.setValueAt("Анализ (L" + laneId + ")...", rowIdx, 10));
 
                         try {
                             AvailabilityResult res = priceAnalyzer.analyzeCatalogLane(
@@ -714,10 +715,10 @@ public class MainWindow extends JFrame {
                             final int d = done.incrementAndGet();
                             SwingUtilities.invokeLater(() -> {
                                 batchResults.set(rowIdx, res);
-                                batchModel.setValueAt(res.getBarnaulCount(), rowIdx, 7);
-                                batchModel.setValueAt(res.isSearchedSiberia() ? res.getSiberiaCount() : "—", rowIdx, 8);
-                                batchModel.setValueAt(shortStatus(res.getColor()), rowIdx, 9);
-                                batchModel.setValueAt(res.isReprice(), rowIdx, 10);
+                                batchModel.setValueAt(res.getBarnaulCount(), rowIdx, 8);
+                                batchModel.setValueAt(res.isSearchedSiberia() ? res.getSiberiaCount() : "—", rowIdx, 9);
+                                batchModel.setValueAt(shortStatus(res.getColor()), rowIdx, 10);
+                                batchModel.setValueAt(res.isReprice(), rowIdx, 11);
                                 batchStatusLabel.setText("Готово " + d + " / " + total + " (дорожек: " + lanes + ")");
                                 batchStatusLabel.setForeground(BLUE);
                                 batchTable.repaint();
@@ -725,7 +726,7 @@ public class MainWindow extends JFrame {
                         } catch (Exception ex) {
                             if (report != null) report.append(it.oem(), it.itemNumber(), it.name(), auto(it), it.price(),
                                     it.created().format(D), it.priceChanged() != null ? it.priceChanged().format(D) : "", null);
-                            SwingUtilities.invokeLater(() -> batchModel.setValueAt("Ошибка", rowIdx, 9));
+                            SwingUtilities.invokeLater(() -> batchModel.setValueAt("Ошибка", rowIdx, 10));
                         }
                     }
                 });

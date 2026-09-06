@@ -23,8 +23,8 @@ import java.nio.file.Path;
 public class ExcelReport {
 
     private static final String[] HEADERS = {
-            "№", "Номер товара", "OEM", "Тип детали", "Запчасть", "Авто", "Цена, ₽", "Создан", "Изменено в",
-            "Барнаул, конк.", "Сибирь, конк.", "Ссылка на моё объявление", "Статус", "Переоценка"
+            "№", "Номер товара", "OEM", "Тип детали", "Запчасть", "Авто", "Цена, ₽", "Создан", "Возраст, мес",
+            "Изменено в", "Барнаул, конк.", "Сибирь, конк.", "Ссылка на моё объявление", "Статус", "Переоценка"
     };
 
     /** Имя профиля (тип детали) — одно на весь отчёт, пишется в каждую строку для сводных таблиц. */
@@ -59,7 +59,7 @@ public class ExcelReport {
         purpleStyle = base(0xE9D5FF, 0x6B21A8, false);   // мало по Сибири (<10)
         redStyle    = base(0xFFC7CE, 0x9C0006, false);   // дефицит: Барнаул<4 и Сибирь<10
 
-        int[] widths = {1500, 3600, 5200, 7000, 14000, 9000, 3400, 5000, 5000, 3600, 3600, 16000, 14000, 3600};
+        int[] widths = {1500, 3600, 5200, 7000, 14000, 9000, 3400, 5000, 3000, 5000, 3600, 3600, 16000, 14000, 3600};
         for (int i = 0; i < widths.length; i++) sheet.setColumnWidth(i, widths[i]);
         sheet.createFreezePane(0, 1);
 
@@ -115,6 +115,8 @@ public class ExcelReport {
         set(row, col++, auto, style);
         set(row, col++, price != null && price.signum() > 0 ? price.toPlainString() : "", style);
         set(row, col++, created == null ? "" : created, style);
+        Integer age = ageMonths(created);
+        set(row, col++, age == null ? "" : (Object) age, style);
         set(row, col++, priceChanged == null ? "" : priceChanged, style);
         set(row, col++, r == null ? "" : String.valueOf(r.getBarnaulCount()), style);
         set(row, col++, r == null || !r.isSearchedSiberia() ? "" : String.valueOf(r.getSiberiaCount()), style);
@@ -199,6 +201,22 @@ public class ExcelReport {
                 + (partType.isBlank() ? "" : "; тип детали: " + partType));
         c.setCellStyle(headerStyle);
         sheet.addMergedRegion(new org.apache.poi.ss.util.CellRangeAddress(row.getRowNum(), row.getRowNum(), 0, HEADERS.length - 1));
+    }
+
+    /**
+     * Возраст позиции в месяцах — сколько она лежит с момента поступления («Создан»).
+     * Заказчик разделяет «дефицит» и «нет спроса»: деталь без продаж год при пустом рынке —
+     * это не то же самое, что свежая позиция. Формат даты — тот же dd.MM.yyyy, что и в колонке.
+     */
+    private static Integer ageMonths(String created) {
+        if (created == null || created.isBlank()) return null;
+        try {
+            java.time.LocalDate d = java.time.LocalDate.parse(created.trim(),
+                    java.time.format.DateTimeFormatter.ofPattern("dd.MM.yyyy"));
+            return (int) java.time.temporal.ChronoUnit.MONTHS.between(d, java.time.LocalDate.now());
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private static String nz(String s) { return s == null ? "" : s; }
