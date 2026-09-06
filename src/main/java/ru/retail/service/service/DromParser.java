@@ -1321,7 +1321,10 @@ public class DromParser {
     private String buildSearchUrl(String oem, String region, boolean used) {
         String url = "https://baza.drom.ru/" + region + "/sell_spare_parts/?";
         if (used) url += "condition%5B%5D=used&";
-        url += "goodPresentState%5B%5D=present&query=" + oem;
+        // Запрос кодируем: в режиме применимости это не OEM, а «деталь марка модель» —
+        // с пробелами и кириллицей, которые в сыром виде в URL попадать не должны.
+        url += "goodPresentState%5B%5D=present&query="
+                + java.net.URLEncoder.encode(oem, java.nio.charset.StandardCharsets.UTF_8);
         return url;
     }
 

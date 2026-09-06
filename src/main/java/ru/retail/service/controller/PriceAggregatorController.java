@@ -53,8 +53,18 @@ public class PriceAggregatorController {
     private int deepMaxPages;
 
     /** Опции скана из запроса. По умолчанию — прежнее поведение: одна страница, только б/у. */
-    private PriceAnalyzer.ScanOptions scanOptions(boolean deep, boolean includeNew) {
-        return new PriceAnalyzer.ScanOptions(deep ? Math.max(1, deepMaxPages) : 1, includeNew);
+    private PriceAnalyzer.ScanOptions scanOptions(boolean deep, boolean includeNew, boolean byApplicability) {
+        return new PriceAnalyzer.ScanOptions(deep ? Math.max(1, deepMaxPages) : 1, includeNew, byApplicability);
+    }
+
+    /**
+     * Поисковая строка для режима применимости: «тип детали + марка + модель» (напр. «бампер ford focus»).
+     * Пустая, если марки/модели нет — тогда позиция считается по OEM, как обычно.
+     */
+    private String applicabilityQuery(CatalogRow row) {
+        String kw = row.profile() == null ? "" : row.profile().getKeyword();
+        String auto = (str(row.item().brand()) + " " + str(row.item().model())).trim();
+        return auto.isBlank() ? "" : (kw + " " + auto).trim();
     }
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
@@ -159,7 +169,7 @@ public class PriceAggregatorController {
         executor.submit(() -> {
             try {
                 priceAnalyzer.resetBreakers();
-                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company, stops, scanOptions(deep, includeNew));
+                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company, stops, scanOptions(deep, includeNew, false));   // применимости нужна марка/модель — их в одиночном запросе нет
                 send(emitter, "result", objectMapper.writeValueAsString(result));
             } catch (Exception e) {
                 send(emitter, "error", e.getMessage() != null ? e.getMessage() : "Ошибка анализа");
@@ -189,7 +199,7 @@ public class PriceAggregatorController {
         executor.submit(() -> {
             jobs.put(jobId, new JobResult("running", null, null, now));
             try {
-                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company, stops, scanOptions(deep, includeNew));
+                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company, stops, scanOptions(deep, includeNew, false));
                 jobs.put(jobId, new JobResult("done", result, null, now));
             } catch (Exception e) {
                 jobs.put(jobId, new JobResult("error", null,
@@ -253,7 +263,8 @@ public class PriceAggregatorController {
             @RequestParam(required = false) String profile,
             @RequestParam(defaultValue = "false") boolean deep,
             @RequestParam(defaultValue = "false") boolean includeNew,
-            @RequestParam(defaultValue = "false") boolean dedupOem) throws IOException {
+            @RequestParam(defaultValue = "false") boolean dedupOem,
+            @RequestParam(defaultValue = "false") boolean byApplicability) throws IOException {
         List<AnalysisProfiles.Profile> prs = profilesOf(profile);
         byte[] bytes = file.getBytes();
 
@@ -268,7 +279,7 @@ public class PriceAggregatorController {
             BatchRun run = new BatchRun(rows, "running");
             run.profile = prs.stream().map(AnalysisProfiles.Profile::getName)
                     .collect(java.util.stream.Collectors.joining(", "));
-            run.scan = scanOptions(deep, includeNew);
+            run.scan = scanOptions(deep, includeNew, byApplicability);
             run.total = (limit > 0 && limit < items.size()) ? limit : items.size();
             batchRun = run;
             executor.submit(() -> runBatch(run, items, company));
@@ -561,7 +572,7 @@ public class PriceAggregatorController {
                         Map<String, Object> finished = new LinkedHashMap<>(row);
                         try {
                             finished.put("result", priceAnalyzer.analyzeCatalogLane(
-                                    it.oem(), it.price(), company, laneId, stops, run.scan));
+                                    it.oem(), applicabilityQuery(cr), it.price(), company, laneId, stops, run.scan));
                             finished.put("status", "done");
                         } catch (Exception e) {
                             finished.put("status", "error");
@@ -608,6 +619,7 @@ public class PriceAggregatorController {
         m.put("lanes", run.lanes);
         m.put("deep", run.scan.maxPages() > 1);
         m.put("includeNew", run.scan.includeNew());
+        m.put("byApplicability", run.scan.byApplicability());
         m.put("catalogSize", run.items.size());
         if (run.error != null) m.put("error", run.error);
         if (since <= 0) m.put("items", run.items);
