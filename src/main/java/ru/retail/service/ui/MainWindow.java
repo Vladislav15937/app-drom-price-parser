@@ -73,6 +73,7 @@ public class MainWindow extends JFrame {
     private JTextField csvPathField;
     private JTextField batchLimitField;
     private JCheckBox deepScanBox;        // точный подсчёт: листать все страницы выдачи
+    private JCheckBox includeNewBox;      // считать конкурентами и новые детали, не только б/у
     private JTextField companyField;
     private JButton batchAnalyzeBtn;
     private JButton batchStopBtn;
@@ -357,6 +358,11 @@ public class MainWindow extends JFrame {
         deepScanBox.setToolTipText("Листать все страницы выдачи, а не только первую (50 объявлений). "
                 + "Точнее на плотных категориях, но прогон дольше.");
         settingsRow.add(deepScanBox);
+        settingsRow.add(Box.createHorizontalStrut(12));
+        includeNewBox = new JCheckBox("С новыми");
+        includeNewBox.setToolTipText("Считать конкурентами не только б/у, но и новые детали — "
+                + "рынок целиком (при большом числе новых поднимать цену бессмысленно).");
+        settingsRow.add(includeNewBox);
         panel.add(settingsRow, fld);
 
         lbl.gridy = 2; panel.add(new JLabel(""), lbl);
@@ -673,7 +679,8 @@ public class MainWindow extends JFrame {
         try { limitVal = Integer.parseInt(batchLimitField.getText().trim()); } catch (Exception ignored) {}
         final int total = (limitVal > 0 && limitVal < catalogItems.size()) ? limitVal : catalogItems.size();
         final int lanes = Math.max(1, priceAnalyzer.laneCount());
-        final int maxPages = deepScanBox.isSelected() ? DEEP_MAX_PAGES : 1;
+        final PriceAnalyzer.ScanOptions scanOpts = new PriceAnalyzer.ScanOptions(
+                deepScanBox.isSelected() ? DEEP_MAX_PAGES : 1, includeNewBox.isSelected());
 
         priceAnalyzer.resetBreakers();
 
@@ -708,7 +715,7 @@ public class MainWindow extends JFrame {
 
                         try {
                             AvailabilityResult res = priceAnalyzer.analyzeCatalogLane(
-                                    it.oem(), it.price(), company, laneId, stops, maxPages);
+                                    it.oem(), it.price(), company, laneId, stops, scanOpts);
                             if (report != null)
                                 report.append(it.oem(), it.itemNumber(), it.name(), auto(it), it.price(),
                                         it.created().format(D), it.priceChanged() != null ? it.priceChanged().format(D) : "", res);
