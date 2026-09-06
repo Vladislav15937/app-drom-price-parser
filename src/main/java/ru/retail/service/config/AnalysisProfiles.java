@@ -27,6 +27,12 @@ public class AnalysisProfiles {
         private String keyword;                 // фильтр каталога из xlsx (колонка «Запчасть») и drom (query — не исп.)
         private List<String> stopWords = new ArrayList<>();
         private List<Integer> bazonPartnameIds = new ArrayList<>();  // фильтр каталога из Bazon (partname_id)
+        /**
+         * Приоритет типа, когда один OEM делится между несколькими деталями (пример заказчика:
+         * товар 73845 — номер общий у ступицы и цапфы, «главной» считается цапфа). Больше — важнее.
+         * Работает только при включённой опции «дубли OEM → приоритетный тип»; иначе не влияет ни на что.
+         */
+        private int priority = 0;
     }
 
     /**

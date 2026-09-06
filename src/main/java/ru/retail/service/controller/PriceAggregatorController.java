@@ -109,11 +109,12 @@ public class PriceAggregatorController {
     @PostMapping("/catalog/preview")
     public ResponseEntity<Map<String, Object>> catalogPreview(
             @RequestParam("file") MultipartFile file,
-            @RequestParam(required = false) String profile) throws IOException {
+            @RequestParam(required = false) String profile,
+            @RequestParam(defaultValue = "false") boolean dedupOem) throws IOException {
         byte[] bytes = file.getBytes();
         synchronized (batchLock) {
             if (batchRunning()) return conflict();
-            List<CatalogRow> items = loadCatalog(bytes, profilesOf(profile));
+            List<CatalogRow> items = loadCatalog(bytes, profilesOf(profile), dedupOem);
             List<Map<String, Object>> rows = new ArrayList<>();
             for (CatalogRow it : items) rows.add(itemFields(it));
             // Каталог кладём в состояние прогона — перезагрузка страницы покажет ту же таблицу
@@ -251,7 +252,8 @@ public class PriceAggregatorController {
             @RequestParam(defaultValue = "0") int limit,
             @RequestParam(required = false) String profile,
             @RequestParam(defaultValue = "false") boolean deep,
-            @RequestParam(defaultValue = "false") boolean includeNew) throws IOException {
+            @RequestParam(defaultValue = "false") boolean includeNew,
+            @RequestParam(defaultValue = "false") boolean dedupOem) throws IOException {
         List<AnalysisProfiles.Profile> prs = profilesOf(profile);
         byte[] bytes = file.getBytes();
 
@@ -259,7 +261,7 @@ public class PriceAggregatorController {
             if (batchRunning()) return conflict();
 
             // Каталог: только целевой тип (профиль) старше 6 мес по «Создан». Дедуп по OEM (один номер — один прогон).
-            List<CatalogRow> items = loadCatalog(bytes, prs);
+            List<CatalogRow> items = loadCatalog(bytes, prs, dedupOem);
             List<Map<String, Object>> rows = new ArrayList<>();
             for (CatalogRow it : items) rows.add(itemFields(it));
 
@@ -641,6 +643,17 @@ public class PriceAggregatorController {
      * одна деталь может подойти двум категориям, и считать её надо с их собственными стоп-словами.
      */
     private List<CatalogRow> loadCatalog(byte[] bytes, List<AnalysisProfiles.Profile> profiles) throws IOException {
+        return loadCatalog(bytes, profiles, false);
+    }
+
+    /**
+     * @param dedupAcrossProfiles одна деталь может подойти двум категориям (общий OEM у ступицы и
+     *        цапфы). Выключено — считаем её в каждой категории отдельно (поведение по умолчанию).
+     *        Включено — оставляем ОДНУ строку, из категории с большим {@code priority}; при равном
+     *        приоритете побеждает та, что выбрана раньше.
+     */
+    private List<CatalogRow> loadCatalog(byte[] bytes, List<AnalysisProfiles.Profile> profiles,
+                                         boolean dedupAcrossProfiles) throws IOException {
         List<CatalogRow> rows = new ArrayList<>();
         for (AnalysisProfiles.Profile pr : profiles) {
             String keyword = pr == null ? "" : pr.getKeyword();
@@ -654,7 +667,30 @@ public class PriceAggregatorController {
                 if (key.isBlank() || seen.add(key)) rows.add(new CatalogRow(it, pr));
             }
         }
-        return rows;
+        return dedupAcrossProfiles ? keepPriorityType(rows, profiles) : rows;
+    }
+
+    /** Из строк с одинаковым OEM оставляет одну — из типа с наибольшим приоритетом. */
+    private List<CatalogRow> keepPriorityType(List<CatalogRow> rows, List<AnalysisProfiles.Profile> order) {
+        Map<String, Integer> rank = new HashMap<>();          // порядок выбора — тай-брейк при равном приоритете
+        for (int i = 0; i < order.size(); i++) rank.put(order.get(i).getName(), i);
+        Map<String, CatalogRow> best = new LinkedHashMap<>();
+        for (CatalogRow r : rows) {
+            String key = r.item().oem().replaceAll("[^A-Za-z0-9]", "").toUpperCase();
+            CatalogRow cur = best.get(key);
+            if (cur == null || better(r, cur, rank)) best.put(key, r);
+        }
+        int dropped = rows.size() - best.size();
+        if (dropped > 0) log.info("Каталог: дубли OEM между типами схлопнуты, убрано строк: {}", dropped);
+        return new ArrayList<>(best.values());
+    }
+
+    private boolean better(CatalogRow a, CatalogRow b, Map<String, Integer> rank) {
+        int pa = a.profile() == null ? 0 : a.profile().getPriority();
+        int pb = b.profile() == null ? 0 : b.profile().getPriority();
+        if (pa != pb) return pa > pb;
+        return rank.getOrDefault(a.profile() == null ? "" : a.profile().getName(), 99)
+             < rank.getOrDefault(b.profile() == null ? "" : b.profile().getName(), 99);
     }
 
     /** Профили запроса: несколько имён через запятую в {@code profile} либо повторяющийся параметр. */
