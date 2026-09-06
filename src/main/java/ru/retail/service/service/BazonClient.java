@@ -44,6 +44,7 @@ public class BazonClient {
     private final String password;
     private final int storageId;
     private final String tokenFile;
+    private final String itemUrlTemplate;
 
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
     private final ObjectMapper mapper = new ObjectMapper();
@@ -69,17 +70,22 @@ public class BazonClient {
             @Value("${bazon.login}") String login,
             @Value("${bazon.password}") String password,
             @Value("${bazon.storage-id:1}") int storageId,
-            @Value("${bazon.token-file:bazon-token.json}") String tokenFile) {
+            @Value("${bazon.token-file:bazon-token.json}") String tokenFile,
+            @Value("${bazon.item-url-template:}") String itemUrlTemplate) {
         this.authUrl = trimSlash(authUrl);
         this.apiUrl = apiUrl.endsWith("/") ? apiUrl : apiUrl + "/";
         this.login = login;
         this.password = password;
         this.storageId = storageId;
         this.tokenFile = tokenFile;
+        this.itemUrlTemplate = itemUrlTemplate;
     }
 
     /** Логин API-пользователя: им подписаны все цены, изменённые парсером («Кто изменил цену» в экспорте). */
     public String login() { return login; }
+
+    /** Шаблон ссылки на карточку товара в Bazon ({@code {id}} → «Номер товара»); пусто — ссылок в отчёте нет. */
+    public String itemUrlTemplate() { return itemUrlTemplate; }
 
     // ==================== ПУБЛИЧНЫЙ МЕТОД ====================
 

@@ -212,6 +212,7 @@ public class PriceAggregatorController {
         volatile String error;
         volatile int total;          // сколько позиций прогоняем (с учётом лимита)
         volatile int lanes = 1;      // дорожек пула (= мобильных IP) в прогоне
+        volatile String profile = "";// тип детали прогона (идёт в отчёт отдельной колонкой)
 
         BatchRun(List<Map<String, Object>> items, String status) {
             this.items = items;
@@ -248,6 +249,7 @@ public class PriceAggregatorController {
             for (CatalogLoader.CatalogItem it : items) rows.add(itemFields(it));
 
             BatchRun run = new BatchRun(rows, "running");
+            run.profile = pr == null ? "" : pr.getName();
             run.total = (limit > 0 && limit < items.size()) ? limit : items.size();
             batchRun = run;
             executor.submit(() -> runBatch(run, items, company, stops));
@@ -279,7 +281,7 @@ public class PriceAggregatorController {
         Path tmp = Files.createTempFile("availability-report_", ".xlsx");
         byte[] bytes;
         try {
-            ExcelReport report = new ExcelReport(tmp);
+            ExcelReport report = new ExcelReport(tmp, run.profile, bazonClient.itemUrlTemplate());
             for (int i = 0; i < run.items.size(); i++) {
                 Map<String, Object> row = run.rows.get(i);
                 if (row == null || "analyzing".equals(row.get("status"))) continue;   // ещё не прогнали

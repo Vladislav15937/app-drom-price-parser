@@ -198,7 +198,8 @@
       "Bash(ssh -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ConnectTimeout=15 -R yard86:80:localhost:8081 serveo.net)",
       "Bash(command -v ngrok)",
       "Bash(ngrok version *)",
-      "Bash(git checkout *)"
+      "Bash(git checkout *)",
+      "Bash(/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc /private/tmp/claude-501/-Users-vladislav-IdeaProjects-app-drom-price-parser/1d170902-bedb-4137-bf16-38544d7e14ec/scratchpad/page3.js)"
     ]
   }
 }

@@ -63,7 +63,7 @@
   </div>
   <div class="row">
     <label>Тип детали:</label>
-    <select id="s-profile" style="min-width:140px"></select>
+    <input type="text" id="s-profile" list="profiles-list" style="width:260px" placeholder="начните вводить: суппорт, фара…" autocomplete="off">
     <label style="margin-left:16px">Компания на Drom:</label>
     <input type="text" id="s-company" value="YARD86" style="width:140px">
     <label style="margin-left:16px">Цена, ₽:</label>
@@ -89,7 +89,8 @@
   </div>
   <div class="row">
     <label>Тип детали:</label>
-    <select id="b-profile" style="min-width:140px"></select>
+    <input type="text" id="b-profile" list="profiles-list" style="width:260px" placeholder="начните вводить: суппорт, фара…" autocomplete="off">
+    <datalist id="profiles-list"></datalist>
     <label style="margin-left:16px">Компания на Drom:</label>
     <input type="text" id="b-company" value="YARD86" style="width:140px">
     <label style="margin-left:16px">Кол-во (0 = все):</label>
@@ -191,13 +192,33 @@ async function loadInfo() {
 setInterval(loadInfo, 15000);
 
 // ── Профили анализа (типы деталей) ──
+// Типов деталей больше сотни, поэтому вместо выпадающего списка — поле с подсказками:
+// пользователь набирает «суппорт», браузер показывает подходящие. Список общий (datalist)
+// на обе вкладки, значения приходят с сервера уже по алфавиту.
+let PROFILES = [];
+
 async function loadProfiles() {
   const r = await api('/api/v1/profiles');
-  const list = await r.json();
-  for (const sel of [$('s-profile'), $('b-profile')]) {
-    sel.innerHTML = '';
-    list.forEach(n => { const o = document.createElement('option'); o.value = n; o.textContent = n; sel.appendChild(o); });
+  PROFILES = await r.json();
+  const dl = $('profiles-list');
+  dl.innerHTML = '';
+  PROFILES.forEach(n => { const o = document.createElement('option'); o.value = n; dl.appendChild(o); });
+  for (const inp of [$('s-profile'), $('b-profile')]) if (!inp.value) inp.value = PROFILES[0] || '';
+}
+
+/** Тип детали должен быть выбран точно: иначе сервер молча возьмёт профиль по умолчанию
+ *  и прогон уйдёт не по той категории. Пустое/незнакомое имя — не запускаем. */
+function profileOf(inputId, statusId) {
+  const v = ($(inputId).value || '').trim();
+  const hit = PROFILES.find(n => n.toLowerCase() === v.toLowerCase());
+  if (!hit) {
+    $(statusId).textContent = v
+      ? `Тип детали «${v}» не найден — выберите из подсказок`
+      : 'Укажите тип детали';
+    $(inputId).focus();
+    return null;
   }
+  return hit;
 }
 
 // ── Tabs ──
@@ -241,7 +262,9 @@ function linkHtml(url) {
 $('s-btn').onclick = () => {
   const oem = $('s-oem').value.trim();
   if (!oem) { $('s-status').textContent = 'Введите OEM'; return; }
-  const body = new URLSearchParams({ oem, catalogPrice: $('s-price').value || '0', company: $('s-company').value.trim(), profile: $('s-profile').value });
+  const profile = profileOf('s-profile', 's-status');
+  if (!profile) return;
+  const body = new URLSearchParams({ oem, catalogPrice: $('s-price').value || '0', company: $('s-company').value.trim(), profile });
   $('s-btn').disabled = true; $('s-status').textContent = 'Анализ идёт…'; $('s-result').style.display = 'none';
   sse('/api/v1/catalog-item/stream', body, {
     result: d => {
@@ -295,6 +318,7 @@ function applyRows(rows) {
       return;
     }
     const r = p.result;
+    st.dataset.done = '1';
     tr.className = r ? r.color : '';
     tr.querySelector('.c-barnaul').textContent = r ? r.barnaulCount : '—';
     tr.querySelector('.c-siberia').textContent = (r && r.searchedSiberia) ? r.siberiaCount : '—';
@@ -314,9 +338,26 @@ function setRunning(on) {
   ['b-file', 'b-profile', 'b-company', 'b-limit'].forEach(id => $(id).disabled = on);
 }
 
+/**
+  * Строки за пределом «Кол-во» в прогон не попадают вовсе. Раньше они так и висели «Ожидает» —
+  * при статусе «Готово (3/3)» это читалось как зависшая строка. Помечаем их явно.
+  */
+function markBeyondLimit(total, catalogSize) {
+  for (let i = total; i < (catalogSize || 0); i++) {
+    const tr = $('b-row-' + i);
+    if (!tr) continue;
+    const st = tr.querySelector('.c-status');
+    if (st.dataset.done === '1') continue;          // строка уже посчитана — не трогаем
+    st.textContent = 'Вне лимита';
+    st.title = 'Не входит в прогон: ограничение «Кол-во» = ' + total;
+    st.style.color = 'var(--dim)';
+  }
+}
+
 function applyState(st, withItems) {
   if (withItems && st.items) renderCatalog(st.items);
   applyRows(st.rows);
+  markBeyondLimit(st.total || 0, st.catalogSize || 0);
   lastDone = st.syncFrom != null ? st.syncFrom : (st.done || 0);
   const running = st.status === 'running';
   setRunning(running);
@@ -326,7 +367,9 @@ function applyState(st, withItems) {
   $('b-reprice').style.display = finished ? '' : 'none';
   if (!finished) { $('rp-panel').style.display = 'none'; rpToken = null; }
 
-  const counts = `${st.done} / ${st.total}`;
+  const counts = (st.catalogSize && st.catalogSize > st.total)
+    ? `${st.done} / ${st.total} (в каталоге ${st.catalogSize}, лимит ${st.total})`
+    : `${st.done} / ${st.total}`;
   if (st.status === 'idle')          $('b-status').textContent = 'Выберите файл каталога (CSV/XLSX)';
   else if (st.status === 'loaded')   $('b-status').textContent = `Загружено из файла (старше 6 мес): ${st.catalogSize}`;
   else if (running)                  $('b-status').textContent = `Анализ: ${counts} (дорожек: ${st.lanes})`;
@@ -351,9 +394,11 @@ function stopPolling()  { if (polling) { clearInterval(polling); polling = null;
 async function loadCatalogPreview() {
   const f = $('b-file').files[0];
   if (!f) return;
+  const profile = profileOf('b-profile', 'b-status');
+  if (!profile) return;
   const fd = new FormData();
   fd.append('file', f);
-  fd.append('profile', $('b-profile').value);
+  fd.append('profile', profile);
   $('b-status').textContent = 'Чтение файла…';
   try {
     const r = await api('/api/v1/catalog/preview', { method:'POST', body: fd }, 120000);
@@ -372,13 +417,15 @@ $('b-profile').onchange = () => { if ($('b-file').files[0]) loadCatalogPreview()
 $('b-btn').onclick = async () => {
   const f = $('b-file').files[0];
   if (!f) { $('b-status').textContent = 'Выберите файл каталога (CSV/XLSX)'; return; }
+  const profile = profileOf('b-profile', 'b-status');
+  if (!profile) return;
   setRunning(true);
   $('b-status').textContent = 'Запуск…';
   const fd = new FormData();
   fd.append('file', f);
   fd.append('company', $('b-company').value.trim());
   fd.append('limit', $('b-limit').value || '0');
-  fd.append('profile', $('b-profile').value);
+  fd.append('profile', profile);
   try {
     const r = await api('/api/v1/batch/start', { method:'POST', body: fd }, 120000);
     const j = await r.json();

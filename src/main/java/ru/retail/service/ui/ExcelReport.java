@@ -23,19 +23,32 @@ import java.nio.file.Path;
 public class ExcelReport {
 
     private static final String[] HEADERS = {
-            "№", "Номер товара", "OEM", "Запчасть", "Авто", "Цена, ₽", "Создан", "Изменено в",
+            "№", "Номер товара", "OEM", "Тип детали", "Запчасть", "Авто", "Цена, ₽", "Создан", "Изменено в",
             "Барнаул, конк.", "Сибирь, конк.", "Ссылка на моё объявление", "Статус", "Переоценка"
     };
+
+    /** Имя профиля (тип детали) — одно на весь отчёт, пишется в каждую строку для сводных таблиц. */
+    private final String partType;
+    /** Шаблон ссылки на карточку товара в Bazon с {@code {id}}; пусто — номер остаётся просто текстом. */
+    private final String itemUrlTemplate;
 
     private final Path file;
     private final XSSFWorkbook wb;
     private final Sheet sheet;
     private int rowNum = 0;
     private int dataCount = 0;
+    private int repriceCount = 0;                  // сколько строк помечено на −10% (итог внизу отчёта)
+    private final java.util.Map<CellStyle, CellStyle> linkStyles = new java.util.HashMap<>();
 
     private final CellStyle headerStyle, plainStyle, yellowStyle, purpleStyle, redStyle;
 
     public ExcelReport(Path file) {
+        this(file, "", "");
+    }
+
+    public ExcelReport(Path file, String partType, String itemUrlTemplate) {
+        this.partType = partType == null ? "" : partType;
+        this.itemUrlTemplate = itemUrlTemplate == null ? "" : itemUrlTemplate;
         this.file = file;
         this.wb = new XSSFWorkbook();
         this.sheet = wb.createSheet("Наличие");
@@ -46,7 +59,7 @@ public class ExcelReport {
         purpleStyle = base(0xE9D5FF, 0x6B21A8, false);   // мало по Сибири (<10)
         redStyle    = base(0xFFC7CE, 0x9C0006, false);   // дефицит: Барнаул<4 и Сибирь<10
 
-        int[] widths = {1500, 3600, 5200, 14000, 9000, 3400, 5000, 5000, 3600, 3600, 16000, 14000, 3600};
+        int[] widths = {1500, 3600, 5200, 7000, 14000, 9000, 3400, 5000, 5000, 3600, 3600, 16000, 14000, 3600};
         for (int i = 0; i < widths.length; i++) sheet.setColumnWidth(i, widths[i]);
         sheet.createFreezePane(0, 1);
 
@@ -88,8 +101,9 @@ public class ExcelReport {
         Row row = sheet.createRow(rowNum++);
         int col = 0;
         set(row, col++, ++dataCount, style);
-        set(row, col++, itemNumber == null ? "" : itemNumber, style);
+        setItemNumber(row, col++, itemNumber, style);   // кликабельно, если задан шаблон ссылки на Bazon
         set(row, col++, oem, style);
+        set(row, col++, partType, style);
         set(row, col++, partName, style);
         set(row, col++, auto, style);
         set(row, col++, price != null && price.signum() > 0 ? price.toPlainString() : "", style);
@@ -100,6 +114,7 @@ public class ExcelReport {
         setLink(row, col++, r == null ? null : r.getMyListingUrl(), style);
         set(row, col++, r == null ? "" : nz(r.getStatus()), style);
         set(row, col, r == null ? "" : (Object) r.isReprice(), style);   // переоценка: true/false
+        if (r != null && r.isReprice()) repriceCount++;
 
         save();
     }
@@ -114,18 +129,39 @@ public class ExcelReport {
         };
     }
 
+    /**
+     * «Номер товара» — ссылка на карточку в Bazon, если задан шаблон {@code bazon.item-url-template}.
+     * Значение остаётся числом (по нему удобно сортировать), меняется только оформление.
+     */
+    private void setItemNumber(Row row, int col, String itemNumber, CellStyle style) {
+        String num = itemNumber == null ? "" : itemNumber.trim();
+        Cell c = row.createCell(col);
+        c.setCellStyle(style);
+        if (num.isEmpty() || itemUrlTemplate.isBlank() || !num.matches("\\d+")) { c.setCellValue(num); return; }
+        c.setCellFormula(hyperlink(itemUrlTemplate.replace("{id}", num), num));
+        c.setCellStyle(linkStyle(style));
+    }
+
     /** Ячейка-гиперссылка на объявление (кликабельная в Excel). */
     private void setLink(Row row, int col, String url, CellStyle style) {
         Cell c = row.createCell(col);
         c.setCellStyle(style);
         if (url == null || url.isBlank()) { c.setCellValue(""); return; }
-        c.setCellValue(url);
-        try {
-            Hyperlink link = wb.getCreationHelper().createHyperlink(HyperlinkType.URL);
-            link.setAddress(url);
-            c.setHyperlink(link);
-        } catch (Exception ignored) {}
+        c.setCellFormula(hyperlink(url, url));
+        c.setCellStyle(linkStyle(style));
     }
+
+    /**
+     * Формула HYPERLINK вместо объекта-гиперссылки POI. Причина: файл пересохраняется после КАЖДОЙ
+     * строки (чтобы не потерять данные при обрыве), а POI при каждой записи добавляет новую
+     * relationship на ту же ссылку — на 20 строках их набегало 460 вместо 40, рост квадратичный.
+     * Формула кликается в Excel/LibreOffice/Google Sheets и не плодит служебных записей.
+     */
+    private static String hyperlink(String url, String text) {
+        return "HYPERLINK(\"" + esc(url) + "\",\"" + esc(text) + "\")";
+    }
+
+    private static String esc(String s) { return s.replace("\"", "\"\""); }
 
     private void set(Row row, int col, Object val, CellStyle style) {
         Cell c = row.createCell(col);
@@ -133,6 +169,29 @@ public class ExcelReport {
         else if (val instanceof Boolean b) c.setCellValue(b);
         else c.setCellValue(val == null ? "" : val.toString());
         c.setCellStyle(style);
+    }
+
+    /** Стиль ячейки-ссылки: та же заливка строки, но синий подчёркнутый шрифт. Кэшируем по базовому стилю. */
+    private CellStyle linkStyle(CellStyle base) {
+        return linkStyles.computeIfAbsent(base, b -> {
+            XSSFCellStyle s = wb.createCellStyle();
+            s.cloneStyleFrom(b);
+            XSSFFont f = wb.createFont();
+            f.setColor(new XSSFColor(rgb(0x0563C1), null));
+            f.setUnderline(org.apache.poi.ss.usermodel.Font.U_SINGLE);
+            s.setFont(f);
+            return s;
+        });
+    }
+
+    /** Итог под таблицей: сколько всего позиций и сколько из них уйдёт в переоценку (−10%). */
+    private void appendSummary() {
+        Row row = sheet.createRow(rowNum++);
+        Cell c = row.createCell(0);
+        c.setCellValue("Итого позиций: " + dataCount + "; на переоценку (−10%): " + repriceCount
+                + (partType.isBlank() ? "" : "; тип детали: " + partType));
+        c.setCellStyle(headerStyle);
+        sheet.addMergedRegion(new org.apache.poi.ss.util.CellRangeAddress(row.getRowNum(), row.getRowNum(), 0, HEADERS.length - 1));
     }
 
     private static String nz(String s) { return s == null ? "" : s; }
@@ -146,6 +205,7 @@ public class ExcelReport {
     }
 
     public void close() {
+        appendSummary();
         save();
         try { wb.close(); } catch (Exception ignored) {}
     }

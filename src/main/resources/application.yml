@@ -81,6 +81,9 @@ bazon:
   login: c2226_external_app
   password: QM)3N2NnQQT!AHv
   storage-id: 1        # склад «Ткацкая» — по нему считаем свободный остаток (amount-reserved > 0)
+  # Ссылка на карточку товара в Bazon: «Номер товара» в Excel-отчёте станет кликабельным.
+  # {id} подставляется из номера товара. Пусто — номер остаётся обычным текстом.
+  item-url-template: ""
 
 feign:
   client:

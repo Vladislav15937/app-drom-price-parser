@@ -158,7 +158,6 @@ analysis:
     - {name: "Подушка двигателя", keyword: "подушка двигателя", bazon-partname-ids: [179]}
     - {name: "Кнопка стеклоподъемника", keyword: "кнопка стеклоподъемника", bazon-partname-ids: [1164]}
     - {name: "Ручка двери внутренняя", keyword: "ручка двери внутренняя", bazon-partname-ids: [767]}
-    - {name: "Стекло", keyword: "стекло", bazon-partname-ids: [1251]}
     - {name: "Стекло глухое", keyword: "стекло глухое", bazon-partname-ids: [1401]}
     - {name: "Стекло двери", keyword: "стекло двери", bazon-partname-ids: [434]}
     - name: "Рычаг"
@@ -203,12 +202,6 @@ analysis:
     - {name: "Крепление бампера", keyword: "крепление бампера", bazon-partname-ids: [319]}
       # ⚠ из таблицы: бампер — НЕ включено: бампер входит в keyword «крепление бампера»,
       #   профиль отсеял бы сам себя (0 позиций в каталоге и 0 конкурентов → ложный дефицит).
-    - name: "Ручка двери"
-      keyword: "ручка двери"
-      bazon-partname-ids: [1245]
-      stop-words:
-        - дверь
-        - накладка двери
     - {name: "Топливная рейка", keyword: "топливная рейка", bazon-partname-ids: [846]}
     - {name: "Защита крыла", keyword: "защита крыла", bazon-partname-ids: [1262]}
     - {name: "Спидометр", keyword: "спидометр", bazon-partname-ids: [1260]}

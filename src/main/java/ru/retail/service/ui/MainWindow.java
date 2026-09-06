@@ -631,7 +631,9 @@ public class MainWindow extends JFrame {
             String name = "availability-report_"
                     + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")) + ".xlsx";
             Path path = Paths.get(name).toAbsolutePath();
-            return new ExcelReport(path);
+            AnalysisProfiles.Profile pr = prof(profileCombo);
+            return new ExcelReport(path, pr == null ? "" : pr.getName(),
+                    bazonClient == null ? "" : bazonClient.itemUrlTemplate());
         } catch (Exception e) {
             System.err.println("Не удалось создать Excel-отчёт: " + e.getMessage());
             return null;

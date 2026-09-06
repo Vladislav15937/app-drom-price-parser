@@ -29,9 +29,16 @@ public class AnalysisProfiles {
         private List<Integer> bazonPartnameIds = new ArrayList<>();  // фильтр каталога из Bazon (partname_id)
     }
 
-    /** Имена профилей для выпадающего списка (UI/веб). */
+    /**
+     * Имена профилей для выпадающего списка (UI/веб) — по алфавиту: типов деталей больше сотни,
+     * и порядок из конфига искать в них не помогает. На выбор профиля сортировка не влияет:
+     * {@link #byName(String)} ищет по имени, а дефолтом остаётся ПЕРВЫЙ профиль конфига.
+     */
     public List<String> names() {
-        return profiles.stream().map(Profile::getName).toList();
+        return profiles.stream()
+                .map(Profile::getName)
+                .sorted(java.text.Collator.getInstance(new java.util.Locale("ru", "RU")))
+                .toList();
     }
 
     /** Профиль по имени; если не найден/имя пустое — первый (дефолтный). Пустой список → null. */
