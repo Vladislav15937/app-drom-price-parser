@@ -111,6 +111,8 @@
       <input type="checkbox" id="b-deep"> точный подсчёт</label>
     <label style="margin-left:12px" title="Считать конкурентами не только б/у, но и новые детали — рынок целиком.">
       <input type="checkbox" id="b-new"> с новыми</label>
+    <label style="margin-left:12px" title="Если один OEM попал сразу в несколько выбранных типов (общий номер у ступицы и цапфы), оставить одну строку — из типа с большим приоритетом (analysis.profiles[].priority).">
+      <input type="checkbox" id="b-dedup"> дубли OEM → приоритетный тип</label>
   </div>
   <div class="row" id="b-chips-row" style="display:none">
     <label>Типы в прогоне:</label>
@@ -357,7 +359,7 @@ function applyRows(rows) {
 function setRunning(on) {
   $('b-btn').disabled = on || $('b-tbody').children.length === 0;
   $('b-stop').disabled = !on;
-  ['b-file', 'b-profile', 'b-company', 'b-limit', 'b-deep', 'b-new', 'b-add-profile'].forEach(id => $(id).disabled = on);
+  ['b-file', 'b-profile', 'b-company', 'b-limit', 'b-deep', 'b-new', 'b-dedup', 'b-add-profile'].forEach(id => $(id).disabled = on);
 }
 
 /**
@@ -423,6 +425,7 @@ async function loadCatalogPreview() {
   const fd = new FormData();
   fd.append('file', f);
   fd.append('profile', profiles.join(','));
+  fd.append('dedupOem', $('b-dedup').checked ? 'true' : 'false');
   $('b-status').textContent = 'Чтение файла…';
   try {
     const r = await api('/api/v1/catalog/preview', { method:'POST', body: fd }, 120000);
@@ -460,6 +463,8 @@ function batchProfiles() {
   return one ? [one] : null;
 }
 
+$('b-dedup').onchange = () => { if ($('b-file').files[0]) loadCatalogPreview(); };
+
 $('b-add-profile').onclick = () => {
   const p = profileOf('b-profile', 'b-status');
   if (!p) return;
@@ -485,6 +490,7 @@ $('b-btn').onclick = async () => {
   fd.append('profile', profiles.join(','));
   fd.append('deep', $('b-deep').checked ? 'true' : 'false');
   fd.append('includeNew', $('b-new').checked ? 'true' : 'false');
+  fd.append('dedupOem', $('b-dedup').checked ? 'true' : 'false');
   try {
     const r = await api('/api/v1/batch/start', { method:'POST', body: fd }, 120000);
     const j = await r.json();
