@@ -72,6 +72,7 @@ public class MainWindow extends JFrame {
     // ── Tab 2: Batch (по каталогу) ──
     private JTextField csvPathField;
     private JTextField batchLimitField;
+    private JCheckBox deepScanBox;        // точный подсчёт: листать все страницы выдачи
     private JTextField companyField;
     private JButton batchAnalyzeBtn;
     private JButton batchStopBtn;
@@ -86,6 +87,8 @@ public class MainWindow extends JFrame {
     private volatile boolean batchStopped = false;
 
     private static final DateTimeFormatter D = DateTimeFormatter.ofPattern("dd.MM.yyyy");
+    /** Глубина «точного подсчёта» в десктопе (в вебе то же самое настраивается drom.deep-max-pages). */
+    private static final int DEEP_MAX_PAGES = 5;
 
     public MainWindow(PriceAnalyzer priceAnalyzer, TunnelService tunnelService,
                       AnalysisProfiles profiles, BazonClient bazonClient) {
@@ -349,6 +352,11 @@ public class MainWindow extends JFrame {
         settingsRow.add(Box.createHorizontalStrut(8));
         batchLimitField = new JTextField("0", 5);
         settingsRow.add(batchLimitField);
+        settingsRow.add(Box.createHorizontalStrut(20));
+        deepScanBox = new JCheckBox("Точный подсчёт");
+        deepScanBox.setToolTipText("Листать все страницы выдачи, а не только первую (50 объявлений). "
+                + "Точнее на плотных категориях, но прогон дольше.");
+        settingsRow.add(deepScanBox);
         panel.add(settingsRow, fld);
 
         lbl.gridy = 2; panel.add(new JLabel(""), lbl);
@@ -664,6 +672,7 @@ public class MainWindow extends JFrame {
         try { limitVal = Integer.parseInt(batchLimitField.getText().trim()); } catch (Exception ignored) {}
         final int total = (limitVal > 0 && limitVal < catalogItems.size()) ? limitVal : catalogItems.size();
         final int lanes = Math.max(1, priceAnalyzer.laneCount());
+        final int maxPages = deepScanBox.isSelected() ? DEEP_MAX_PAGES : 1;
 
         priceAnalyzer.resetBreakers();
 
@@ -698,7 +707,7 @@ public class MainWindow extends JFrame {
 
                         try {
                             AvailabilityResult res = priceAnalyzer.analyzeCatalogLane(
-                                    it.oem(), it.price(), company, laneId, stops);
+                                    it.oem(), it.price(), company, laneId, stops, maxPages);
                             if (report != null)
                                 report.append(it.oem(), it.itemNumber(), it.name(), auto(it), it.price(),
                                         it.created().format(D), it.priceChanged() != null ? it.priceChanged().format(D) : "", res);

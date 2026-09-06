@@ -68,6 +68,8 @@
     <input type="text" id="s-company" value="YARD86" style="width:140px">
     <label style="margin-left:16px">Цена, ₽:</label>
     <input type="number" id="s-price" style="width:120px" placeholder="необязательно">
+    <label style="margin-left:16px" title="Читать все страницы выдачи, а не только первую (50 объявлений). Точнее на плотных категориях, но дольше.">
+      <input type="checkbox" id="s-deep"> точный подсчёт</label>
   </div>
   <div class="row">
     <button id="s-btn">Проверить наличие</button>
@@ -95,6 +97,8 @@
     <input type="text" id="b-company" value="YARD86" style="width:140px">
     <label style="margin-left:16px">Кол-во (0 = все):</label>
     <input type="number" id="b-limit" value="0" style="width:80px">
+    <label style="margin-left:16px" title="Читать все страницы выдачи, а не только первую (50 объявлений). Точнее на плотных категориях, но прогон дольше.">
+      <input type="checkbox" id="b-deep"> точный подсчёт</label>
   </div>
   <div class="row">
     <button id="b-btn">Запустить анализ</button>
@@ -264,7 +268,8 @@ $('s-btn').onclick = () => {
   if (!oem) { $('s-status').textContent = 'Введите OEM'; return; }
   const profile = profileOf('s-profile', 's-status');
   if (!profile) return;
-  const body = new URLSearchParams({ oem, catalogPrice: $('s-price').value || '0', company: $('s-company').value.trim(), profile });
+  const body = new URLSearchParams({ oem, catalogPrice: $('s-price').value || '0', company: $('s-company').value.trim(), profile,
+                                     deep: $('s-deep').checked ? 'true' : 'false' });
   $('s-btn').disabled = true; $('s-status').textContent = 'Анализ идёт…'; $('s-result').style.display = 'none';
   sse('/api/v1/catalog-item/stream', body, {
     result: d => {
@@ -335,7 +340,7 @@ function applyRows(rows) {
 function setRunning(on) {
   $('b-btn').disabled = on || $('b-tbody').children.length === 0;
   $('b-stop').disabled = !on;
-  ['b-file', 'b-profile', 'b-company', 'b-limit'].forEach(id => $(id).disabled = on);
+  ['b-file', 'b-profile', 'b-company', 'b-limit', 'b-deep'].forEach(id => $(id).disabled = on);
 }
 
 /**
@@ -361,6 +366,7 @@ function applyState(st, withItems) {
   lastDone = st.syncFrom != null ? st.syncFrom : (st.done || 0);
   const running = st.status === 'running';
   setRunning(running);
+  if (st.deep != null) $('b-deep').checked = !!st.deep;   // режим берём с сервера (переживает F5)
   // отчёт и переоценка доступны, когда прогон закончен (или остановлен) и есть что выгружать
   const finished = !running && st.done > 0;
   $('b-report').style.display  = finished ? '' : 'none';
@@ -426,6 +432,7 @@ $('b-btn').onclick = async () => {
   fd.append('company', $('b-company').value.trim());
   fd.append('limit', $('b-limit').value || '0');
   fd.append('profile', profile);
+  fd.append('deep', $('b-deep').checked ? 'true' : 'false');
   try {
     const r = await api('/api/v1/batch/start', { method:'POST', body: fd }, 120000);
     const j = await r.json();

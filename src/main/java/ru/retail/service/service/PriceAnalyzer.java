@@ -77,12 +77,22 @@ public class PriceAnalyzer {
 
     /** Веб/одиночный анализ по OEM — одиночная дорожка. stopWords — профиль типа детали. */
     public AvailabilityResult analyzeByOem(String oem, BigDecimal price, String myCompany, List<String> stopWords) {
-        return analyzeWithRetry(oem, price, myCompany, dromParser, stopWords);
+        return analyzeByOem(oem, price, myCompany, stopWords, 1);
+    }
+
+    /** {@code maxPages} — сколько страниц выдачи drom листать (1 = как раньше, см. DromParser#scanRegion). */
+    public AvailabilityResult analyzeByOem(String oem, BigDecimal price, String myCompany, List<String> stopWords, int maxPages) {
+        return analyzeWithRetry(oem, price, myCompany, dromParser, stopWords, maxPages);
     }
 
     /** Параллельный батч — конкретная дорожка пула (свой IP). */
     public AvailabilityResult analyzeCatalogLane(String oem, BigDecimal price, String myCompany, int lane, List<String> stopWords) {
-        return analyzeWithRetry(oem, price, myCompany, pool.lane(lane), stopWords);
+        return analyzeCatalogLane(oem, price, myCompany, lane, stopWords, 1);
+    }
+
+    public AvailabilityResult analyzeCatalogLane(String oem, BigDecimal price, String myCompany, int lane,
+                                                 List<String> stopWords, int maxPages) {
+        return analyzeWithRetry(oem, price, myCompany, pool.lane(lane), stopWords, maxPages);
     }
 
     // ==================== ОРКЕСТРАЦИЯ ====================
@@ -91,11 +101,12 @@ public class PriceAnalyzer {
      * Прогон OEM с повтором при капче со сменой IP: если за время прогона дорожка сменила IP
      * (была нерешаемая капча), OEM прогоняется заново на свежем IP.
      */
-    private AvailabilityResult analyzeWithRetry(String oem, BigDecimal price, String myCompany, DromParser p, List<String> stopWords) {
+    private AvailabilityResult analyzeWithRetry(String oem, BigDecimal price, String myCompany, DromParser p,
+                                                List<String> stopWords, int maxPages) {
         AvailabilityResult res = null;
         for (int attempt = 1; attempt <= MAX_OEM_ATTEMPTS; attempt++) {
             long rotBefore = p.rotationCount();
-            res = analyzeOnce(oem, price, myCompany, p, stopWords);
+            res = analyzeOnce(oem, price, myCompany, p, stopWords, maxPages);
             boolean rotatedDuringRun = p.rotationCount() > rotBefore;
             if (!rotatedDuringRun || p.isCaptchaBlocked() || attempt >= MAX_OEM_ATTEMPTS) {
                 if (rotatedDuringRun && attempt > 1)
@@ -108,17 +119,18 @@ public class PriceAnalyzer {
         return res;
     }
 
-    private AvailabilityResult analyzeOnce(String oem, BigDecimal price, String myCompany, DromParser p, List<String> stopWords) {
+    private AvailabilityResult analyzeOnce(String oem, BigDecimal price, String myCompany, DromParser p,
+                                           List<String> stopWords, int maxPages) {
         log.info("=== Наличие OEM: {} | Компания: {} ===", oem, myCompany);
 
         // 1. Барнаул (город): конкуренты (used+present) + наше объявление. Порог <4.
-        DromParser.RegionScan barnaul = scan(p, oem, HOME_CITY, myCompany, true);
+        DromParser.RegionScan barnaul = scan(p, oem, HOME_CITY, myCompany, true, maxPages);
         int b = countCompetitors(barnaul.competitors(), oem, stopWords);
         String myUrl = pickUrlByPrice(barnaul.myCandidates(), price);
         // Наше объявление могло не попасть в used-выдачу (часть наших не помечена «Б/у», напр. диски —
         // «Контрактная»). Тогда ищем его без used-фильтра (present-only), чтобы не терять ссылку.
         if (myUrl == null) {
-            myUrl = pickUrlByPrice(scan(p, oem, HOME_CITY, myCompany, false).myCandidates(), price);
+            myUrl = pickUrlByPrice(scan(p, oem, HOME_CITY, myCompany, false, maxPages).myCandidates(), price);
         }
         log.info("Барнаул: конкурентов {} (наших объявлений {})", b, barnaul.myCandidates().size());
 
@@ -129,7 +141,7 @@ public class PriceAnalyzer {
         if (b < SIBERIA_TRIGGER) {
             searched = true;
             for (String region : SIBERIA_REGIONS) {
-                int c = countCompetitors(scan(p, oem, region, myCompany, true).competitors(), oem, stopWords);
+                int c = countCompetitors(scan(p, oem, region, myCompany, true, maxPages).competitors(), oem, stopWords);
                 siberiaTotal += c;
                 log.info("Сибирь [{}]: конкурентов {} (сумма {})", region, c, siberiaTotal);
             }
@@ -156,11 +168,12 @@ public class PriceAnalyzer {
 
     /** Скан региона через кэш батча (дубли OEM не перезапрашивают drom). Кэшируем только непустой результат.
      *  used=false — выдача без фильтра «Б/у» (для поиска нашего объявления, если оно не помечено б/у). */
-    private DromParser.RegionScan scan(DromParser p, String oem, String region, String myCompany, boolean used) {
-        String key = normalizeOem(oem) + "|" + region + "|" + used;
+    private DromParser.RegionScan scan(DromParser p, String oem, String region, String myCompany, boolean used, int maxPages) {
+        // Глубина входит в ключ: обычный и точный скан дают разные наборы, смешивать их нельзя.
+        String key = normalizeOem(oem) + "|" + region + "|" + used + "|" + maxPages;
         DromParser.RegionScan cached = scanCache.get(key);
         if (cached != null) return cached;
-        DromParser.RegionScan sc = p.scanRegion(oem, region, myCompany, used);
+        DromParser.RegionScan sc = p.scanRegion(oem, region, myCompany, used, maxPages);
         if (!sc.competitors().isEmpty() || !sc.myCandidates().isEmpty()) scanCache.put(key, sc);
         return sc;
     }
