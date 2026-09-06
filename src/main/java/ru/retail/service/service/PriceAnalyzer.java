@@ -61,9 +61,10 @@ public class PriceAnalyzer {
      *                   на рынок целиком: если новых предложений много (пример 78228 — рынок 85),
      *                   поднимать цену бессмысленно, даже когда б/у почти нет.
      */
-    public record ScanOptions(int maxPages, boolean includeNew) {
-        public static final ScanOptions DEFAULT = new ScanOptions(1, false);
+    public record ScanOptions(int maxPages, boolean includeNew, boolean byApplicability) {
+        public static final ScanOptions DEFAULT = new ScanOptions(1, false, false);
         public ScanOptions { maxPages = Math.max(1, maxPages); }
+        public ScanOptions(int maxPages, boolean includeNew) { this(maxPages, includeNew, false); }
         /** Фильтр «Б/у» на стороне drom: при учёте новых он снимается. */
         boolean usedOnly() { return !includeNew; }
     }
@@ -108,7 +109,20 @@ public class PriceAnalyzer {
 
     public AvailabilityResult analyzeCatalogLane(String oem, BigDecimal price, String myCompany, int lane,
                                                  List<String> stopWords, ScanOptions opts) {
-        return analyzeWithRetry(oem, price, myCompany, pool.lane(lane), stopWords, opts);
+        return analyzeCatalogLane(oem, null, price, myCompany, lane, stopWords, opts);
+    }
+
+    /**
+     * Прогон позиции каталога. {@code applicabilityQuery} — поисковая строка «тип детали + марка +
+     * модель»; используется вместо OEM, когда включён поиск по применимости. Нужно кузовным деталям:
+     * у части марок (пример заказчика — Ford) номер индивидуален, и по OEM рынок выглядит пустым,
+     * хотя деталь на модель продаётся.
+     */
+    public AvailabilityResult analyzeCatalogLane(String oem, String applicabilityQuery, BigDecimal price,
+                                                 String myCompany, int lane, List<String> stopWords, ScanOptions opts) {
+        boolean byApp = opts.byApplicability() && applicabilityQuery != null && !applicabilityQuery.isBlank();
+        String query = byApp ? applicabilityQuery.trim() : oem;
+        return analyzeWithRetry(query, oem, price, myCompany, pool.lane(lane), stopWords, opts, !byApp);
     }
 
     // ==================== ОРКЕСТРАЦИЯ ====================
@@ -119,35 +133,47 @@ public class PriceAnalyzer {
      */
     private AvailabilityResult analyzeWithRetry(String oem, BigDecimal price, String myCompany, DromParser p,
                                                 List<String> stopWords, ScanOptions opts) {
+        return analyzeWithRetry(oem, oem, price, myCompany, p, stopWords, opts, true);
+    }
+
+    /**
+     * @param query      что ищем на drom (OEM либо «деталь марка модель»)
+     * @param oem        OEM позиции — идёт в результат и в сверку номера
+     * @param matchOem   сверять ли OEM конкурента с нашим. При поиске по применимости — нет:
+     *                   у конкурентов номера свои, отбор держится на стоп-словах и запросе.
+     */
+    private AvailabilityResult analyzeWithRetry(String query, String oem, BigDecimal price, String myCompany,
+                                                DromParser p, List<String> stopWords, ScanOptions opts, boolean matchOem) {
         AvailabilityResult res = null;
         for (int attempt = 1; attempt <= MAX_OEM_ATTEMPTS; attempt++) {
             long rotBefore = p.rotationCount();
-            res = analyzeOnce(oem, price, myCompany, p, stopWords, opts);
+            res = analyzeOnce(query, oem, price, myCompany, p, stopWords, opts, matchOem);
             boolean rotatedDuringRun = p.rotationCount() > rotBefore;
             if (!rotatedDuringRun || p.isCaptchaBlocked() || attempt >= MAX_OEM_ATTEMPTS) {
                 if (rotatedDuringRun && attempt > 1)
-                    log.info("OEM {}: завершён после смены IP (попыток: {})", oem, attempt);
+                    log.info("Запрос {}: завершён после смены IP (попыток: {})", query, attempt);
                 return res;
             }
-            log.warn("OEM {}: во время прогона сменился IP из-за капчи — повтор на свежем IP (попытка {}/{})",
-                    oem, attempt + 1, MAX_OEM_ATTEMPTS);
+            log.warn("Запрос {}: во время прогона сменился IP из-за капчи — повтор на свежем IP (попытка {}/{})",
+                    query, attempt + 1, MAX_OEM_ATTEMPTS);
         }
         return res;
     }
 
-    private AvailabilityResult analyzeOnce(String oem, BigDecimal price, String myCompany, DromParser p,
-                                           List<String> stopWords, ScanOptions opts) {
-        log.info("=== Наличие OEM: {} | Компания: {} | {} ===", oem, myCompany,
-                opts.includeNew() ? "б/у + новые" : "только б/у");
+    private AvailabilityResult analyzeOnce(String query, String oem, BigDecimal price, String myCompany, DromParser p,
+                                           List<String> stopWords, ScanOptions opts, boolean matchOem) {
+        log.info("=== Наличие: {} | Компания: {} | {}{} ===", query, myCompany,
+                opts.includeNew() ? "б/у + новые" : "только б/у",
+                matchOem ? "" : " | по применимости");
 
         // 1. Барнаул (город): конкуренты (used+present) + наше объявление. Порог <4.
-        DromParser.RegionScan barnaul = scan(p, oem, HOME_CITY, myCompany, opts.usedOnly(), opts.maxPages());
-        int b = countCompetitors(barnaul.competitors(), oem, stopWords);
+        DromParser.RegionScan barnaul = scan(p, query, HOME_CITY, myCompany, opts.usedOnly(), opts.maxPages());
+        int b = countCompetitors(barnaul.competitors(), oem, stopWords, matchOem);
         String myUrl = pickUrlByPrice(barnaul.myCandidates(), price);
         // Наше объявление могло не попасть в used-выдачу (часть наших не помечена «Б/у», напр. диски —
         // «Контрактная»). Тогда ищем его без used-фильтра (present-only), чтобы не терять ссылку.
         if (myUrl == null) {
-            myUrl = pickUrlByPrice(scan(p, oem, HOME_CITY, myCompany, false, opts.maxPages()).myCandidates(), price);
+            myUrl = pickUrlByPrice(scan(p, query, HOME_CITY, myCompany, false, opts.maxPages()).myCandidates(), price);
         }
         log.info("Барнаул: конкурентов {} (наших объявлений {})", b, barnaul.myCandidates().size());
 
@@ -158,7 +184,7 @@ public class PriceAnalyzer {
         if (b < SIBERIA_TRIGGER) {
             searched = true;
             for (String region : SIBERIA_REGIONS) {
-                int c = countCompetitors(scan(p, oem, region, myCompany, opts.usedOnly(), opts.maxPages()).competitors(), oem, stopWords);
+                int c = countCompetitors(scan(p, query, region, myCompany, opts.usedOnly(), opts.maxPages()).competitors(), oem, stopWords, matchOem);
                 siberiaTotal += c;
                 log.info("Сибирь [{}]: конкурентов {} (сумма {})", region, c, siberiaTotal);
             }
@@ -199,8 +225,8 @@ public class PriceAnalyzer {
 
     /** Конкуренты по этому OEM: целевая деталь (без стоп-слов), тот же OEM. Б/у-фильтр — на стороне drom
      *  (condition[]=used в buildSearchUrl), поэтому здесь достаточно фильтра типа/OEM. */
-    private int countCompetitors(List<PartPrice> competitors, String oem, List<String> stopWords) {
-        return filterAssemblies(competitors, oem, stopWords).size();
+    private int countCompetitors(List<PartPrice> competitors, String oem, List<String> stopWords, boolean matchOem) {
+        return filterAssemblies(competitors, oem, stopWords, matchOem).size();
     }
 
     private Color computeColor(int barnaul, int siberia, boolean searched) {
@@ -239,14 +265,14 @@ public class PriceAnalyzer {
     }
 
     /** Выкидывает нецелевые (по стоп-словам профиля) и объявления с НЕ совпадающим OEM. */
-    private List<PartPrice> filterAssemblies(List<PartPrice> parts, String targetOem, List<String> stopWords) {
+    private List<PartPrice> filterAssemblies(List<PartPrice> parts, String targetOem, List<String> stopWords, boolean matchOem) {
         String normalizedTarget = normalizeOem(targetOem);
         List<String> stops = stopWords == null ? List.of() : stopWords;
         return parts.stream()
                 .filter(p -> {
                     String title = p.getTitle() == null ? "" : p.getTitle().toLowerCase();
                     if (stops.stream().anyMatch(w -> !w.isBlank() && title.contains(w.toLowerCase()))) return false;
-                    if (p.getOem() != null && !p.getOem().isBlank()) {
+                    if (matchOem && p.getOem() != null && !p.getOem().isBlank()) {
                         return normalizeOem(p.getOem()).equals(normalizedTarget);
                     }
                     return true;   // OEM со страницы поиска не извлёкся — доверяем поисковому запросу
