@@ -111,9 +111,9 @@ public class PriceAggregatorController {
         byte[] bytes = file.getBytes();
         synchronized (batchLock) {
             if (batchRunning()) return conflict();
-            List<CatalogLoader.CatalogItem> items = loadCatalog(bytes, analysisProfiles.byName(profile));
+            List<CatalogRow> items = loadCatalog(bytes, profilesOf(profile));
             List<Map<String, Object>> rows = new ArrayList<>();
-            for (CatalogLoader.CatalogItem it : items) rows.add(itemFields(it));
+            for (CatalogRow it : items) rows.add(itemFields(it));
             // Каталог кладём в состояние прогона — перезагрузка страницы покажет ту же таблицу
             batchRun = new BatchRun(rows, "loaded");
             return ResponseEntity.ok(state(batchRun, 0));
@@ -247,24 +247,24 @@ public class PriceAggregatorController {
             @RequestParam(defaultValue = "0") int limit,
             @RequestParam(required = false) String profile,
             @RequestParam(defaultValue = "false") boolean deep) throws IOException {
-        AnalysisProfiles.Profile pr = analysisProfiles.byName(profile);
-        List<String> stops = pr == null ? List.of() : pr.getStopWords();
+        List<AnalysisProfiles.Profile> prs = profilesOf(profile);
         byte[] bytes = file.getBytes();
 
         synchronized (batchLock) {
             if (batchRunning()) return conflict();
 
             // Каталог: только целевой тип (профиль) старше 6 мес по «Создан». Дедуп по OEM (один номер — один прогон).
-            List<CatalogLoader.CatalogItem> items = loadCatalog(bytes, pr);
+            List<CatalogRow> items = loadCatalog(bytes, prs);
             List<Map<String, Object>> rows = new ArrayList<>();
-            for (CatalogLoader.CatalogItem it : items) rows.add(itemFields(it));
+            for (CatalogRow it : items) rows.add(itemFields(it));
 
             BatchRun run = new BatchRun(rows, "running");
-            run.profile = pr == null ? "" : pr.getName();
+            run.profile = prs.stream().map(AnalysisProfiles.Profile::getName)
+                    .collect(java.util.stream.Collectors.joining(", "));
             run.maxPages = pagesFor(deep);
             run.total = (limit > 0 && limit < items.size()) ? limit : items.size();
             batchRun = run;
-            executor.submit(() -> runBatch(run, items, company, stops));
+            executor.submit(() -> runBatch(run, items, company));
             return ResponseEntity.ok(state(run, 0));
         }
     }
@@ -302,7 +302,7 @@ public class PriceAggregatorController {
                         str(row.get("oem")), str(row.get("itemNumber")), str(row.get("partName")),
                         (str(row.get("brand")) + " " + str(row.get("model"))).trim(),
                         price(row.get("price")), str(row.get("created")), str(row.get("priceChanged")),
-                        res instanceof AvailabilityResult r ? r : null);
+                        res instanceof AvailabilityResult r ? r : null, str(row.get("profile")));
             }
             report.close();
             bytes = Files.readAllBytes(tmp);
@@ -515,8 +515,7 @@ public class PriceAggregatorController {
      * Тело прогона: как в десктоп-батче — воркер на каждую дорожку пула (1 дорожка = 1 мобильный IP),
      * общий курсор по каталогу. Результат каждой позиции пишется в состояние, его и опрашивает страница.
      */
-    private void runBatch(BatchRun run, List<CatalogLoader.CatalogItem> items,
-                          String company, List<String> stops) {
+    private void runBatch(BatchRun run, List<CatalogRow> items, String company) {
         int lanes = Math.max(1, priceAnalyzer.laneCount());
         run.lanes = lanes;
         try {
@@ -541,7 +540,11 @@ public class PriceAggregatorController {
                         int idx = cursor.getAndIncrement();
                         if (idx >= run.total) break;
 
-                        CatalogLoader.CatalogItem it = items.get(idx);
+                        CatalogRow cr = items.get(idx);
+                        CatalogLoader.CatalogItem it = cr.item();
+                        // Стоп-слова — те, что у типа детали ИМЕННО ЭТОЙ строки: в прогоне
+                        // может быть несколько категорий, и у каждой свой отсев.
+                        List<String> stops = cr.profile() == null ? List.of() : cr.profile().getStopWords();
                         Map<String, Object> row = new LinkedHashMap<>(run.items.get(idx));
                         row.put("index", idx);
                         row.put("lane", "L" + laneId);
@@ -623,23 +626,52 @@ public class PriceAggregatorController {
     // ── Утилиты ────────────────────────────────────────────
 
     /** Каталог из файла: только тип профиля, старше 6 мес, дедуп по OEM (один номер — один прогон). */
-    private List<CatalogLoader.CatalogItem> loadCatalog(byte[] bytes, AnalysisProfiles.Profile pr) throws IOException {
-        String keyword = pr == null ? "" : pr.getKeyword();
-        List<String> stops = pr == null ? List.of() : pr.getStopWords();
-        // bazonClient.login() — позиции, которым цену менял сам парсер >1 мес назад, снова идут в переоценку
-        List<CatalogLoader.CatalogItem> all = CatalogLoader.loadOlderThan6Months(bytes, keyword, stops, bazonClient.login());
-        List<CatalogLoader.CatalogItem> items = new ArrayList<>();
-        java.util.Set<String> seen = new java.util.HashSet<>();
-        for (CatalogLoader.CatalogItem it : all) {
-            String key = it.oem().replaceAll("[^A-Za-z0-9]", "").toUpperCase();
-            if (key.isBlank() || seen.add(key)) items.add(it);
+    /** Позиция каталога вместе с профилем, по которому её отобрали: у каждого типа свои стоп-слова. */
+    record CatalogRow(CatalogLoader.CatalogItem item, AnalysisProfiles.Profile profile) {}
+
+    /**
+     * Каталог из файла по одному или нескольким типам деталей. Несколько нужны, чтобы проверить
+     * пачку категорий одним прогоном, а не запускать их поштучно. Дедуп по OEM — внутри типа:
+     * одна деталь может подойти двум категориям, и считать её надо с их собственными стоп-словами.
+     */
+    private List<CatalogRow> loadCatalog(byte[] bytes, List<AnalysisProfiles.Profile> profiles) throws IOException {
+        List<CatalogRow> rows = new ArrayList<>();
+        for (AnalysisProfiles.Profile pr : profiles) {
+            String keyword = pr == null ? "" : pr.getKeyword();
+            List<String> stops = pr == null ? List.of() : pr.getStopWords();
+            // bazonClient.login() — позиции, которым цену менял сам парсер >1 мес назад, снова идут в переоценку
+            List<CatalogLoader.CatalogItem> all =
+                    CatalogLoader.loadOlderThan6Months(bytes, keyword, stops, bazonClient.login());
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            for (CatalogLoader.CatalogItem it : all) {
+                String key = it.oem().replaceAll("[^A-Za-z0-9]", "").toUpperCase();
+                if (key.isBlank() || seen.add(key)) rows.add(new CatalogRow(it, pr));
+            }
         }
-        return items;
+        return rows;
+    }
+
+    /** Профили запроса: несколько имён через запятую в {@code profile} либо повторяющийся параметр. */
+    private List<AnalysisProfiles.Profile> profilesOf(String profile) {
+        List<AnalysisProfiles.Profile> out = new ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (String name : (profile == null ? "" : profile).split(",")) {
+            if (name.isBlank()) continue;
+            AnalysisProfiles.Profile pr = analysisProfiles.byName(name.trim());
+            if (pr != null && seen.add(pr.getName())) out.add(pr);
+        }
+        if (out.isEmpty()) {
+            AnalysisProfiles.Profile pr = analysisProfiles.byName(profile);
+            if (pr != null) out.add(pr);
+        }
+        return out;
     }
 
     /** Поля позиции каталога для веба — те же колонки, что в таблице десктопа. */
-    private Map<String, Object> itemFields(CatalogLoader.CatalogItem it) {
+    private Map<String, Object> itemFields(CatalogRow row) {
+        CatalogLoader.CatalogItem it = row.item();
         Map<String, Object> m = new LinkedHashMap<>();
+        m.put("profile", row.profile() == null ? "" : row.profile().getName());
         m.put("itemNumber", it.itemNumber());
         m.put("oem", it.oem());
         m.put("partName", it.name());
