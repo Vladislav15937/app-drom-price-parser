@@ -52,6 +52,22 @@ public class PriceAnalyzer {
     // Сколько раз гонять один OEM, если во время прогона случилась капча со сменой IP (повтор на свежем IP).
     private static final int MAX_OEM_ATTEMPTS = 3;
 
+    /**
+     * Настройки скана, которые клиент выбирает сам. Значения по умолчанию повторяют прежнее
+     * поведение: одна страница выдачи и только б/у.
+     *
+     * @param maxPages   сколько страниц выдачи листать (1 — как раньше, 50 объявлений)
+     * @param includeNew считать конкурентами и НОВЫЕ детали, а не только б/у. Заказчик смотрит
+     *                   на рынок целиком: если новых предложений много (пример 78228 — рынок 85),
+     *                   поднимать цену бессмысленно, даже когда б/у почти нет.
+     */
+    public record ScanOptions(int maxPages, boolean includeNew) {
+        public static final ScanOptions DEFAULT = new ScanOptions(1, false);
+        public ScanOptions { maxPages = Math.max(1, maxPages); }
+        /** Фильтр «Б/у» на стороне drom: при учёте новых он снимается. */
+        boolean usedOnly() { return !includeNew; }
+    }
+
     private final DromParser dromParser;   // одиночная дорожка (веб / одиночный анализ)
     private final DromParserPool pool;     // пул дорожек (IP) для параллельного батча
 
@@ -77,22 +93,22 @@ public class PriceAnalyzer {
 
     /** Веб/одиночный анализ по OEM — одиночная дорожка. stopWords — профиль типа детали. */
     public AvailabilityResult analyzeByOem(String oem, BigDecimal price, String myCompany, List<String> stopWords) {
-        return analyzeByOem(oem, price, myCompany, stopWords, 1);
+        return analyzeByOem(oem, price, myCompany, stopWords, ScanOptions.DEFAULT);
     }
 
-    /** {@code maxPages} — сколько страниц выдачи drom листать (1 = как раньше, см. DromParser#scanRegion). */
-    public AvailabilityResult analyzeByOem(String oem, BigDecimal price, String myCompany, List<String> stopWords, int maxPages) {
-        return analyzeWithRetry(oem, price, myCompany, dromParser, stopWords, maxPages);
+    public AvailabilityResult analyzeByOem(String oem, BigDecimal price, String myCompany,
+                                           List<String> stopWords, ScanOptions opts) {
+        return analyzeWithRetry(oem, price, myCompany, dromParser, stopWords, opts);
     }
 
     /** Параллельный батч — конкретная дорожка пула (свой IP). */
     public AvailabilityResult analyzeCatalogLane(String oem, BigDecimal price, String myCompany, int lane, List<String> stopWords) {
-        return analyzeCatalogLane(oem, price, myCompany, lane, stopWords, 1);
+        return analyzeCatalogLane(oem, price, myCompany, lane, stopWords, ScanOptions.DEFAULT);
     }
 
     public AvailabilityResult analyzeCatalogLane(String oem, BigDecimal price, String myCompany, int lane,
-                                                 List<String> stopWords, int maxPages) {
-        return analyzeWithRetry(oem, price, myCompany, pool.lane(lane), stopWords, maxPages);
+                                                 List<String> stopWords, ScanOptions opts) {
+        return analyzeWithRetry(oem, price, myCompany, pool.lane(lane), stopWords, opts);
     }
 
     // ==================== ОРКЕСТРАЦИЯ ====================
@@ -102,11 +118,11 @@ public class PriceAnalyzer {
      * (была нерешаемая капча), OEM прогоняется заново на свежем IP.
      */
     private AvailabilityResult analyzeWithRetry(String oem, BigDecimal price, String myCompany, DromParser p,
-                                                List<String> stopWords, int maxPages) {
+                                                List<String> stopWords, ScanOptions opts) {
         AvailabilityResult res = null;
         for (int attempt = 1; attempt <= MAX_OEM_ATTEMPTS; attempt++) {
             long rotBefore = p.rotationCount();
-            res = analyzeOnce(oem, price, myCompany, p, stopWords, maxPages);
+            res = analyzeOnce(oem, price, myCompany, p, stopWords, opts);
             boolean rotatedDuringRun = p.rotationCount() > rotBefore;
             if (!rotatedDuringRun || p.isCaptchaBlocked() || attempt >= MAX_OEM_ATTEMPTS) {
                 if (rotatedDuringRun && attempt > 1)
@@ -120,17 +136,18 @@ public class PriceAnalyzer {
     }
 
     private AvailabilityResult analyzeOnce(String oem, BigDecimal price, String myCompany, DromParser p,
-                                           List<String> stopWords, int maxPages) {
-        log.info("=== Наличие OEM: {} | Компания: {} ===", oem, myCompany);
+                                           List<String> stopWords, ScanOptions opts) {
+        log.info("=== Наличие OEM: {} | Компания: {} | {} ===", oem, myCompany,
+                opts.includeNew() ? "б/у + новые" : "только б/у");
 
         // 1. Барнаул (город): конкуренты (used+present) + наше объявление. Порог <4.
-        DromParser.RegionScan barnaul = scan(p, oem, HOME_CITY, myCompany, true, maxPages);
+        DromParser.RegionScan barnaul = scan(p, oem, HOME_CITY, myCompany, opts.usedOnly(), opts.maxPages());
         int b = countCompetitors(barnaul.competitors(), oem, stopWords);
         String myUrl = pickUrlByPrice(barnaul.myCandidates(), price);
         // Наше объявление могло не попасть в used-выдачу (часть наших не помечена «Б/у», напр. диски —
         // «Контрактная»). Тогда ищем его без used-фильтра (present-only), чтобы не терять ссылку.
         if (myUrl == null) {
-            myUrl = pickUrlByPrice(scan(p, oem, HOME_CITY, myCompany, false, maxPages).myCandidates(), price);
+            myUrl = pickUrlByPrice(scan(p, oem, HOME_CITY, myCompany, false, opts.maxPages()).myCandidates(), price);
         }
         log.info("Барнаул: конкурентов {} (наших объявлений {})", b, barnaul.myCandidates().size());
 
@@ -141,7 +158,7 @@ public class PriceAnalyzer {
         if (b < SIBERIA_TRIGGER) {
             searched = true;
             for (String region : SIBERIA_REGIONS) {
-                int c = countCompetitors(scan(p, oem, region, myCompany, true, maxPages).competitors(), oem, stopWords);
+                int c = countCompetitors(scan(p, oem, region, myCompany, opts.usedOnly(), opts.maxPages()).competitors(), oem, stopWords);
                 siberiaTotal += c;
                 log.info("Сибирь [{}]: конкурентов {} (сумма {})", region, c, siberiaTotal);
             }
