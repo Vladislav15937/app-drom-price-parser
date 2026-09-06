@@ -517,41 +517,41 @@ public class DromParser {
 
     /** {@code used=false} — без фильтра «Б/у» (для поиска НАШЕГО объявления, см. {@link #buildSearchUrl}). */
     public RegionScan scanRegion(String oemNumber, String region, String myCompany, boolean used) {
+        return scanRegion(oemNumber, region, myCompany, used, 1);
+    }
+
+    /**
+     * Скан наличия с ограничением на число страниц выдачи.
+     * <p>
+     * {@code maxPages = 1} — поведение по умолчанию: одна страница, до 50 объявлений. Для порогов
+     * 4 и 10 этого достаточно, и это самый дешёвый режим по запросам и капче.
+     * <p>
+     * {@code maxPages > 1} — «точный подсчёт»: листаем дальше, пока страница приходит полной
+     * (50 записей) и лимит не исчерпан. Нужно там, где реальных объявлений больше полусотни:
+     * на плотных категориях счётчик иначе занижен (у рычага заказчик видел 40 против 85).
+     * Цена — лишняя загрузка страницы на каждую полусотню.
+     */
+    public RegionScan scanRegion(String oemNumber, String region, String myCompany, boolean used, int maxPages) {
+        int pages = Math.max(1, maxPages);
         String searchUrl = buildSearchUrl(oemNumber, region, used);
-        log.info("Скан наличия [{}] OEM={} (used={}): {}", region, oemNumber, used, searchUrl);
+        log.info("Скан наличия [{}] OEM={} (used={}, страниц до {}): {}", region, oemNumber, used, pages, searchUrl);
 
         BrowserContext ctx = newContext(browser, sessionFile);
         Page page = newPage(ctx);
         try {
-            List<SearchEntry> entries = loadSearchEntries(page, ctx, sessionFile, searchUrl, region);
-            if (entries == null) return RegionScan.empty();   // капча не пройдена
-
-            String companyLower = myCompany == null ? "" : myCompany.toLowerCase();
-            List<MyListingCandidate> mine = new ArrayList<>();
-            List<PartPrice> competitors = new ArrayList<>();
-            for (SearchEntry e : entries) {
-                // Подмешка из ДРУГОГО региона/города: drom помечает такие меткой с предлогом «в <город>»
-                // («в Улан-Удэ», «во Владивостоке»). Объявления ВНУТРИ искомой гео-области помечены городом
-                // без предлога («Барнаул», «Новоалтайск») либо без метки — их оставляем. Так работает и для
-                // поиска по городу, и по региону (регион показывает все свои города без предлога).
-                String oc = e.otherCity() == null ? "" : e.otherCity().trim().toLowerCase();
-                if (oc.startsWith("в ") || oc.startsWith("во ")) continue;
-                boolean isMine = !companyLower.isBlank() && e.dealer() != null
-                        && e.dealer().toLowerCase().contains(companyLower);
-                if (isMine) {
-                    mine.add(new MyListingCandidate(e.url(), e.price()));
-                } else {
-                    competitors.add(PartPrice.builder()
-                            .title(e.title())
-                            .price(e.price())
-                            .url(e.url())
-                            .dealer(e.dealer())
-                            .oem(e.oem())
-                            .publishedDate(e.date())
-                            .build());
-                }
+            List<SearchEntry> entries = new ArrayList<>();
+            for (int n = 1; n <= pages; n++) {
+                String url = n == 1 ? searchUrl : searchUrl + "&page=" + n;
+                List<SearchEntry> part = loadSearchEntries(page, ctx, sessionFile, url, region);
+                if (part == null) return n == 1 ? RegionScan.empty() : toScan(entries, myCompany);  // капча
+                entries.addAll(part);
+                if (pages > 1) log.info("  стр. {}: объявлений {} (всего {})", n, part.size(), entries.size());
+                // Неполная страница = выдача кончилась. Пустая — тем более (drom на «лишних»
+                // страницах отдаёт пустой список, а не 404).
+                if (part.size() < PAGE_SIZE) break;
+                if (n < pages) sleepQuiet(400 + (long) (Math.random() * 400));
             }
-            return new RegionScan(mine, competitors);
+            return toScan(entries, myCompany);
         } catch (Exception ex) {
             noteError(ex);
             log.error("Ошибка скана [{}]: {}", region, ex.getMessage());
@@ -560,6 +560,45 @@ public class DromParser {
             page.close();
             ctx.close();
         }
+    }
+
+    /** Сколько объявлений drom отдаёт на одной странице поиска — по нему понимаем, есть ли следующая. */
+    private static final int PAGE_SIZE = 50;
+
+    private static void sleepQuiet(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    /** Делит сырые объявления на наши и конкурентов, отсекая подмешанные из других городов. */
+    private RegionScan toScan(List<SearchEntry> entries, String myCompany) {
+        String companyLower = myCompany == null ? "" : myCompany.toLowerCase();
+        List<MyListingCandidate> mine = new ArrayList<>();
+        List<PartPrice> competitors = new ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();   // страницы могут пересечься — дедуп по URL
+        for (SearchEntry e : entries) {
+            if (e.url() == null || !seen.add(e.url())) continue;
+            // Подмешка из ДРУГОГО региона/города: drom помечает такие меткой с предлогом «в <город>»
+            // («в Улан-Удэ», «во Владивостоке»). Объявления ВНУТРИ искомой гео-области помечены городом
+            // без предлога («Барнаул», «Новоалтайск») либо без метки — их оставляем. Так работает и для
+            // поиска по городу, и по региону (регион показывает все свои города без предлога).
+            String oc = e.otherCity() == null ? "" : e.otherCity().trim().toLowerCase();
+            if (oc.startsWith("в ") || oc.startsWith("во ")) continue;
+            boolean isMine = !companyLower.isBlank() && e.dealer() != null
+                    && e.dealer().toLowerCase().contains(companyLower);
+            if (isMine) {
+                mine.add(new MyListingCandidate(e.url(), e.price()));
+            } else {
+                competitors.add(PartPrice.builder()
+                        .title(e.title())
+                        .price(e.price())
+                        .url(e.url())
+                        .dealer(e.dealer())
+                        .oem(e.oem())
+                        .publishedDate(e.date())
+                        .build());
+            }
+        }
+        return new RegionScan(mine, competitors);
     }
 
     /** Загружает страницу поиска (с обработкой капчи) и возвращает сырые объявления; null — капча не пройдена. */

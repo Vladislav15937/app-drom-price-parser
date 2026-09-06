@@ -48,6 +48,13 @@ public class PriceAggregatorController {
     private final AnalysisProfiles analysisProfiles;
     private final BazonClient bazonClient;
 
+    /** Сколько страниц выдачи листать в режиме «точный подсчёт». 1 страница = 50 объявлений. */
+    @org.springframework.beans.factory.annotation.Value("${drom.deep-max-pages:5}")
+    private int deepMaxPages;
+
+    /** Глубина скана: по умолчанию одна страница (прежнее поведение), точный подсчёт — по запросу клиента. */
+    private int pagesFor(boolean deep) { return deep ? Math.max(1, deepMaxPages) : 1; }
+
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "web-analysis");
         t.setDaemon(true);
@@ -121,6 +128,7 @@ public class PriceAggregatorController {
             @RequestParam(defaultValue = "0") BigDecimal catalogPrice,
             @RequestParam(defaultValue = "YARD86") String company,
             @RequestParam(required = false) String profile,
+            @RequestParam(defaultValue = "false") boolean deep,
             HttpServletResponse response) {
         List<String> stops = stopWords(profile);
 
@@ -147,7 +155,7 @@ public class PriceAggregatorController {
         executor.submit(() -> {
             try {
                 priceAnalyzer.resetBreakers();
-                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company, stops);
+                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company, stops, pagesFor(deep));
                 send(emitter, "result", objectMapper.writeValueAsString(result));
             } catch (Exception e) {
                 send(emitter, "error", e.getMessage() != null ? e.getMessage() : "Ошибка анализа");
@@ -166,7 +174,8 @@ public class PriceAggregatorController {
             @RequestParam String oem,
             @RequestParam(defaultValue = "0") BigDecimal catalogPrice,
             @RequestParam(defaultValue = "YARD86") String company,
-            @RequestParam(required = false) String profile) {
+            @RequestParam(required = false) String profile,
+            @RequestParam(defaultValue = "false") boolean deep) {
         List<String> stops = stopWords(profile);
         if (batchRunning()) return Map.of("error", "Идёт пакетный анализ — дождитесь его окончания.");
         String jobId = UUID.randomUUID().toString();
@@ -175,7 +184,7 @@ public class PriceAggregatorController {
         executor.submit(() -> {
             jobs.put(jobId, new JobResult("running", null, null, now));
             try {
-                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company, stops);
+                AvailabilityResult result = priceAnalyzer.analyzeByOem(oem, catalogPrice, company, stops, pagesFor(deep));
                 jobs.put(jobId, new JobResult("done", result, null, now));
             } catch (Exception e) {
                 jobs.put(jobId, new JobResult("error", null,
@@ -213,6 +222,7 @@ public class PriceAggregatorController {
         volatile int total;          // сколько позиций прогоняем (с учётом лимита)
         volatile int lanes = 1;      // дорожек пула (= мобильных IP) в прогоне
         volatile String profile = "";// тип детали прогона (идёт в отчёт отдельной колонкой)
+        volatile int maxPages = 1;   // глубина скана: 1 — как раньше, больше — точный подсчёт
 
         BatchRun(List<Map<String, Object>> items, String status) {
             this.items = items;
@@ -235,7 +245,8 @@ public class PriceAggregatorController {
             @RequestParam("file") MultipartFile file,
             @RequestParam(defaultValue = "YARD86") String company,
             @RequestParam(defaultValue = "0") int limit,
-            @RequestParam(required = false) String profile) throws IOException {
+            @RequestParam(required = false) String profile,
+            @RequestParam(defaultValue = "false") boolean deep) throws IOException {
         AnalysisProfiles.Profile pr = analysisProfiles.byName(profile);
         List<String> stops = pr == null ? List.of() : pr.getStopWords();
         byte[] bytes = file.getBytes();
@@ -250,6 +261,7 @@ public class PriceAggregatorController {
 
             BatchRun run = new BatchRun(rows, "running");
             run.profile = pr == null ? "" : pr.getName();
+            run.maxPages = pagesFor(deep);
             run.total = (limit > 0 && limit < items.size()) ? limit : items.size();
             batchRun = run;
             executor.submit(() -> runBatch(run, items, company, stops));
@@ -539,7 +551,7 @@ public class PriceAggregatorController {
                         Map<String, Object> finished = new LinkedHashMap<>(row);
                         try {
                             finished.put("result", priceAnalyzer.analyzeCatalogLane(
-                                    it.oem(), it.price(), company, laneId, stops));
+                                    it.oem(), it.price(), company, laneId, stops, run.maxPages));
                             finished.put("status", "done");
                         } catch (Exception e) {
                             finished.put("status", "error");
@@ -584,6 +596,7 @@ public class PriceAggregatorController {
         m.put("total", run.total);
         m.put("done", run.done.get());
         m.put("lanes", run.lanes);
+        m.put("deep", run.maxPages > 1);
         m.put("catalogSize", run.items.size());
         if (run.error != null) m.put("error", run.error);
         if (since <= 0) m.put("items", run.items);

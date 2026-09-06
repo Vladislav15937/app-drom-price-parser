@@ -199,7 +199,9 @@
       "Bash(command -v ngrok)",
       "Bash(ngrok version *)",
       "Bash(git checkout *)",
-      "Bash(/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc /private/tmp/claude-501/-Users-vladislav-IdeaProjects-app-drom-price-parser/1d170902-bedb-4137-bf16-38544d7e14ec/scratchpad/page3.js)"
+      "Bash(/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc /private/tmp/claude-501/-Users-vladislav-IdeaProjects-app-drom-price-parser/1d170902-bedb-4137-bf16-38544d7e14ec/scratchpad/page3.js)",
+      "Bash(git merge *)",
+      "Bash(git branch *)"
     ]
   }
 }
