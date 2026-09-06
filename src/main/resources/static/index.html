@@ -37,12 +37,17 @@
   tr.PURPLE td { background:#2e2440; }
   tr.YELLOW td { background:#3a3410; }
   .big { font-size:26px; font-weight:700; margin:8px 0; }
+  /* Индикатор связи: пока запросы проходят — скрыт; при обрыве видно, что страница жива и переподключается. */
+  #conn { display:none; margin-left:10px; padding:2px 8px; border-radius:10px;
+          background:#7a1f1f; color:#ffd7d7; font-weight:600; }
+  #conn.on { display:inline-block; }
 </style>
 </head>
 <body>
 <div id="url-bar">
   <b>Локальный:</b> <span id="url-local">http://localhost:8081</span>
   &nbsp;|&nbsp; <b>Публичный:</b> <span id="url-pub">определяется…</span>
+  <span id="conn"></span>
 </div>
 
 <div class="tabs">
@@ -133,28 +138,67 @@
 
 <script>
 const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ── Связь с сервером ────────────────────────────────────
+// Во время прогона сервер занят (три headless-браузера), а публичный туннель может моргать.
+// Раньше упавший запрос глотался молча: счётчик замирал, и понять, жив ли анализ, было нельзя.
+// Теперь любой сбой виден в шапке, а страница продолжает переподключаться сама.
+let offlineSince = 0;
+
+function renderConn() {
+  const el = $('conn');
+  if (!offlineSince) { el.className = ''; el.textContent = ''; return; }
+  const sec = Math.round((Date.now() - offlineSince) / 1000);
+  el.className = 'on';
+  el.textContent = `● нет связи с сервером ${sec} с — переподключаемся…`;
+}
+setInterval(() => { if (offlineSince) renderConn(); }, 1000);
+
+function markOnline()  { if (offlineSince) { offlineSince = 0; renderConn(); } }
+function markOffline() { if (!offlineSince) offlineSince = Date.now(); renderConn(); }
+
+/**
+ * fetch с тайм-аутом и отметкой состояния связи. Бросает исключение — вызывающий решает, что делать.
+ * 5xx считаем обрывом связи, а не ответом приложения: когда публичный туннель отваливается, он
+ * отдаёт 502/504 от своего имени («сайт пока не может обработать запрос»), и снаружи это выглядит
+ * ровно как недоступность. Ответы 4xx (например 409 «анализ уже идёт») — настоящие, их отдаём как есть.
+ */
+async function api(path, opts, timeoutMs) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs || 20000);
+  try {
+    const r = await fetch(path, Object.assign({}, opts, { signal: ctl.signal }));
+    if (r.status >= 500) { markOffline(); throw new Error('HTTP ' + r.status); }
+    markOnline();
+    return r;
+  } catch (e) {
+    markOffline();
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 // ── Server info ──
 async function loadInfo() {
   try {
-    const r = await fetch('/api/v1/info'); const j = await r.json();
+    const r = await api('/api/v1/info'); const j = await r.json();
     if (j.localUrl)  $('url-local').textContent = j.localUrl;
     $('url-pub').textContent = j.publicUrl || 'cloudflared не найден';
   } catch(e) {}
 }
-loadInfo(); setInterval(loadInfo, 15000);
+setInterval(loadInfo, 15000);
 
 // ── Профили анализа (типы деталей) ──
 async function loadProfiles() {
-  try {
-    const r = await fetch('/api/v1/profiles'); const list = await r.json();
-    for (const sel of [$('s-profile'), $('b-profile')]) {
-      sel.innerHTML = '';
-      list.forEach(n => { const o = document.createElement('option'); o.value = n; o.textContent = n; sel.appendChild(o); });
-    }
-  } catch(e) {}
+  const r = await api('/api/v1/profiles');
+  const list = await r.json();
+  for (const sel of [$('s-profile'), $('b-profile')]) {
+    sel.innerHTML = '';
+    list.forEach(n => { const o = document.createElement('option'); o.value = n; o.textContent = n; sel.appendChild(o); });
+  }
 }
-loadProfiles();
 
 // ── Tabs ──
 document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
@@ -295,10 +339,12 @@ function applyState(st, withItems) {
 
 /** Состояние с сервера: withItems=true — вместе с каталогом (при загрузке страницы и после выбора файла). */
 async function refresh(withItems) {
-  const r = await fetch('/api/v1/batch/state?since=' + (withItems ? 0 : lastDone));
+  const r = await api('/api/v1/batch/state?since=' + (withItems ? 0 : lastDone));
   applyState(await r.json(), withItems);
 }
 
+// Опрос не прекращается из-за единичного сбоя: неудачный тик только зажигает индикатор,
+// следующий (через 2 с) подхватит прогресс — прогон-то живёт на сервере.
 function startPolling() { if (!polling) polling = setInterval(() => refresh(false).catch(() => {}), 2000); }
 function stopPolling()  { if (polling) { clearInterval(polling); polling = null; } }
 
@@ -310,7 +356,7 @@ async function loadCatalogPreview() {
   fd.append('profile', $('b-profile').value);
   $('b-status').textContent = 'Чтение файла…';
   try {
-    const r = await fetch('/api/v1/catalog/preview', { method:'POST', body: fd });
+    const r = await api('/api/v1/catalog/preview', { method:'POST', body: fd }, 120000);
     const j = await r.json();
     if (r.status === 409) { applyState(j, true); $('b-status').textContent = j.error; return; }
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -334,7 +380,7 @@ $('b-btn').onclick = async () => {
   fd.append('limit', $('b-limit').value || '0');
   fd.append('profile', $('b-profile').value);
   try {
-    const r = await fetch('/api/v1/batch/start', { method:'POST', body: fd });
+    const r = await api('/api/v1/batch/start', { method:'POST', body: fd }, 120000);
     const j = await r.json();
     applyState(j, true);
     if (r.status === 409) $('b-status').textContent = j.error;
@@ -347,7 +393,7 @@ $('b-btn').onclick = async () => {
 $('b-stop').onclick = async () => {
   $('b-stop').disabled = true;
   $('b-status').textContent = 'Останавливаем (текущая деталь дойдёт до конца)…';
-  try { applyState(await (await fetch('/api/v1/batch/stop', { method:'POST' })).json(), false); }
+  try { applyState(await (await api('/api/v1/batch/stop', { method:'POST' })).json(), false); }
   catch (e) { $('b-status').textContent = 'Ошибка: ' + e; }
 };
 
@@ -369,7 +415,7 @@ $('rp-calc').onclick = async () => {
   $('rp-confirm').style.display = 'none';
   $('rp-summary').textContent = 'Считаем…';
   try {
-    const r = await fetch('/api/v1/reprice/preview?limit=' + ($('rp-limit').value || '0'), { method:'POST' });
+    const r = await api('/api/v1/reprice/preview?limit=' + ($('rp-limit').value || '0'), { method:'POST' }, 120000);
     const j = await r.json();
     if (!r.ok || j.error) { $('rp-summary').innerHTML = `<span style="color:var(--red)">${esc(j.error || 'HTTP ' + r.status)}</span>`; return; }
     rpToken = j.token;
@@ -399,7 +445,7 @@ $('rp-apply').onclick = async () => {
   $('rp-apply').disabled = true;
   $('rp-summary').textContent = 'Пишем цены в Bazon…';
   try {
-    const r = await fetch('/api/v1/reprice/apply?token=' + encodeURIComponent(rpToken), { method:'POST' });
+    const r = await api('/api/v1/reprice/apply?token=' + encodeURIComponent(rpToken), { method:'POST' }, 300000);
     const j = await r.json();
     rpToken = null;
     $('rp-confirm').style.display = 'none';
@@ -415,8 +461,26 @@ $('rp-apply').onclick = async () => {
   }
 };
 
-// Восстановление после перезагрузки страницы: каталог и прогресс берём с сервера
-refresh(true).catch(() => {});
+// ── Старт страницы / восстановление после перезагрузки ──
+// Каталог и прогресс живут на сервере, поэтому F5 должен просто подтянуть их обратно.
+// Раньше здесь была одна попытка с молчаливым catch: если запрос не прошёл (сервер занят прогоном,
+// туннель моргнул), страница оставалась пустой — без таблицы, без списка типов и без опроса — и уже
+// не оживала. Теперь пробуем, пока не получится, показывая состояние в шапке.
+async function boot() {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await loadInfo();
+      await loadProfiles();
+      await refresh(true);
+      return;                                    // поднялись: дальше работает опрос/таймеры
+    } catch (e) {
+      markOffline();
+      $('b-status').textContent = 'Нет связи с сервером — переподключаемся (попытка ' + attempt + ')…';
+      await sleep(Math.min(10000, 1000 * attempt));   // 1с, 2с, 3с… не чаще раза в 10 с
+    }
+  }
+}
+boot();
 </script>
 </body>
 </html>

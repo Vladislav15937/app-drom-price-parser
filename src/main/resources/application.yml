@@ -52,6 +52,16 @@ twocaptcha:
   enabled: false  # капча drom — свой чекбокс /verify (без sitekey), 2captcha тут не работает; решает tryClickDromCheckbox + ротация IP
   api-key: 682948916e47240f5ce9a73ec7c1f4a4 # Ключ с 2captcha.com
 
+# Публичный доступ к веб-интерфейсу (туннель).
+# ngrok-domain — постоянный домен из кабинета ngrok (бесплатный тариф даёт один статический,
+# вида "имя.ngrok-free.app"). Задан → ngrok идёт первым и ссылка НЕ меняется при переподключении;
+# пусто → случайные адреса cloudflared/serveo/localhost.run, как раньше.
+# Auth-токен ngrok в конфиге НЕ хранится: он прописывается один раз командой
+#   ngrok config add-authtoken <токен>
+# и лежит в профиле пользователя (~/Library/Application Support/ngrok/ngrok.yml), вне репозитория.
+tunnel:
+  ngrok-domain: ""
+
 # Мобильные прокси mobileproxy.space (mproxy.site): account-токен для авто-дискавери change-IP ссылок.
 # По нему пул на старте тянет proxy_change_ip_url по каждому порту → дорожки реактивно крутят IP при капче.
 mobileproxy:
