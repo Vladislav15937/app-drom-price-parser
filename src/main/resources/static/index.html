@@ -145,7 +145,7 @@
     <table>
       <thead><tr>
         <th>#</th><th>Номер товара</th><th>OEM</th><th>Запчасть</th><th>Авто</th><th>Цена, ₽</th>
-        <th>Создан</th><th>Изменено в</th><th>Барнаул</th><th>Сибирь</th>
+        <th>Создан</th><th title="Сколько месяцев позиция лежит с поступления">Возраст</th><th>Изменено в</th><th>Барнаул</th><th>Сибирь</th>
         <th>Статус</th><th>Моё объявление</th><th>Переоценка</th>
       </tr></thead>
       <tbody id="b-tbody"></tbody>
@@ -316,7 +316,7 @@ function renderCatalog(items) {
     const auto = [p.brand, p.model].filter(Boolean).join(' ');
     tr.innerHTML =
       `<td>${i + 1}</td><td>${dash(p.itemNumber)}</td><td>${esc(p.oem)}</td><td>${esc(p.partName)}</td>` +
-      `<td>${dash(auto)}</td><td>${dash(p.price)}</td><td>${dash(p.created)}</td><td>${dash(p.priceChanged)}</td>` +
+      `<td>${dash(auto)}</td><td>${dash(p.price)}</td><td>${dash(p.created)}</td><td>${dash(p.ageMonths)}</td><td>${dash(p.priceChanged)}</td>` +
       `<td class="c-barnaul">—</td><td class="c-siberia">—</td>` +
       `<td class="c-status" style="color:var(--dim)">Ожидает</td><td class="c-link"></td><td class="c-reprice">—</td>`;
     tb.appendChild(tr);
