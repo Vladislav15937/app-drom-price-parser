@@ -47,6 +47,7 @@ public class PriceAggregatorController {
     private final TunnelService tunnelService;
     private final AnalysisProfiles analysisProfiles;
     private final BazonClient bazonClient;
+    private final ru.retail.service.service.DiscountService discountService;
 
     /** Сколько страниц выдачи листать в режиме «точный подсчёт». 1 страница = 50 объявлений. */
     @org.springframework.beans.factory.annotation.Value("${drom.deep-max-pages:5}")
@@ -464,6 +465,121 @@ public class PriceAggregatorController {
         resp.put("appliedFile", applied.getFileName().toString());
         if (applyErr != null) resp.put("error", applyErr);
         return ResponseEntity.ok(resp);
+    }
+
+    // ── Автодисконт: скидка в пики спроса с откатом (предложение №11) ────────────
+
+    private volatile List<ru.retail.service.service.DiscountService.DiscountPlan> discountPlan;
+    private volatile String discountToken;
+
+    /**
+     * ШАГ 1 — расчёт. Берёт строки прогона, отбирает по критериям КЛИЕНТА и считает цену на сегодня
+     * по расписанию (чт/пт/сб/вс), считая её от БАЗОВОЙ цены из журнала, а не от текущей.
+     *
+     * @param colors        какие цвета считать дефицитом — задаёт клиент (напр. «RED» или «RED,YELLOW»)
+     * @param minAgeMonths  сколько месяцев позиция должна лежать с поступления («Создан»), по умолчанию 12
+     * @param percent       переопределение скидки; −1 — взять по расписанию на сегодня
+     * @param limit         тестовый режим «первые N» (0 = все)
+     */
+    @PostMapping("/discount/preview")
+    public ResponseEntity<Map<String, Object>> discountPreview(
+            @RequestParam(defaultValue = "RED") String colors,
+            @RequestParam(defaultValue = "12") int minAgeMonths,
+            @RequestParam(defaultValue = "-1") int percent,
+            @RequestParam(defaultValue = "0") int limit) {
+        BatchRun run = batchRun;
+        if (run == null || batchRunning()) return conflict();
+
+        java.util.Set<String> wanted = new java.util.HashSet<>();
+        for (String c : colors.split(",")) if (!c.isBlank()) wanted.add(c.trim().toUpperCase());
+        int pct = percent >= 0 ? percent : discountService.percentToday();
+
+        List<ru.retail.service.service.DiscountService.DiscountPlan> plans = new ArrayList<>();
+        int skippedAge = 0, skippedColor = 0;
+        for (int i = 0; i < run.items.size(); i++) {
+            Map<String, Object> row = run.rows.get(i);
+            if (row == null || !(row.get("result") instanceof AvailabilityResult r)) continue;
+            if (!wanted.contains(String.valueOf(r.getColor()))) { skippedColor++; continue; }
+            long age = ageMonths(row.get("ageMonths"));
+            if (age < minAgeMonths) { skippedAge++; continue; }
+            String num = str(row.get("itemNumber")).trim();
+            if (!num.matches("\\d+")) continue;
+            BigDecimal pr = price(row.get("price"));
+            plans.add(discountService.plan(Integer.parseInt(num), str(row.get("oem")),
+                    pr == null ? 0 : pr.longValue(), pct));
+        }
+        if (limit > 0 && limit < plans.size()) plans = new ArrayList<>(plans.subList(0, limit));
+
+        discountPlan = plans;
+        discountToken = plans.isEmpty() ? null : UUID.randomUUID().toString();
+
+        long willChange = plans.stream().filter(
+                ru.retail.service.service.DiscountService.DiscountPlan::applicable).count();
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("token", discountToken);
+        resp.put("percent", pct);
+        resp.put("dayOff", pct == 0);                 // сегодня не пик — план на откат к базовым ценам
+        resp.put("candidates", plans.size());
+        resp.put("willChange", willChange);
+        resp.put("skippedByColor", skippedColor);
+        resp.put("skippedByAge", skippedAge);
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (var p : plans) rows.add(Map.of("id", p.id(), "oem", p.oem(), "basePrice", p.basePrice(),
+                "oldPrice", p.oldPrice(), "newPrice", p.newPrice(), "note", p.note()));
+        resp.put("rows", rows);
+        return ResponseEntity.ok(resp);
+    }
+
+    /** ШАГ 2 — запись цен в Bazon по токену из расчёта. Необратимо, поэтому токен одноразовый. */
+    @PostMapping("/discount/apply")
+    public ResponseEntity<Map<String, Object>> discountApply(@RequestParam String token) {
+        var plans = discountPlan;
+        if (plans == null || discountToken == null || !discountToken.equals(token))
+            return ResponseEntity.status(409).body(Map.of("error", "План устарел — посчитайте заново."));
+        discountPlan = null;
+        discountToken = null;
+
+        List<BazonClient.PriceUpdate> updates = new ArrayList<>();
+        for (var p : plans) if (p.applicable()) updates.add(new BazonClient.PriceUpdate(p.id(), p.newPrice()));
+
+        Map<Integer, BazonClient.PriceResult> byId = new HashMap<>();
+        String applyErr = null;
+        try { for (BazonClient.PriceResult r : bazonClient.setPrices(updates)) byId.put(r.id(), r); }
+        catch (Exception e) { applyErr = e.getMessage(); }
+
+        List<ru.retail.service.service.DiscountService.DiscountPlan> ok = new ArrayList<>();
+        int errors = 0;
+        Path log = repriceReportPath("autodiscount-applied");
+        try (java.io.PrintWriter w = new java.io.PrintWriter(Files.newBufferedWriter(log))) {
+            w.println("id;OEM;базовая;было;стало;скидка,%;статус");
+            for (var p : plans) {
+                String head = p.id() + ";" + p.oem() + ";" + p.basePrice() + ";" + p.oldPrice() + ";"
+                        + p.newPrice() + ";" + p.percent() + ";";
+                if (!p.applicable()) { w.println(head + "ПРОПУЩЕНО " + p.note()); continue; }
+                BazonClient.PriceResult r = byId.get(p.id());
+                if (applyErr != null) { errors++; w.println(head + "ОШИБКА " + applyErr); }
+                else if (r != null && r.ok() && r.appliedPrice() == p.newPrice()) { ok.add(p); w.println(head + "OK"); }
+                else { errors++; w.println(head + "ОТКАЗ " + (r == null ? "нет ответа" : r.error())); }
+            }
+        } catch (Exception e) {
+            log_warn(e);
+        }
+        // Журнал базовых цен обновляем ТОЛЬКО по успешно записанным: иначе откат уведёт цену не туда.
+        discountService.remember(ok);
+
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("changed", ok.size());
+        resp.put("errors", errors);
+        resp.put("appliedFile", log.getFileName().toString());
+        if (applyErr != null) resp.put("error", applyErr);
+        return ResponseEntity.ok(resp);
+    }
+
+    private void log_warn(Exception e) { log.warn("Автодисконт: не записать отчёт: {}", e.getMessage()); }
+
+    private static long ageMonths(Object v) {
+        try { return v == null || v.toString().isBlank() ? 0 : Long.parseLong(v.toString()); }
+        catch (NumberFormatException e) { return 0; }
     }
 
     /** Скачать превью переоценки (dry-run) на своё устройство. */
