@@ -205,7 +205,8 @@
       "Bash(sed -n '/private List<CatalogLoader.CatalogItem> loadCatalog/,/^    }/p' src/main/java/ru/retail/service/controller/PriceAggregatorController.java)",
       "Bash(sed -n '/private Map<String, Object> itemFields/,/^    }/p' src/main/java/ru/retail/service/controller/PriceAggregatorController.java)",
       "Bash(/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc /private/tmp/claude-501/-Users-vladislav-IdeaProjects-app-drom-price-parser/1d170902-bedb-4137-bf16-38544d7e14ec/scratchpad/page4.js)",
-      "Bash(ps -o command= -p 9759)"
+      "Bash(ps -o command= -p 9759)",
+      "Artifact"
     ]
   }
 }
