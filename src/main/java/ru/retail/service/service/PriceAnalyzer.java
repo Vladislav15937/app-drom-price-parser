@@ -149,13 +149,16 @@ public class PriceAnalyzer {
             long rotBefore = p.rotationCount();
             res = analyzeOnce(query, oem, price, myCompany, p, stopWords, opts, matchOem);
             boolean rotatedDuringRun = p.rotationCount() > rotBefore;
-            if (!rotatedDuringRun || p.isCaptchaBlocked() || attempt >= MAX_OEM_ATTEMPTS) {
-                if (rotatedDuringRun && attempt > 1)
-                    log.info("Запрос {}: завершён после смены IP (попыток: {})", query, attempt);
+            // Повторяем, если выдача была получена не целиком (капча/сбой) или IP сменился посреди прогона.
+            boolean retry = rotatedDuringRun || res.isIncomplete();
+            if (!retry || p.isCaptchaBlocked() || attempt >= MAX_OEM_ATTEMPTS) {
+                if (retry && attempt > 1)
+                    log.info("Запрос {}: завершён после повтора (попыток: {}, неполный: {})", query, attempt, res.isIncomplete());
                 return res;
             }
-            log.warn("Запрос {}: во время прогона сменился IP из-за капчи — повтор на свежем IP (попытка {}/{})",
-                    query, attempt + 1, MAX_OEM_ATTEMPTS);
+            log.warn("Запрос {}: {} — повтор (попытка {}/{})", query,
+                    rotatedDuringRun ? "во время прогона сменился IP из-за капчи" : "drom не отдал выдачу",
+                    attempt + 1, MAX_OEM_ATTEMPTS);
         }
         return res;
     }
@@ -167,14 +170,10 @@ public class PriceAnalyzer {
                 matchOem ? "" : " | по применимости");
 
         // 1. Барнаул (город): конкуренты (used+present) + наше объявление. Порог <4.
-        DromParser.RegionScan barnaul = scan(p, query, HOME_CITY, myCompany, opts.usedOnly(), opts.maxPages());
+        DromParser.RegionScan barnaul = scan(p, query, HOME_CITY, myCompany, opts.usedOnly(), opts.maxPages(), matchOem);
+        if (barnaul.failed()) return incomplete(oem, price, HOME_CITY, 0, 0, false);
         int b = countCompetitors(barnaul.competitors(), oem, stopWords, matchOem);
-        String myUrl = pickUrlByPrice(barnaul.myCandidates(), price);
-        // Наше объявление могло не попасть в used-выдачу (часть наших не помечена «Б/у», напр. диски —
-        // «Контрактная»). Тогда ищем его без used-фильтра (present-only), чтобы не терять ссылку.
-        if (myUrl == null) {
-            myUrl = pickUrlByPrice(scan(p, query, HOME_CITY, myCompany, false, opts.maxPages()).myCandidates(), price);
-        }
+        String myUrl = findMyListing(p, query, oem, barnaul, myCompany, price, opts, matchOem);
         log.info("Барнаул: конкурентов {} (наших объявлений {})", b, barnaul.myCandidates().size());
 
         // 2. При b<10 — расширяем на всю Сибирь ПО РЕГИОНАМ ЦЕЛИКОМ (все города регионов, вкл. Алтайский край).
@@ -184,7 +183,10 @@ public class PriceAnalyzer {
         if (b < SIBERIA_TRIGGER) {
             searched = true;
             for (String region : SIBERIA_REGIONS) {
-                int c = countCompetitors(scan(p, query, region, myCompany, opts.usedOnly(), opts.maxPages()).competitors(), oem, stopWords, matchOem);
+                DromParser.RegionScan rs = scan(p, query, region, myCompany, opts.usedOnly(), opts.maxPages(), matchOem);
+                // Регион без выдачи дал бы заниженную сумму по Сибири → ложный фиолетовый/красный.
+                if (rs.failed()) return incomplete(oem, price, region, b, siberiaTotal, true);
+                int c = countCompetitors(rs.competitors(), oem, stopWords, matchOem);
                 siberiaTotal += c;
                 log.info("Сибирь [{}]: конкурентов {} (сумма {})", region, c, siberiaTotal);
             }
@@ -209,15 +211,58 @@ public class PriceAnalyzer {
                 .build();
     }
 
-    /** Скан региона через кэш батча (дубли OEM не перезапрашивают drom). Кэшируем только непустой результат.
-     *  used=false — выдача без фильтра «Б/у» (для поиска нашего объявления, если оно не помечено б/у). */
-    private DromParser.RegionScan scan(DromParser p, String oem, String region, String myCompany, boolean used, int maxPages) {
+    /**
+     * Ссылка на наше объявление.
+     * <p>По OEM — из той же выдачи Барнаула; если там нашего нет (часть наших не помечена «Б/у», напр.
+     * диски — «Контрактная»), доп. скан без used-фильтра (present-only).
+     * <p>По применимости выдача «деталь марка модель» содержит ВСЕ наши объявления на эту модель
+     * (разные детали, поколения) — ближайшее по цене из них легко оказывается чужой позицией. Поэтому
+     * наше объявление ищем по OEM позиции: у нас он указан, и выдача по нему однозначна.
+     */
+    private String findMyListing(DromParser p, String query, String oem, DromParser.RegionScan barnaul,
+                                 String myCompany, BigDecimal price, ScanOptions opts, boolean matchOem) {
+        if (!matchOem) {
+            if (oem == null || oem.isBlank()) return null;
+            return pickUrlByPrice(scan(p, oem, HOME_CITY, myCompany, false, opts.maxPages(), true).myCandidates(), price);
+        }
+        String myUrl = pickUrlByPrice(barnaul.myCandidates(), price);
+        if (myUrl == null) {
+            myUrl = pickUrlByPrice(scan(p, query, HOME_CITY, myCompany, false, opts.maxPages(), true).myCandidates(), price);
+        }
+        return myUrl;
+    }
+
+    /** Результат, когда drom не отдал выдачу: без цвета и БЕЗ переоценки — считать нечего. */
+    private AvailabilityResult incomplete(String oem, BigDecimal price, String region, int b, int s, boolean searched) {
+        log.warn("Не посчитано: нет выдачи drom [{}] (капча/сбой)", region);
+        return AvailabilityResult.builder()
+                .oemNumber(oem)
+                .price(price)
+                .barnaulCount(b)
+                .siberiaCount(s)
+                .searchedSiberia(searched)
+                .color(Color.NONE)
+                .reprice(false)
+                .incomplete(true)
+                .status("Не посчитано: drom не отдал выдачу [" + region + "] (капча/сбой) — повторите прогон")
+                .collectedAt(java.time.Instant.now())
+                .build();
+    }
+
+    /** Скан региона через кэш батча (дубли запроса не перезапрашивают drom). Кэшируем только непустой результат.
+     *  used=false — выдача без фильтра «Б/у» (для поиска нашего объявления, если оно не помечено б/у).
+     *  byOem — запрос это OEM (иначе — строка применимости «деталь марка модель»). */
+    private DromParser.RegionScan scan(DromParser p, String query, String region, String myCompany, boolean used,
+                                       int maxPages, boolean byOem) {
+        // OEM нормализуем (дефисы/пробелы не важны). Строку применимости — нет: normalizeOem оставляет
+        // только латиницу и цифры, и «бампер ford focus» с «капот ford focus» сошлись бы в один ключ.
         // Глубина входит в ключ: обычный и точный скан дают разные наборы, смешивать их нельзя.
-        String key = normalizeOem(oem) + "|" + region + "|" + used + "|" + maxPages;
+        String q = byOem ? "oem:" + normalizeOem(query) : "app:" + query.trim().toLowerCase().replaceAll("\\s+", " ");
+        String key = q + "|" + region + "|" + used + "|" + maxPages;
         DromParser.RegionScan cached = scanCache.get(key);
         if (cached != null) return cached;
-        DromParser.RegionScan sc = p.scanRegion(oem, region, myCompany, used, maxPages);
-        if (!sc.competitors().isEmpty() || !sc.myCandidates().isEmpty()) scanCache.put(key, sc);
+        DromParser.RegionScan sc = p.scanRegion(query, region, myCompany, used, maxPages);
+        if (!sc.failed() && (!sc.competitors().isEmpty() || !sc.myCandidates().isEmpty())) scanCache.put(key, sc);
         return sc;
     }
 

@@ -58,6 +58,10 @@ public class AvailabilityResult {
             + "Считается по той же пороговой логике, что и цвет, а не по самому цвету")
     private boolean reprice;
 
+    @Schema(description = "Не посчитано: drom не отдал выдачу (капча/сбой). Счётчики неполные, цвет и переоценка "
+            + "не выставляются — пустая выдача при сбое не означает дефицит")
+    private boolean incomplete;
+
     @Schema(description = "Текстовая расшифровка статуса рынка")
     private String status;
 

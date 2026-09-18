@@ -687,9 +687,16 @@ public class PriceAggregatorController {
 
                         Map<String, Object> finished = new LinkedHashMap<>(row);
                         try {
-                            finished.put("result", priceAnalyzer.analyzeCatalogLane(
-                                    it.oem(), applicabilityQuery(cr), it.price(), company, laneId, stops, run.scan));
-                            finished.put("status", "done");
+                            AvailabilityResult res = priceAnalyzer.analyzeCatalogLane(
+                                    it.oem(), applicabilityQuery(cr), it.price(), company, laneId, stops, run.scan);
+                            finished.put("result", res);
+                            // drom не отдал выдачу — строка не посчитана, а не «без конкурентов»
+                            if (res.isIncomplete()) {
+                                finished.put("status", "error");
+                                finished.put("error", res.getStatus());
+                            } else {
+                                finished.put("status", "done");
+                            }
                         } catch (Exception e) {
                             finished.put("status", "error");
                             finished.put("error", e.getMessage() != null ? e.getMessage() : "Ошибка анализа");

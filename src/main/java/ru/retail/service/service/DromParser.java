@@ -500,16 +500,23 @@ public class DromParser {
         return best != null ? best : mine.get(0);
     }
 
-    /** Результат дешёвого скана региона: наши объявления (для ссылки) + конкуренты со страницы поиска. */
-    public record RegionScan(List<MyListingCandidate> myCandidates, List<PartPrice> competitors) {
-        static RegionScan empty() { return new RegionScan(List.of(), List.of()); }
+    /**
+     * Результат дешёвого скана региона: наши объявления (для ссылки) + конкуренты со страницы поиска.
+     * {@code failed} — выдачу получить не удалось (капча не пройдена, сбой загрузки). Это НЕ «объявлений
+     * нет»: пустой список при сбое нельзя считать нулём конкурентов, иначе получается ложный дефицит.
+     */
+    public record RegionScan(List<MyListingCandidate> myCandidates, List<PartPrice> competitors, boolean failed) {
+        RegionScan(List<MyListingCandidate> myCandidates, List<PartPrice> competitors) {
+            this(myCandidates, competitors, false);
+        }
+        static RegionScan failure() { return new RegionScan(List.of(), List.of(), true); }
     }
 
     /**
      * Дешёвый подсчёт наличия: за ОДНУ загрузку страницы поиска по OEM возвращает наши объявления
      * (dealer содержит {@code myCompany}) и конкурентов (чужие компании) как «лёгкие» {@link PartPrice}
      * прямо со страницы результатов — БЕЗ захода на детальные страницы (быстро, меньше капчи).
-     * Капча не пройдена / ошибка → пустой результат (как и остальные методы).
+     * Капча не пройдена / ошибка → пустой результат с признаком {@link RegionScan#failed()}.
      */
     public RegionScan scanRegion(String oemNumber, String region, String myCompany) {
         return scanRegion(oemNumber, region, myCompany, true);
@@ -543,7 +550,9 @@ public class DromParser {
             for (int n = 1; n <= pages; n++) {
                 String url = n == 1 ? searchUrl : searchUrl + "&page=" + n;
                 List<SearchEntry> part = loadSearchEntries(page, ctx, sessionFile, url, region);
-                if (part == null) return n == 1 ? RegionScan.empty() : toScan(entries, myCompany);  // капча
+                // Капча на первой странице — выдачи нет вовсе. На следующих — отдаём уже собранное:
+                // первая страница была полной (50), так что до порогов 4/10 счётчик не занизится.
+                if (part == null) return n == 1 ? RegionScan.failure() : toScan(entries, myCompany);
                 entries.addAll(part);
                 if (pages > 1) log.info("  стр. {}: объявлений {} (всего {})", n, part.size(), entries.size());
                 // Неполная страница = выдача кончилась. Пустая — тем более (drom на «лишних»
@@ -555,7 +564,7 @@ public class DromParser {
         } catch (Exception ex) {
             noteError(ex);
             log.error("Ошибка скана [{}]: {}", region, ex.getMessage());
-            return RegionScan.empty();
+            return RegionScan.failure();
         } finally {
             page.close();
             ctx.close();
