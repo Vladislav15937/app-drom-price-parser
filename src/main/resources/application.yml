@@ -47,10 +47,11 @@ drom:
   # Режим по умолчанию не меняется: без галочки читается одна страница, как и раньше.
   deep-max-pages: 5   # пул воркеров работает в headless (4 браузера без окон)
   # Пул прокси: каждый порт = свой мобильный IP = отдельный параллельный воркер (через запятую, без пробелов)
-  # 14353 (Москва #82) / 16308 (Москва, ВАО #19) / 20976 (Подольск #2), megafon — до 30-09-2026
-  proxies: http://Eg9AZa:ez7Av2GamZuZ@mproxy.site:14353,http://hyRGEe:pyK5SAX8eFvu@mproxy.site:16308,http://Eb2KYK:AZyz5YSACYN3@mproxy.site:20976
+  # 14847 (Новосибирск #17, megafon) / 14850 (Москва, Видное, megafon) / 13017 (Санкт-Петербург #48, yota) — до 07-11-2026
+  # PID 561034/561035/561033. Признак истечения: curl -x через порт не соединяется (http=000), get_my_proxy отдаёт []
+  proxies: http://ad7zuR:vyrgeJ3YRYB8@mproxy.site:14847,http://fUp7Yf:Dyj6Ut5Ed6fU@mproxy.site:14850,http://TaE7FY:Ab5udZAK3RER@mproxy.site:13017
   proxy:
-    url: http://Eg9AZa:ez7Av2GamZuZ@mproxy.site:14353   # одиночная дорожка (веб/одиночный анализ)
+    url: http://ad7zuR:vyrgeJ3YRYB8@mproxy.site:14847   # одиночная дорожка (веб/одиночный анализ)
 
 twocaptcha:
   enabled: false  # капча drom — свой чекбокс /verify (без sitekey), 2captcha тут не работает; решает tryClickDromCheckbox + ротация IP
@@ -71,11 +72,15 @@ discount:
 # ngrok-domain — постоянный домен из кабинета ngrok (бесплатный тариф даёт один статический,
 # вида "имя.ngrok-free.app"). Задан → ngrok идёт первым и ссылка НЕ меняется при переподключении;
 # пусто → случайные адреса cloudflared/serveo/localhost.run, как раньше.
-# Auth-токен ngrok в конфиге НЕ хранится: он прописывается один раз командой
-#   ngrok config add-authtoken <токен>
-# и лежит в профиле пользователя (~/Library/Application Support/ngrok/ngrok.yml), вне репозитория.
+# ngrok-authtoken — токен агента из кабинета ngrok. Задан → передаётся агенту флагом --authtoken,
+# и ngrok работает на любой машине без предварительного `ngrok config add-authtoken`
+# (нужно для Windows-дистрибутива: там профиля пользователя с ngrok.yml нет).
+# Пусто → агент берёт токен из профиля пользователя, как раньше.
+# ВНИМАНИЕ: токен лежит в репозитории. При публикации репозитория его нужно ротировать
+# (кабинет ngrok → Your Authtoken → Rotate authtoken).
 tunnel:
-  ngrok-domain: ""
+  ngrok-domain: "easiness-darn-flaxseed.ngrok-free.dev"   # постоянный dev-домен аккаунта ngrok (кабинет → Domains)
+  ngrok-authtoken: "3EXmSm9eK92x13eTO3XRuOWOAvF_4tTnySFQATwq7J3Ew2KVT"
 
 # Мобильные прокси mobileproxy.space (mproxy.site): account-токен для авто-дискавери change-IP ссылок.
 # По нему пул на старте тянет proxy_change_ip_url по каждому порту → дорожки реактивно крутят IP при капче.

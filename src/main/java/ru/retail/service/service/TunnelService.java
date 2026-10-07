@@ -34,6 +34,14 @@ public class TunnelService {
     @Value("${tunnel.ngrok-domain:}")
     private String ngrokDomain;
 
+    /**
+     * Токен агента ngrok. Задан — передаём его флагом {@code --authtoken}, и туннель поднимается
+     * на любой машине без предварительного {@code ngrok config add-authtoken} (у Windows-дистрибутива
+     * профиля пользователя с ngrok.yml нет). Пусто — агент берёт токен из профиля, как раньше.
+     */
+    @Value("${tunnel.ngrok-authtoken:}")
+    private String ngrokAuthtoken;
+
     @Getter
     private String publicUrl;
 
@@ -50,6 +58,11 @@ public class TunnelService {
     private static final int HEALTH_TIMEOUT_MS = 10_000;
     /** Сколько неудачных проверок подряд считаем поломкой туннеля (одиночные 502 бывают на ровном месте). */
     private static final int HEALTH_FAILS_BEFORE_RECONNECT = 2;
+    /**
+     * Как часто пытаться вернуться с запасного туннеля на постоянный домен. Возврат = несколько
+     * секунд недоступности (гасим рабочий процесс, поднимаем ngrok), поэтому редко.
+     */
+    private static final long RESTORE_PREFERRED_PERIOD_MS = 10 * 60_000;
 
     /** Индекс поднятого провайдера в {@link #providers} (−1 — публичного адреса нет). */
     private volatile int activeProvider = -1;
@@ -67,24 +80,29 @@ public class TunnelService {
             new TunnelProvider(
                     List.of("cloudflared", "tunnel", "--url", "http://localhost:{port}", "--protocol", "http2"),
                     Pattern.compile("(https://[a-z0-9][a-z0-9-]+\\.trycloudflare\\.com)"),
-                    "cloudflared"
+                    "cloudflared", false
             ),
             new TunnelProvider(
                     List.of("ssh", "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=30",
                             "-R", "80:localhost:{port}", "serveo.net"),
                     // URL вида https://xxx.serveousercontent.com (с ANSI-кодами в строке)
                     Pattern.compile("(https://[a-zA-Z0-9-]+\\.serveousercontent\\.com)"),
-                    "serveo.net"
+                    "serveo.net", false
             ),
             new TunnelProvider(
                     List.of("ssh", "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=30",
                             "-R", "80:localhost:{port}", "nokey@localhost.run"),
                     Pattern.compile("(https://[a-zA-Z0-9-]+\\.lhr\\.life)"),
-                    "localhost.run"
+                    "localhost.run", false
             )
     );
 
-    record TunnelProvider(List<String> cmdTemplate, Pattern urlPattern, String name) {}
+    /**
+     * @param stableUrl адрес НЕ меняется при перезапуске провайдера (ngrok со статическим доменом).
+     *                  У quick-туннелей (trycloudflare/serveo/lhr.life) каждый запуск даёт новое имя,
+     *                  поэтому их перезапуск ссылку не спасает — там сразу идём к следующему.
+     */
+    record TunnelProvider(List<String> cmdTemplate, Pattern urlPattern, String name, boolean stableUrl) {}
 
     /** Реальный список провайдеров этого запуска: с ngrok впереди, если задан постоянный домен. */
     private volatile List<TunnelProvider> providers = FALLBACK_PROVIDERS;
@@ -98,7 +116,7 @@ public class TunnelService {
         return new TunnelProvider(
                 List.of("ngrok", "http", "--domain=" + domain, "--log", "stdout", "--log-format", "logfmt", "{port}"),
                 Pattern.compile("(https://" + Pattern.quote(domain) + ")"),
-                "ngrok (" + domain + ")");
+                "ngrok (" + domain + ")", true);
     }
 
     public void start() {
@@ -169,31 +187,63 @@ public class TunnelService {
      * Сторож туннеля. Провайдер может «умереть тихо»: ssh-процесс жив, а публичный адрес отдаёт
      * 502 — снаружи страница просто недоступна, и понять это изнутри приложения было нельзя.
      * Раз в {@link #HEALTH_PERIOD_MS} дёргаем свой же {@code /api/v1/info} ЧЕРЕЗ публичный адрес;
-     * после {@link #HEALTH_FAILS_BEFORE_RECONNECT} неудач подряд гасим процесс и поднимаем
-     * СЛЕДУЮЩИЙ провайдер (упавший обычно не оживает). Новый URL сразу виден в {@code /info}.
+     * после {@link #HEALTH_FAILS_BEFORE_RECONNECT} неудач подряд гасим процесс и поднимаем туннель
+     * заново. Новый URL сразу виден в {@code /info}.
+     *
+     * <p><b>Постоянный адрес важнее быстрого восстановления.</b> У провайдера со статическим доменом
+     * (ngrok) перезапуск возвращает ТУ ЖЕ ссылку, поэтому сначала пробуем поднять его же — иначе
+     * один сбой уводил на quick-туннель со случайным именем, и ссылка, отданная заказчику, умирала
+     * безвозвратно. Если статический домен не поднялся — уходим к следующему провайдеру, но
+     * продолжаем раз в {@link #RESTORE_PREFERRED_PERIOD_MS} пытаться вернуться на него.
      */
     private void startWatchdog() {
         Thread watchdog = new Thread(() -> {
             int fails = 0;
+            long lastRestoreTry = System.currentTimeMillis();
             while (true) {
                 try { Thread.sleep(HEALTH_PERIOD_MS); } catch (InterruptedException e) { return; }
                 String url = publicUrl;
                 if (url == null) {                      // туннеля нет вовсе — пробуем поднять заново
-                    if (connect(activeProvider + 1) >= 0) fails = 0;
+                    if (connect(0) >= 0) fails = 0;     // с начала списка: постоянный домен в приоритете
                     continue;
                 }
-                if (healthy(url)) { fails = 0; continue; }
+                if (healthy(url)) {
+                    fails = 0;
+                    // Живы, но на запасном провайдере со случайным адресом — периодически
+                    // возвращаемся на постоянный домен, чтобы ссылка снова стала неизменной.
+                    if (shouldRestorePreferred()
+                            && System.currentTimeMillis() - lastRestoreTry >= RESTORE_PREFERRED_PERIOD_MS) {
+                        lastRestoreTry = System.currentTimeMillis();
+                        restorePreferred();
+                    }
+                    continue;
+                }
                 fails++;
                 log.warn("Туннель {}: публичный адрес не отвечает ({}/{}) — {}",
                         providerName(activeProvider), fails, HEALTH_FAILS_BEFORE_RECONNECT, url);
                 if (fails < HEALTH_FAILS_BEFORE_RECONNECT) continue;
 
-                log.warn("Туннель {}: переподключаюсь на следующий провайдер", providerName(activeProvider));
+                int broken = activeProvider;
+                boolean stable = broken >= 0 && broken < providers.size() && providers.get(broken).stableUrl();
                 stopProcess();
                 publicUrl = null;
                 fails = 0;
-                int idx = connect(activeProvider + 1);
+
+                // Статический домен — сначала он же: так ссылка у заказчика не меняется.
+                if (stable) {
+                    log.warn("Туннель {}: перезапускаю того же провайдера (адрес постоянный)", providerName(broken));
+                    if (tryProvider(providers.get(broken))) {
+                        activeProvider = broken;
+                        log.info("Туннель восстановлен на том же адресе: {}", publicUrl);
+                        continue;
+                    }
+                    publicUrl = null;
+                }
+
+                log.warn("Туннель {}: переподключаюсь на следующий провайдер", providerName(broken));
+                int idx = connect(broken + 1);
                 if (idx >= 0) log.info("Туннель восстановлен через {}: {}", providerName(idx), publicUrl);
+                lastRestoreTry = System.currentTimeMillis();
             }
         }, "tunnel-watchdog");
         watchdog.setDaemon(true);
@@ -214,6 +264,31 @@ public class TunnelService {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    /** Работаем на запасном провайдере, хотя первым в списке стоит постоянный домен? */
+    private boolean shouldRestorePreferred() {
+        return activeProvider > 0 && !providers.isEmpty() && providers.get(0).stableUrl();
+    }
+
+    /**
+     * Пробует вернуть туннель на постоянный домен (провайдер 0). Текущий рабочий процесс гасим
+     * только на время попытки: если ngrok не поднялся — сразу возвращаемся на запасного.
+     */
+    private void restorePreferred() {
+        int current = activeProvider;
+        log.info("Туннель: пробую вернуться на постоянный домен {}", providerName(0));
+        stopProcess();
+        publicUrl = null;
+        if (tryProvider(providers.get(0))) {
+            activeProvider = 0;
+            log.info("Туннель снова на постоянном адресе: {}", publicUrl);
+            return;
+        }
+        publicUrl = null;
+        log.warn("Туннель: постоянный домен по-прежнему недоступен — остаюсь на запасном");
+        int idx = connect(current);
+        if (idx >= 0) log.info("Туннель: запасной поднят, адрес {}", publicUrl);
     }
 
     private String providerName(int idx) {
@@ -245,6 +320,11 @@ public class TunnelService {
             }
 
             ProcessBuilder pb = new ProcessBuilder(cmd);
+            // Токен ngrok — через окружение дочернего процесса, а не аргументом командной строки:
+            // аргументы видны в `ps` любому пользователю машины.
+            if (binary.equals("ngrok") && ngrokAuthtoken != null && !ngrokAuthtoken.isBlank()) {
+                pb.environment().put("NGROK_AUTHTOKEN", ngrokAuthtoken.trim());
+            }
             pb.redirectErrorStream(true);
             Process proc = pb.start();
             tunnelProcess = proc;
