@@ -79,7 +79,9 @@ public class TunnelService {
     private static final List<TunnelProvider> FALLBACK_PROVIDERS = List.of(
             new TunnelProvider(
                     List.of("cloudflared", "tunnel", "--url", "http://localhost:{port}", "--protocol", "http2"),
-                    Pattern.compile("(https://[a-z0-9][a-z0-9-]+\\.trycloudflare\\.com)"),
+                    // (?!api\\.) — без сети cloudflared пишет «failed to request quick Tunnel: Post
+                    // https://api.trycloudflare.com/tunnel…», и это служебный адрес принимался за публичный.
+                    Pattern.compile("(https://(?!api\\.)[a-z0-9][a-z0-9-]+\\.trycloudflare\\.com)"),
                     "cloudflared", false
             ),
             new TunnelProvider(
@@ -208,6 +210,7 @@ public class TunnelService {
                     continue;
                 }
                 if (healthy(url)) {
+                    if (fails > 0) log.info("Туннель {}: публичный адрес снова отвечает — {}", providerName(activeProvider), url);
                     fails = 0;
                     // Живы, но на запасном провайдере со случайным адресом — периодически
                     // возвращаемся на постоянный домен, чтобы ссылка снова стала неизменной.
@@ -225,6 +228,17 @@ public class TunnelService {
 
                 int broken = activeProvider;
                 boolean stable = broken >= 0 && broken < providers.size() && providers.get(broken).stableUrl();
+
+                // Агент ngrok при обрыве связи переподключается сам и на тот же адрес. Раньше сторож
+                // убивал его через минуту молчания и уходил перебирать запасные туннели — а при пропавшей
+                // сети (VPN моргнул) не поднимался никто, и после её возврата постоянного адреса уже не было.
+                // Пока процесс жив — ждём; перезапускаем, только если он умер.
+                Process proc = tunnelProcess;
+                if (stable && proc != null && proc.isAlive()) {
+                    if (fails == HEALTH_FAILS_BEFORE_RECONNECT)
+                        log.warn("Туннель {}: процесс жив — жду, пока агент переподключится сам", providerName(broken));
+                    continue;
+                }
                 stopProcess();
                 publicUrl = null;
                 fails = 0;

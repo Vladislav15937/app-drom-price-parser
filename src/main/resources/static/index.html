@@ -216,11 +216,17 @@ function markOffline() { if (!offlineSince) offlineSince = Date.now(); renderCon
  * отдаёт 502/504 от своего имени («сайт пока не может обработать запрос»), и снаружи это выглядит
  * ровно как недоступность. Ответы 4xx (например 409 «анализ уже идёт») — настоящие, их отдаём как есть.
  */
+// Бесплатный ngrok на любой запрос из браузера отдаёт свою HTML-страницу-предупреждение
+// (200, text/html) вместо ответа приложения — r.json() падал, и страница вечно «переподключалась».
+// Заголовок ngrok-skip-browser-warning эту страницу отключает; другим туннелям он не мешает.
+const TUNNEL_HEADERS = { 'ngrok-skip-browser-warning': '1' };
+
 async function api(path, opts, timeoutMs) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs || 20000);
   try {
-    const r = await fetch(path, Object.assign({}, opts, { signal: ctl.signal }));
+    const headers = Object.assign({}, TUNNEL_HEADERS, opts && opts.headers);
+    const r = await fetch(path, Object.assign({}, opts, { headers, signal: ctl.signal }));
     if (r.status >= 500) { markOffline(); throw new Error('HTTP ' + r.status); }
     markOnline();
     return r;
@@ -282,7 +288,7 @@ document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
 
 // ── SSE over fetch (POST) ──
 async function sse(url, body, handlers) {
-  const resp = await fetch(url, { method:'POST', body });
+  const resp = await fetch(url, { method:'POST', body, headers: TUNNEL_HEADERS });
   const reader = resp.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
