@@ -49,9 +49,9 @@ drom:
   # Пул прокси: каждый порт = свой мобильный IP = отдельный параллельный воркер (через запятую, без пробелов)
   # 14847 (Новосибирск #17, megafon) / 14850 (Москва, Видное, megafon) / 13017 (Санкт-Петербург #48, yota) — до 07-11-2026
   # PID 561034/561035/561033. Признак истечения: curl -x через порт не соединяется (http=000), get_my_proxy отдаёт []
-  proxies: http://ad7zuR:vyrgeJ3YRYB8@mproxy.site:14847,http://fUp7Yf:Dyj6Ut5Ed6fU@mproxy.site:14850,http://TaE7FY:Ab5udZAK3RER@mproxy.site:13017
+  proxies: http://av2fug:eCMuU6CezYN5@mproxy.site:10368,http://uk9sey:YDgARefGat8y@mproxy.site:26920,http://gek6az:eM4YFkEuvEge@mproxy.site:26921
   proxy:
-    url: http://ad7zuR:vyrgeJ3YRYB8@mproxy.site:14847   # одиночная дорожка (веб/одиночный анализ)
+    url: http://av2fug:eCMuU6CezYN5@mproxy.site:10368   # одиночная дорожка (веб/одиночный анализ)
 
 twocaptcha:
   enabled: false  # капча drom — свой чекбокс /verify (без sitekey), 2captcha тут не работает; решает tryClickDromCheckbox + ротация IP
